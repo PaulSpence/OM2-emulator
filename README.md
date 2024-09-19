@@ -4,7 +4,7 @@ Overall, the aim here is learn how to create a machine learning emulator for acc
 ## Aim 1: 
 First simple aim is to reproduce some results from Dheeshjith et al. 2024 (https://arxiv.org/abs/2405.18585) except using for ACCESS-CM2. 
 
-Dheeshjith et al. used GFDL-CM2.6 data (PI, 2xCO2, and 4xCO2). They used 4000 daily data samples from the 20 year PI control run was used to train the emulators. They test on the PI and 2xCO2 runs using an initial state fromday 4200 and atmospheric boundary info through day 7200. They test on the 4xCO2 data.
+Dheeshjith et al. used GFDL-CM2.6 data (PI, 2xCO2, and 4xCO2). They used 4000 daily data samples from the 20 year PI control run to train the emulators. They test on the PI and 2xCO2 runs using an initial state fromd ay 4200 and atmospheric boundary info through day 7200. They test on the 4xCO2 data.
 
 Their goal is to autoregressively emulate the surface ocean climate given the atmospheric boundary conditions, and test the generalization to different atmospheric boundary conditions (e.g.increased CO2). 
 They define the ocean state as phi=(u,v,T,t): zonal and meridional surface velocity and SST. 
