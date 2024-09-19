@@ -5,7 +5,7 @@ Overall, the aim here is learn how to create a machine learning emulator for acc
 Emulate SST from SAT using data from ACCESS-CM2, essentially to reproduce some results from Dheeshjith et al. 2024 (https://arxiv.org/abs/2405.18585). See here for details: https://github.com/PaulSpence/OM2-emulator/issues/1#issue-2535235521
 
 ## Aim 2: 
-Emulate SST from SAT using training data from ACCESS-OM2-01, aiming to emulate Qian’s or Hannah's future warming runs (all coarse-grained to 1-degree).
+Redo Aim 1, but using ACCESS-OM2-1 ocean data and future atmosphere from Qian or Hannahs future warming runs.
 
 ## Aim 3: 
 Since emulating SST from SAT doesn't seem that challenging, we would like to try to autoregressively emulate ACCESS-OM2-1’s vertically integrated ocean heat content evolution given surface forcing (basically, emulate Huguenin et al. 2022; https://www.nature.com/articles/s41467-022-32540-5 Nat Comms.)
