@@ -2,18 +2,10 @@
 Overall, the aim here is learn how to create a machine learning emulator for access-om2 models. The hope is that an emumlator will allow to generate ensembles of simulated output based on a high resolution model data. The primary benefit being that it will allow us to better distinguish internal from forced varaiability in our model simulation results. 
 
 ## Aim 1: 
-First simple aim is to reproduce some results from Dheeshjith et al. 2024 (https://arxiv.org/abs/2405.18585) except using for ACCESS-CM2. 
-
-Dheeshjith et al. used GFDL-CM2.6 data (PI, 2xCO2, and 4xCO2). They used 4000 daily data samples from the 20 year PI control run to train the emulators. They test on the PI and 2xCO2 runs using an initial state fromd ay 4200 and atmospheric boundary info through day 7200. They test on the 4xCO2 data.
-
-Their goal is to autoregressively emulate the surface ocean climate given the atmospheric boundary conditions, and test the generalization to different atmospheric boundary conditions (e.g.increased CO2). 
-They define the ocean state as phi=(u,v,T,t): zonal and meridional surface velocity and SST. 
-They define the atmospheric boundary condition as tau=(tx,ty, Tatm,t): zonal, meridional and SAT.
-
-They predict phi(t+delta_t) using input from phi(t) and tau(t) with delta_t = 1 day. Apparently this gives 6 input channels (u,v,T,tx,ty,Tatm at time=t) and 3 output (u,v,T) channels (?). 
+Emulate SST from SAT using data from ACCESS-CM2, essentially to reproduce some results from Dheeshjith et al. 2024 (https://arxiv.org/abs/2405.18585). See here for details: https://github.com/PaulSpence/OM2-emulator/issues/1#issue-2535235521
 
 ## Aim 2: 
-Do the same as Aim 1 but for ACCESS-OM2-01, aiming to emulate Qian’s or Hannah's future warming runs (all coarse-grained to 1-degree).
+Emulate SST from SAT using training data from ACCESS-OM2-01, aiming to emulate Qian’s or Hannah's future warming runs (all coarse-grained to 1-degree).
 
 ## Aim 3: 
 Since emulating SST from SAT doesn't seem that challenging, we would like to try to autoregressively emulate ACCESS-OM2-1’s vertically integrated ocean heat content evolution given surface forcing (basically, emulate Huguenin et al. 2022; https://www.nature.com/articles/s41467-022-32540-5 Nat Comms.)
