@@ -10,13 +10,13 @@ Their goal is to autoregressively emulate the surface ocean climate given the at
 They define the ocean state as phi=(u,v,T,t): zonal and meridional surface velocity and SST. 
 They define the atmospheric boundary condition as tau=(tx,ty, Tatm,t): zonal, meridional and SAT.
 
-Tey predict phi(t+delta_t) using input from phi(t) and tau(t) with delta_t = 1 day. Apparently this gives 6 input channels (u,v,T,tx,ty,Tatm at time=t) and 3 output (u,v,T) channels (?). 
+They predict phi(t+delta_t) using input from phi(t) and tau(t) with delta_t = 1 day. Apparently this gives 6 input channels (u,v,T,tx,ty,Tatm at time=t) and 3 output (u,v,T) channels (?). 
 
 ## Aim 2: 
-Do the same for ACCESS-OM2-01, aiming to emulate Qian’s runs (all coarse-grained to 1-degree).
+Do the same as Aim 1 but for ACCESS-OM2-01, aiming to emulate Qian’s or Hannah's future warming runs (all coarse-grained to 1-degree).
 
 ## Aim 3: 
-autoregressively emulate ACCESS-OM2-1’s vertically integrated ocean heat content evolution given surface forcing (basically, emulate Huguenin et al. Nat Comms.)
+Since emulating SST from SAT doesn't seem that challenging, we would like to try to autoregressively emulate ACCESS-OM2-1’s vertically integrated ocean heat content evolution given surface forcing (basically, emulate Huguenin et al. 2022; https://www.nature.com/articles/s41467-022-32540-5 Nat Comms.)
 Ocean state: OHC(x,y,t) [SST(x,y,t)]
 Atmospheric forcing: U, V, Ta, (q, radiation) (x,y).
 Model: inputs: OHC(x,y,t), U,V Ta, q(x,y,t) -> output: OHC*(x,y,t+delta t).
