@@ -2,10 +2,13 @@
 Overall, the aim here is learn how to create a machine learning emulator for access-om2 models. The hope is that an emulator will allow us to generate ensembles of simulated output based on a high resolution model data, at a much cheaper cost than running an ensemble of the model itself. The primary benefit being that it will allow us to better distinguish internal from forced variability in our model simulation results. 
 
 ## Aim 0:
-Put in 2D surface heat fluxes and verticall integrated 2d ocean heat content in at t=0, get there latent space representation, from om2. 
+Put in 2D net surface heat fluxes and verticall integrated 2d ocean heat content in at t=0, get there latent space representation, from om2. 
+Get monthly averages from 1 deg IAF run. cycle 6 of the omip2 run. /g/data/ik11/outputs/access-om2/1deg_jra55_iaf_omip2_cycle6
 
 ## Aim 1: 
 Emulate SST from ACCESS-CM2 (using SAT and wind stress as inputs). Essentially reproduce some results from Dheeshjith et al. 2024 (https://arxiv.org/abs/2405.18585). See here for details: https://github.com/PaulSpence/OM2-emulator/issues/1#issue-2535235521
+Regrid: 1 deg om2, 1 deg global since om2 has 1/3deg near the equator and 1 deg at poles to resolve the undercurrents.
+
 
 ## Aim 2: 
 Redo Aim 1, but using ACCESS-OM2-01 ocean data and future atmosphere from Qian or Hannahs future warming runs. See here: https://github.com/PaulSpence/OM2-emulator/issues/2#issue-2535251725
