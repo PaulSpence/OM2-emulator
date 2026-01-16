@@ -1,6 +1,9 @@
 # OM2-emulator
 Overall, the aim here is learn how to create a machine learning emulator for access-om2 models. The hope is that an emulator will allow us to generate ensembles of simulated output based on a high resolution model data, at a much cheaper cost than running an ensemble of the model itself. The primary benefit being that it will allow us to better distinguish internal from forced variability in our model simulation results. 
 
+## Aim 0:
+Put in 2D surface heat fluxes and verticall integrated 2d ocean heat content in at t=0, get there latent space representation, from om2. 
+
 ## Aim 1: 
 Emulate SST from ACCESS-CM2 (using SAT and wind stress as inputs). Essentially reproduce some results from Dheeshjith et al. 2024 (https://arxiv.org/abs/2405.18585). See here for details: https://github.com/PaulSpence/OM2-emulator/issues/1#issue-2535235521
 
