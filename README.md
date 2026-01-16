@@ -12,6 +12,7 @@ Vertically integrated heat content:
 temp*rho_dzt*Cp
 
 Cp = 3992.10322329649
+area_t
 
 ## Aim 1: 
 Emulate SST from ACCESS-CM2 (using SAT and wind stress as inputs). Essentially reproduce some results from Dheeshjith et al. 2024 (https://arxiv.org/abs/2405.18585). See here for details: https://github.com/PaulSpence/OM2-emulator/issues/1#issue-2535235521
