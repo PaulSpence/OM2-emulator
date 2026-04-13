@@ -1,0 +1,31 @@
+# One-factor-at-a-time ablation matrix.
+# Each key is a dotted config path and each value list contains candidate settings.
+factors:
+  normalization.strategy:
+    - masked_zscore
+    - nan_zscore
+    - robust_median_iqr
+    - minmax
+
+  model.encoder[0].out_channels:
+    - 8
+    - 16
+    - 32
+
+  model.encoder[1].out_channels:
+    - 16
+    - 32
+    - 64
+
+  model.encoder[0].kernel_size:
+    - 3
+    - 4
+    - 5
+
+  model.encoder[0].stride:
+    - 1
+    - 2
+
+  model.encoder[0].padding:
+    - 1
+    - 2
