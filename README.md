@@ -2,9 +2,9 @@
 
 Overall, the aim here is learn how to create a machine learning emulator for access-om2 models. The hope is that an emulator will allow us to generate ensembles of simulated output based on a high resolution model data, at a much cheaper cost than running an ensemble of the model itself. The primary benefit being that it will allow us to better distinguish internal from forced variability in our model simulation results.
 
-## Refactored Experiment Workflow
+## Experiment Workflow
 
-This repository now supports a reproducible **CLI + YAML** experiment workflow while still using the existing **PyEarthTools** data path and `PartialConv2d` model family.
+This repository supports a reproducible **CLI + YAML** experiment workflow while using the existing **PyEarthTools** data path and `PartialConv2d` model family.
 
 ### Why this structure
 
