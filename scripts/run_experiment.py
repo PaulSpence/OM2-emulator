@@ -17,12 +17,8 @@ def _bootstrap_modules_if_needed() -> None:
     Notes
     -----
     The relaunch occurs only once per invocation via the
-    ``OM2_MODULE_BOOTSTRAPPED`` flag. We intentionally load:
-    - ``conda/analysis3`` (without version pin)
-    - ``pet/2025.08`` (as requested)
-
-    If the PET modulefile is unavailable, we fall back to prepending the PET
-    bin directory to ``PATH``.
+    ``OM2_MODULE_BOOTSTRAPPED`` flag. We intentionally load PET only,
+    with fallback to PET bin path if modulefiles are unavailable.
     """
     if os.environ.get("OM2_MODULE_BOOTSTRAPPED") == "1":
         return
@@ -30,12 +26,10 @@ def _bootstrap_modules_if_needed() -> None:
     script_path = Path(__file__).resolve()
     args = " ".join(shlex.quote(arg) for arg in sys.argv[1:])
 
-    analysis3_module = os.environ.get("OM2_ANALYSIS3_MODULE", "conda/analysis3")
     pet_module = os.environ.get("OM2_PET_MODULE", "pet/2025.08")
 
     relaunch_command = (
         "module unload openmpi >/dev/null 2>&1 || true; "
-        f"module load {shlex.quote(analysis3_module)} && "
         f"(module load {shlex.quote(pet_module)} || export PATH=/g/data/dk92/apps/pet/2025.08/bin:$PATH) && "
         f"OM2_MODULE_BOOTSTRAPPED=1 exec python {shlex.quote(str(script_path))} {args}"
     )
@@ -61,11 +55,11 @@ def _add_local_paths() -> None:
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for a single experiment run."""
-    parser = argparse.ArgumentParser(description="Run one OM2 emulator experiment from YAML config.")
+    parser = argparse.ArgumentParser(description="Run one OM2 emulator experiment from config file.")
     parser.add_argument(
         "--config",
         required=True,
-        help="Path to experiment YAML config file.",
+        help="Path to experiment config file (JSON content; .json or .yaml).",
     )
     return parser.parse_args()
 

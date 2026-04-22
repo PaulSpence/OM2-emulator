@@ -80,7 +80,7 @@ Each run is written to `runs/<run_name>_<timestamp>/` and includes:
 - `metrics.json`
 - `training_summary.json`
 - `model_state.pt`
-- `arrays.npz` (optional)
+- `arrays.nc` (optional)
 - `diagnostics/reconstruction_maps.png`
 - `diagnostics/latent_feature_maps.png`
 

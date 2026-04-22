@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import xarray as xr
 
 from om2_experiment_config import dump_yaml_config, load_yaml_config, resolve_config
 from om2_experiment_data import build_pipeline, load_mask_and_area, take_pipeline_sample
@@ -75,6 +76,62 @@ def make_run_directory(run_config: dict[str, Any]) -> Path:
     run_dir = output_root / f"{run_name}_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
+
+
+def save_array_artifacts_netcdf(
+    output_path: str | Path,
+    inference: dict[str, np.ndarray],
+    area_weighted_mask: np.ndarray,
+    mask: np.ndarray,
+) -> None:
+    """Persist array artifacts to one NetCDF file.
+
+    Parameters
+    ----------
+    output_path
+        Target NetCDF path.
+    inference
+        Inference dictionary from ``run_inference_sample``.
+    area_weighted_mask
+        Area weighted ocean mask, shape ``(y, x)``.
+    mask
+        Binary ocean mask, shape ``(y, x)``.
+
+    Notes
+    -----
+    We intentionally use generic dimension names (``channel``, ``y``, ``x``)
+    because this artifact is a model-diagnostics container rather than a
+    geospatially indexed dataset.
+    """
+    output_file = Path(output_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    prediction_physical = inference["prediction_physical"]
+    target_physical = inference["target_physical"]
+    prediction_normalized = inference["prediction_normalized"]
+    target_normalized = inference["target_normalized"]
+    latent = inference["latent"]
+    latent_mask = inference["latent_mask"]
+    output_mask = inference["output_mask"]
+
+    dataset = xr.Dataset(
+        data_vars={
+            "prediction_physical": (("sample", "channel", "y", "x"), prediction_physical),
+            "target_physical": (("sample", "channel", "y", "x"), target_physical),
+            "prediction_normalized": (
+                ("sample", "channel", "y", "x"),
+                prediction_normalized,
+            ),
+            "target_normalized": (("sample", "channel", "y", "x"), target_normalized),
+            "latent": (("sample", "latent_channel", "latent_y", "latent_x"), latent),
+            "latent_mask": (("sample", "mask_channel", "latent_y", "latent_x"), latent_mask),
+            "output_mask": (("sample", "mask_channel", "y", "x"), output_mask),
+            "area_weighted_mask": (("y", "x"), area_weighted_mask),
+            "mask": (("y", "x"), mask),
+        }
+    )
+
+    dataset.to_netcdf(output_file)
 
 
 def run_experiment_from_config_dict(config: dict[str, Any]) -> dict[str, Any]:
@@ -149,13 +206,9 @@ def run_experiment_from_config_dict(config: dict[str, Any]) -> dict[str, Any]:
     )
 
     if bool(config["run"].get("save_arrays", True)):
-        np.savez_compressed(
-            run_dir / "arrays.npz",
-            prediction_physical=inference["prediction_physical"],
-            target_physical=inference["target_physical"],
-            latent=inference["latent"],
-            latent_mask=inference["latent_mask"],
-            output_mask=inference["output_mask"],
+        save_array_artifacts_netcdf(
+            output_path=run_dir / "arrays.nc",
+            inference=inference,
             area_weighted_mask=area_weighted_mask,
             mask=mask,
         )

@@ -1,16 +1,19 @@
-run:
-  name: smoke_baseline
-  seed: 42
-  device: auto
-  output_root: runs
-  save_arrays: true
-
-training:
-  num_epochs: 1
-  max_samples_per_epoch: 3
-  learning_rate: 1.0e-4
-  print_every: 1
-  ignore_sample_errors: true
-
-diagnostics:
-  sample_index: 0
+{
+  "run": {
+    "name": "smoke_baseline",
+    "seed": 42,
+    "device": "auto",
+    "output_root": "runs",
+    "save_arrays": true
+  },
+  "training": {
+    "num_epochs": 1,
+    "max_samples_per_epoch": 3,
+    "learning_rate": 1.0e-4,
+    "print_every": 1,
+    "ignore_sample_errors": true
+  },
+  "diagnostics": {
+    "sample_index": 0
+  }
+}

@@ -8,16 +8,10 @@ which means we can always reconstruct exactly how a model was trained.
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
-
-try:
-    import yaml
-except ImportError as exc:  # pragma: no cover - exercised only if dependency missing
-    raise ImportError(
-        "PyYAML is required for OM2 experiment configs. On NCI, run `module load conda/analysis3` before launching the CLI, or install with `pip install pyyaml`."
-    ) from exc
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -105,28 +99,43 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 def load_yaml_config(path: str | Path) -> dict[str, Any]:
-    """Load a YAML experiment config from disk.
+    """Load an experiment config from disk.
 
     Parameters
     ----------
     path
-        Path to a YAML file.
+        Path to a JSON-formatted config file (``.json`` or ``.yaml``).
 
     Returns
     -------
     dict[str, Any]
-        Parsed YAML content.
+        Parsed config content.
 
     Notes
     -----
-    The function keeps parsing intentionally simple and transparent.
-    Validation is handled in :func:`validate_config` so parse errors and
-    semantic errors remain clearly separated.
+    We intentionally parse with the Python standard library only so the
+    workflow works with PET runtime alone (no PyYAML dependency).
     """
-    with Path(path).open("r", encoding="utf-8") as handle:
-        loaded = yaml.safe_load(handle)
+    config_path = Path(path)
+    text = config_path.read_text(encoding="utf-8").strip()
+    if not text:
+        return {}
 
-    return loaded or {}
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Config parse failed for {config_path}. "
+            "Use valid JSON content (JSON is also accepted inside .yaml files)."
+        ) from exc
+
+    if loaded is None:
+        return {}
+
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Top-level config must be an object/dict in {config_path}")
+
+    return loaded
 
 
 def deep_merge(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
@@ -166,7 +175,7 @@ def resolve_config(user_config: dict[str, Any]) -> dict[str, Any]:
     Parameters
     ----------
     user_config
-        Parsed YAML content from a user config file.
+        Parsed config content from a user config file.
 
     Returns
     -------
@@ -227,14 +236,14 @@ def validate_config(config: dict[str, Any]) -> None:
 
 
 def dump_yaml_config(config: dict[str, Any], path: str | Path) -> None:
-    """Write a config dictionary to YAML.
+    """Write a config dictionary as pretty JSON.
 
     Parameters
     ----------
     config
         Configuration dictionary.
     path
-        Output YAML path.
+        Output file path (``.json`` or ``.yaml``).
 
     Notes
     -----
@@ -244,7 +253,18 @@ def dump_yaml_config(config: dict[str, Any], path: str | Path) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(config, handle, sort_keys=False)
+        json.dump(config, handle, indent=2)
+        handle.write("\n")
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    """Backward-compatible alias for :func:`load_yaml_config`."""
+    return load_yaml_config(path)
+
+
+def dump_config(config: dict[str, Any], path: str | Path) -> None:
+    """Backward-compatible alias for :func:`dump_yaml_config`."""
+    dump_yaml_config(config, path)
 
 
 def slugify_variant_name(raw_name: str) -> str:
