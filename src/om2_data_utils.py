@@ -13,13 +13,13 @@ import xarray as xr
 import pyearthtools.data as petdata
 from pyearthtools.data.transforms import TransformCollection
 import pyearthtools.data.archive as archive
-from pyearthtools.data.indexes import DataFileSystemIndex
+from pyearthtools.data.indexes import ArchiveIndex
+from pyearthtools.data.exceptions import DataNotFoundError as PetDataNotFoundError
 from pyearthtools.data.time import Petdt
 
 
-class DataNotFoundError(Exception):
+class DataNotFoundError(PetDataNotFoundError):
     """Exception raised when expected data file is not found."""
-    pass
 
 
 @archive.register_archive(
@@ -29,9 +29,9 @@ class DataNotFoundError(Exception):
         root="",
     ),
 )
-class ACCESS_OHC(DataFileSystemIndex):
+class ACCESS_OHC(ArchiveIndex):
     """User-defined ACCESS Ocean Heat Content archive.
-    
+
     This archive provides access to ocean heat content data from the
     ACCESS-OM2 model. It supports querying by year, month, or specific datetime.
     """
@@ -50,10 +50,11 @@ class ACCESS_OHC(DataFileSystemIndex):
         *,
         root: str | Path,
         transforms=None,
+        data_interval: tuple[int, str] | int | str = (1, "month"),
         **kwargs: Any,
     ):
         """Initialize the ACCESS_OHC archive.
-        
+
         Parameters
         ----------
         variables : str or list[str]
@@ -62,6 +63,9 @@ class ACCESS_OHC(DataFileSystemIndex):
             Root directory containing the ocean heat data.
         transforms : TransformCollection, optional
             Data transformations to apply.
+        data_interval : tuple[int, str] | int | str, optional
+            Nominal temporal interval for AdvancedTimeIndex-style operations,
+            by default (1, "month").
         **kwargs
             Additional arguments passed to parent class.
         """
@@ -72,14 +76,16 @@ class ACCESS_OHC(DataFileSystemIndex):
 
         super().__init__(
             transforms=base + (transforms or TransformCollection()),
+            data_interval=data_interval,
             **kwargs,
         )
         self.record_initialisation()
 
-    def search(self, *args, **kwargs):
-        """Search for data files.
-        
-        Ignore time entirely: dataset is time-complete.
+    def filesystem(self, querytime, **kwargs):
+        """Resolve archive path for a given query time.
+
+        The ACCESS_OHC dataset is time-complete and stored in one NetCDF file,
+        so all query times map to the same path.
         """
         path = self.root / "1deg_ocean_heat_emulator_data.nc"
         if not path.exists():
@@ -90,7 +96,7 @@ class ACCESS_OHC(DataFileSystemIndex):
 
     def get(self, querytime, **kwargs):
         """Retrieve data for a specific time or time range.
-        
+
         Parameters
         ----------
         querytime : str
@@ -98,7 +104,7 @@ class ACCESS_OHC(DataFileSystemIndex):
             - "YYYY" for full year
             - "YYYY-MM" for specific month
             - datetime string for nearest match
-            
+
         Returns
         -------
         xr.Dataset
@@ -107,38 +113,42 @@ class ACCESS_OHC(DataFileSystemIndex):
         path = self.root / "1deg_ocean_heat_emulator_data.nc"
         if not path.exists():
             raise DataNotFoundError(f"ACCESS_OHC file not found at {path!r}")
-    
+
         ds = xr.open_dataset(path)
-    
+
         # Keep only requested variables
         keep = [v for v in self.variables if v in ds.data_vars]
         if keep:
             ds = ds[keep]
-    
+
         qt = str(querytime)
-    
+
         # -------------------------
         # Case 1: "YYYY" → full year
         # -------------------------
         if len(qt) == 4 and qt.isdigit():
             start = pd.Timestamp(f"{qt}-01-01")
             end = pd.Timestamp(f"{int(qt)+1}-01-01")
-            return ds.sel(time=slice(
-                np.datetime64(start),
-                np.datetime64(end),
-            ))
-    
+            return ds.sel(
+                time=slice(
+                    np.datetime64(start),
+                    np.datetime64(end),
+                )
+            )
+
         # -------------------------
         # Case 2: "YYYY-MM" → month
         # -------------------------
         if len(qt) == 7 and qt[4] == "-":
             start = pd.Timestamp(f"{qt}-01")
             end = start + pd.offsets.MonthBegin(1)
-            return ds.sel(time=slice(
-                np.datetime64(start),
-                np.datetime64(end),
-            ))
-    
+            return ds.sel(
+                time=slice(
+                    np.datetime64(start),
+                    np.datetime64(end),
+                )
+            )
+
         # -------------------------
         # Case 3: exact datetime → nearest
         # -------------------------
