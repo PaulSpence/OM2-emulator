@@ -7,15 +7,11 @@ Provides custom data archive accessors for loading ocean heat content and surfac
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-import pandas as pd
-import xarray as xr
 import pyearthtools.data as petdata
 from pyearthtools.data.transforms import TransformCollection
 import pyearthtools.data.archive as archive
 from pyearthtools.data.indexes import ArchiveIndex
 from pyearthtools.data.exceptions import DataNotFoundError as PetDataNotFoundError
-from pyearthtools.data.time import Petdt
 
 
 class DataNotFoundError(PetDataNotFoundError):
@@ -91,66 +87,8 @@ class ACCESS_OHC(ArchiveIndex):
         if not path.exists():
             raise DataNotFoundError(f"ACCESS_OHC file not found at {path!r}")
 
-        # Map each requested variable to the same file
-        return {v: path for v in self.variables}
-
-    def get(self, querytime, **kwargs):
-        """Retrieve data for a specific time or time range.
-
-        Parameters
-        ----------
-        querytime : str
-            Time specification. Can be:
-            - "YYYY" for full year
-            - "YYYY-MM" for specific month
-            - datetime string for nearest match
-
-        Returns
-        -------
-        xr.Dataset
-            Dataset containing requested variables for the specified time.
-        """
-        path = self.root / "1deg_ocean_heat_emulator_data.nc"
-        if not path.exists():
-            raise DataNotFoundError(f"ACCESS_OHC file not found at {path!r}")
-
-        ds = xr.open_dataset(path)
-
-        # Keep only requested variables
-        keep = [v for v in self.variables if v in ds.data_vars]
-        if keep:
-            ds = ds[keep]
-
-        qt = str(querytime)
-
-        # -------------------------
-        # Case 1: "YYYY" → full year
-        # -------------------------
-        if len(qt) == 4 and qt.isdigit():
-            start = pd.Timestamp(f"{qt}-01-01")
-            end = pd.Timestamp(f"{int(qt)+1}-01-01")
-            return ds.sel(
-                time=slice(
-                    np.datetime64(start),
-                    np.datetime64(end),
-                )
-            )
-
-        # -------------------------
-        # Case 2: "YYYY-MM" → month
-        # -------------------------
-        if len(qt) == 7 and qt[4] == "-":
-            start = pd.Timestamp(f"{qt}-01")
-            end = start + pd.offsets.MonthBegin(1)
-            return ds.sel(
-                time=slice(
-                    np.datetime64(start),
-                    np.datetime64(end),
-                )
-            )
-
-        # -------------------------
-        # Case 3: exact datetime → nearest
-        # -------------------------
-        qt_dt = np.datetime64(str(Petdt(querytime)))
-        return ds.sel(time=qt_dt, method="nearest")
+        # Return a single file path (not {var: path} mapping). The per-variable
+        # selection is already handled by the Trim transform in __init__, and
+        # returning duplicate paths via a dict can push xarray/open_mfdataset
+        # into an unnecessary concat path during pipeline iteration.
+        return path
