@@ -1,4 +1,5 @@
 data/*.nc
 notebooks/.ipynb*
 src/__pycache__/*
-
+notebooks/*.invalid
+src/.ipynb*

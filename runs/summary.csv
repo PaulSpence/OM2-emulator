@@ -1,0 +1,2 @@
+run_name,run_dir,device,final_epoch_loss,total_steps,rmse_OHC,rmse_HeatFlux
+smoke_baseline,/g/data/v46/txs156/OM2-emulator/runs/smoke_baseline_20260413T062701Z,cpu,1.6594387690226238,3,1821582999934.1367,108.76082844140632
