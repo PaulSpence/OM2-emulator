@@ -12,6 +12,7 @@ from pyearthtools.data.transforms import TransformCollection
 import pyearthtools.data.archive as archive
 from pyearthtools.data.indexes import ArchiveIndex
 from pyearthtools.data.exceptions import DataNotFoundError as PetDataNotFoundError
+import xarray as xr
 
 
 class DataNotFoundError(PetDataNotFoundError):
@@ -67,6 +68,7 @@ class ACCESS_OHC(ArchiveIndex):
         """
         self.variables = [variables] if isinstance(variables, str) else list(variables)
         self.root = Path(root)
+        self._ocean_mask: xr.DataArray | None = None
 
         base = petdata.transforms.variables.Trim(self.variables)
 
@@ -77,13 +79,56 @@ class ACCESS_OHC(ArchiveIndex):
         )
         self.record_initialisation()
 
+    def _dataset_path(self) -> Path:
+        """Return the canonical ACCESS_OHC NetCDF path."""
+        return self.root / "1deg_ocean_heat_emulator_data.nc"
+
+    def _get_ocean_mask(self) -> xr.DataArray:
+        """Compute and cache ocean-valid mask (1=ocean, 0=land)."""
+        if self._ocean_mask is None:
+            path = self._dataset_path()
+            if not path.exists():
+                raise DataNotFoundError(f"ACCESS_OHC file not found at {path!r}")
+
+            with xr.open_dataset(path) as ds_mask:
+                if "total_surface_heat_flx" not in ds_mask:
+                    raise DataNotFoundError(
+                        "ACCESS_OHC variable 'total_surface_heat_flx' not found for mask creation."
+                    )
+
+                mask = xr.where(
+                    ds_mask["total_surface_heat_flx"].isel(time=0).isnull(),
+                    0,
+                    1,
+                )
+                self._ocean_mask = mask.load()
+
+        return self._ocean_mask
+
+    def _apply_land_nan_mask(self, data: xr.Dataset | xr.DataArray):
+        """Set land points to NaN using mask derived from surface heat flux."""
+        ocean_mask = self._get_ocean_mask()
+        ocean_valid = ocean_mask == 1
+
+        if isinstance(data, xr.Dataset):
+            masked = data.copy()
+            for name, da in masked.data_vars.items():
+                if {"yt_ocean", "xt_ocean"}.issubset(da.dims):
+                    masked[name] = da.where(ocean_valid)
+            return masked
+
+        if isinstance(data, xr.DataArray) and {"yt_ocean", "xt_ocean"}.issubset(data.dims):
+            return data.where(ocean_valid)
+
+        return data
+
     def filesystem(self, querytime, **kwargs):
         """Resolve archive path for a given query time.
 
         The ACCESS_OHC dataset is time-complete and stored in one NetCDF file,
         so all query times map to the same path.
         """
-        path = self.root / "1deg_ocean_heat_emulator_data.nc"
+        path = self._dataset_path()
         if not path.exists():
             raise DataNotFoundError(f"ACCESS_OHC file not found at {path!r}")
 
@@ -92,3 +137,8 @@ class ACCESS_OHC(ArchiveIndex):
         # returning duplicate paths via a dict can push xarray/open_mfdataset
         # into an unnecessary concat path during pipeline iteration.
         return path
+
+    def get(self, querytime, **kwargs):
+        """Retrieve data and mask land points as NaN on spatial variables."""
+        data = super().get(querytime, **kwargs)
+        return self._apply_land_nan_mask(data)
