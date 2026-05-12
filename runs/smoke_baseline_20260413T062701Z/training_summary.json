@@ -1,0 +1,10 @@
+{
+  "epoch_losses": [
+    1.6594387690226238
+  ],
+  "epoch_sample_counts": [
+    3
+  ],
+  "learning_rate": 0.0001,
+  "total_steps": 3
+}

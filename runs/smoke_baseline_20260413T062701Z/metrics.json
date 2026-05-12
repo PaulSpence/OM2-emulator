@@ -1,0 +1,9 @@
+{
+  "device": "cpu",
+  "final_epoch_loss": 1.6594387690226238,
+  "rmse_HeatFlux": 108.76082844140632,
+  "rmse_OHC": 1821582999934.1367,
+  "run_dir": "/g/data/v46/txs156/OM2-emulator/runs/smoke_baseline_20260413T062701Z",
+  "run_name": "smoke_baseline",
+  "total_steps": 3
+}
