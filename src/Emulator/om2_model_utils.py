@@ -7,6 +7,9 @@ and training autoencoder models on ACCESS-OM2 data.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import lightning as L
 
 
 class PartialConv2d(nn.Module):
@@ -168,7 +171,7 @@ class PartialConv2d(nn.Module):
 # See GH issue: https://github.com/ACCESS-Community-Hub/PyEarthTools/issues/266
 # NB: This wrapper should probably also move out of this notebook
 
-class LightingWrapper(L.LightningModule):
+class LightningWrapper(L.LightningModule):
     def __init__(self, model, mask, lr=1e-4):
         super().__init__()
         self.model = model
@@ -386,3 +389,7 @@ class UNet(nn.Module):
         reconstructed = reconstructed[:, :, :input_h, :input_w]
 
         return reconstructed
+
+
+# Backwards-compatible alias for notebooks that used the old misspelling.
+LightingWrapper = LightningWrapper

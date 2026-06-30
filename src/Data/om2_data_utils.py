@@ -12,6 +12,8 @@ from pyearthtools.data.transforms import TransformCollection
 import pyearthtools.data.archive as archive
 from pyearthtools.data.indexes import ArchiveIndex
 from pyearthtools.data.exceptions import DataNotFoundError as PetDataNotFoundError
+import torch
+from torch.utils.data import DataLoader, TensorDataset
 import xarray as xr
 
 

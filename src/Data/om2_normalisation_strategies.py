@@ -1,4 +1,12 @@
-# Define a function to build the normalisations depending on the strategy -- should be moved to a separate Python function file
+import warnings
+
+import numpy as np
+import pandas as pd
+import pyearthtools.pipeline as petpipe
+import xarray as xr
+
+
+# Define a function to build the normalisations depending on the strategy.
 def build_normalisation(file, norm_strat, norm_variables, time_window, train_end, mask, area_weight=True, mask_var_index=1):
     #Load the xarray data and time/variable slice it. 
     ds_stats = xr.open_dataset(file)
