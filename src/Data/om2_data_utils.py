@@ -142,3 +142,20 @@ class ACCESS_OHC(ArchiveIndex):
         """Retrieve data and mask land points as NaN on spatial variables."""
         data = super().get(querytime, **kwargs)
         return self._apply_land_nan_mask(data)
+
+def make_fast_dl(pet_dl, batch_size=8, shuffle=False, drop_last=False):
+    xs = []
+
+    for batch in pet_dl:
+        x = batch[0] if isinstance(batch, (tuple, list)) else batch
+        xs.append(x.detach().cpu())
+
+    xs = torch.cat(xs, dim=0)
+
+    return DataLoader(
+        TensorDataset(xs),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=0,
+        drop_last=drop_last,
+    )
