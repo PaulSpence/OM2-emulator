@@ -306,11 +306,61 @@ class AutoEncoder(nn.Module):
         return reconstructed
 
 
+class IdentityLatentProcessor(nn.Module):
+    """
+    Default latent-space processor used when no refinement module is requested.
+
+    It preserves the existing UNet behaviour while giving the forward pass a
+    stable hook for optional latent-space modules.
+    """
+
+    def forward(self, latent, latent_mask):
+        return latent, latent_mask
+
+
+class ForwardDiffusion(nn.Module):
+    """
+    Deterministic latent-space residual refiner for the forward UNet.
+
+    This is not a stochastic denoising-diffusion sampler. It is a small,
+    mask-aware residual module that operates on the encoded UNet latent state
+    before decoding. The input and output shapes are identical, so it can be
+    swapped for another latent processor without changing the decoder contract.
+    """
+
+    def __init__(
+        self,
+        channel_count=64,
+        hidden_channel_count=None,
+        residual_scale=0.1,
+    ):
+        super().__init__()
+
+        hidden_channel_count = hidden_channel_count or channel_count
+        self.diff1 = PartialConv2d(channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1)
+        self.diff2 = PartialConv2d(hidden_channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1)
+        self.diff3 = PartialConv2d(hidden_channel_count, channel_count, kernel_size=3, stride=1, padding=1)
+        self.relu = nn.ReLU()
+        self.residual_scale = residual_scale
+
+    def forward(self, latent, latent_mask):
+        correction, mask = self.diff1(latent, latent_mask)
+        correction = self.relu(correction)
+
+        correction, mask = self.diff2(correction, mask)
+        correction = self.relu(correction)
+
+        correction, mask = self.diff3(correction, mask)
+
+        return latent + self.residual_scale * correction, mask
+
+
 class UNet(nn.Module):
 
     def __init__(self,
                  input_channel_count=2,
-                 output_channel_count=2):
+                 output_channel_count=2,
+                 latent_processor=None):
 
         super(UNet, self).__init__()
 
@@ -328,6 +378,7 @@ class UNet(nn.Module):
 
         self.dec3 = PartialConv2d(16, output_channel_count, kernel_size=4, stride=1, padding=2)
 
+        self.latent_processor = latent_processor or IdentityLatentProcessor()
         self.relu = nn.ReLU()
 
     def encode(self, x, mask):
@@ -379,6 +430,7 @@ class UNet(nn.Module):
         input_h, input_w = x.shape[2], x.shape[3]
 
         latent, latent_mask, x1, mask1, x2, mask2 = self.encode(x, mask)
+        latent, latent_mask = self.latent_processor(latent, latent_mask)
 
         reconstructed, final_mask = self.decode(
             latent, latent_mask,

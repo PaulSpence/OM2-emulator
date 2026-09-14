@@ -35,6 +35,8 @@ class ACCESS_OHC(ArchiveIndex):
     ACCESS-OM2 model. It supports querying by year, month, or specific datetime.
     """
 
+    auxiliary_coordinates = ("geolat_t", "geolon_t")
+
     @property
     def _desc_(self):
         return {
@@ -124,6 +126,13 @@ class ACCESS_OHC(ArchiveIndex):
 
         return data
 
+    def _drop_auxiliary_coordinates(self, data: xr.Dataset | xr.DataArray):
+        """Drop 2D grid metadata coordinates that are not model inputs."""
+        if isinstance(data, (xr.Dataset, xr.DataArray)):
+            return data.drop_vars(self.auxiliary_coordinates, errors="ignore")
+
+        return data
+
     def filesystem(self, querytime, **kwargs):
         """Resolve archive path for a given query time.
 
@@ -143,7 +152,8 @@ class ACCESS_OHC(ArchiveIndex):
     def get(self, querytime, **kwargs):
         """Retrieve data and mask land points as NaN on spatial variables."""
         data = super().get(querytime, **kwargs)
-        return self._apply_land_nan_mask(data)
+        data = self._apply_land_nan_mask(data)
+        return self._drop_auxiliary_coordinates(data)
 
 def make_fast_dl(pet_dl, batch_size=8, shuffle=False, drop_last=False):
     xs = []
