@@ -12,6 +12,8 @@ from pyearthtools.data.transforms import TransformCollection
 import pyearthtools.data.archive as archive
 from pyearthtools.data.indexes import ArchiveIndex
 from pyearthtools.data.exceptions import DataNotFoundError as PetDataNotFoundError
+import torch
+from torch.utils.data import DataLoader, TensorDataset
 import xarray as xr
 
 
@@ -32,6 +34,8 @@ class ACCESS_OHC(ArchiveIndex):
     This archive provides access to ocean heat content data from the
     ACCESS-OM2 model. It supports querying by year, month, or specific datetime.
     """
+
+    auxiliary_coordinates = ("geolat_t", "geolon_t")
 
     @property
     def _desc_(self):
@@ -122,6 +126,13 @@ class ACCESS_OHC(ArchiveIndex):
 
         return data
 
+    def _drop_auxiliary_coordinates(self, data: xr.Dataset | xr.DataArray):
+        """Drop 2D grid metadata coordinates that are not model inputs."""
+        if isinstance(data, (xr.Dataset, xr.DataArray)):
+            return data.drop_vars(self.auxiliary_coordinates, errors="ignore")
+
+        return data
+
     def filesystem(self, querytime, **kwargs):
         """Resolve archive path for a given query time.
 
@@ -141,4 +152,22 @@ class ACCESS_OHC(ArchiveIndex):
     def get(self, querytime, **kwargs):
         """Retrieve data and mask land points as NaN on spatial variables."""
         data = super().get(querytime, **kwargs)
-        return self._apply_land_nan_mask(data)
+        data = self._apply_land_nan_mask(data)
+        return self._drop_auxiliary_coordinates(data)
+
+def make_fast_dl(pet_dl, batch_size=8, shuffle=False, drop_last=False):
+    xs = []
+
+    for batch in pet_dl:
+        x = batch[0] if isinstance(batch, (tuple, list)) else batch
+        xs.append(x.detach().cpu())
+
+    xs = torch.cat(xs, dim=0)
+
+    return DataLoader(
+        TensorDataset(xs),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=0,
+        drop_last=drop_last,
+    )
