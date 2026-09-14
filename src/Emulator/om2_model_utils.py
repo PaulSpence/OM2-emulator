@@ -318,7 +318,7 @@ class IdentityLatentProcessor(nn.Module):
         return latent, latent_mask
 
 
-class ForwardDiffusion(nn.Module):
+class ResidualNetwork(nn.Module):
     """
     Deterministic latent-space residual refiner for the forward UNet.
 
@@ -353,6 +353,10 @@ class ForwardDiffusion(nn.Module):
         correction, mask = self.diff3(correction, mask)
 
         return latent + self.residual_scale * correction, mask
+
+
+# Backwards-compatible alias for notebooks that used the old module name.
+ForwardDiffusion = ResidualNetwork
 
 
 class UNet(nn.Module):

@@ -1,4 +1,4 @@
-from .om2_model_utils import AutoEncoder, ForwardDiffusion, IdentityLatentProcessor, LightningWrapper, PartialConv2d, UNet
+from .om2_model_utils import AutoEncoder, ForwardDiffusion, IdentityLatentProcessor, LightningWrapper, PartialConv2d, ResidualNetwork, UNet
 
 __all__ = [
     "AutoEncoder",
@@ -6,5 +6,6 @@ __all__ = [
     "IdentityLatentProcessor",
     "LightningWrapper",
     "PartialConv2d",
+    "ResidualNetwork",
     "UNet",
 ]
