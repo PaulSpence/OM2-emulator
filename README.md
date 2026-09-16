@@ -18,6 +18,7 @@ Since emulating SST from SAT doesn't seem that challenging, we would like to try
 # Ryan's process for getting PyEarthTools working (latest) and notebooks working on GPU hopper
 
 ### ARE session settings:
+```
 Cluster: ncigadi
 Walltime (hours): 2
 Queue: gpuhopper
@@ -34,6 +35,7 @@ Python or Conda virtual environment base:
 Conda environment:
 Environment variables: PYTHONUSERBASE=/g/data/dx2/rmh561/python-userbase
 Jobfs size: 100GB
+```
 
 ### Installing PyEarthTools:
 - clone latest `develop` branch from https://github.com/ACCESS-Community-Hub/PyEarthTools to somewhere on gdata.
