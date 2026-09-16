@@ -7,3 +7,4 @@ __pycache__/
 notebooks/*.invalid
 src/.ipynb*
 .ipynb_checkpoints/
+*__pycache__*
