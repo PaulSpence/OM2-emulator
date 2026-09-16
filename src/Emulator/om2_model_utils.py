@@ -1,7 +1,7 @@
 """
-Utility functions and modules for OM2 emulator models.
+Machine Learning modules for OM2 emulator.
 
-This module contains neural network components and utilities for building
+This module contains neural network components for building
 and training autoencoder models on ACCESS-OM2 data.
 """
 
@@ -318,7 +318,7 @@ class IdentityLatentProcessor(nn.Module):
         return latent, latent_mask
 
 
-class ResidualNetwork(nn.Module):
+class LatentResidualTuner(nn.Module):
     """
     Deterministic latent-space residual refiner for the forward UNet.
 
@@ -355,8 +355,45 @@ class ResidualNetwork(nn.Module):
         return latent + self.residual_scale * correction, mask
 
 
-# Backwards-compatible alias for notebooks that used the old module name.
-ForwardDiffusion = ResidualNetwork
+class SpatialResidualHead(nn.Module):
+    """
+    Mask-aware output-space residual correction head.
+
+    This operates on the full-resolution prediction grid, optionally conditioned
+    on the original forward-emulator inputs. Unlike LatentResidualTuner, this
+    module directly corrects the predicted OHC spatial pattern.
+    """
+
+    def __init__(
+        self,
+        input_channel_count,
+        output_channel_count=1,
+        hidden_channel_count=16,
+        residual_scale=0.1,
+    ):
+        super().__init__()
+
+        self.head1 = PartialConv2d(input_channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1)
+        self.head2 = PartialConv2d(hidden_channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1)
+        self.head3 = PartialConv2d(hidden_channel_count, output_channel_count, kernel_size=3, stride=1, padding=1)
+        self.relu = nn.ReLU()
+        self.residual_scale = residual_scale
+
+    def forward(self, prediction, conditioning, mask):
+        if conditioning is None:
+            x = prediction
+        else:
+            x = torch.cat([prediction, conditioning], dim=1)
+
+        correction, mask = self.head1(x, mask)
+        correction = self.relu(correction)
+
+        correction, mask = self.head2(correction, mask)
+        correction = self.relu(correction)
+
+        correction, mask = self.head3(correction, mask)
+
+        return prediction + self.residual_scale * correction
 
 
 class UNet(nn.Module):

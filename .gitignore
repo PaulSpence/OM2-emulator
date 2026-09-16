@@ -1,7 +1,9 @@
 data/*.nc
 data/*_rollout_*.pt
 notebooks/.ipynb*
-src/__pycache__/*
+__pycache__/
+*.py[cod]
+*$py.class
 notebooks/*.invalid
 src/.ipynb*
 .ipynb_checkpoints/
