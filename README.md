@@ -14,3 +14,41 @@ Redo Aim 1, but using ACCESS-OM2-01 ocean data and future atmosphere from Qian o
 
 ## Aim 3: 
 Since emulating SST from SAT doesn't seem that challenging, we would like to try to autoregressively emulate ACCESS-OM2-1’s vertically integrated ocean heat content evolution given surface forcing (basically, emulate Huguenin et al. 2022; https://www.nature.com/articles/s41467-022-32540-5 Nat Comms.) See here: https://github.com/PaulSpence/OM2-emulator/issues/3#issue-2535255067
+
+# Ryan's process for getting PyEarthTools working (latest) and notebooks working on GPU hopper
+
+### ARE session settings:
+```
+Cluster: ncigadi
+Walltime (hours): 2
+Queue: gpuhopper
+Compute Size: 1gpu
+Project: nm47
+Storage: gdata/nm47+gdata/dk92+gdata/dx2
+Software:
+Settings:
+Show advanced settings: 1
+Extra arguments:
+Module directories: /g/data/dk92/apps/Modules/modulefiles/
+Modules: pet/2025.08
+Python or Conda virtual environment base:
+Conda environment:
+Environment variables: PYTHONUSERBASE=/g/data/dx2/rmh561/python-userbase
+Jobfs size: 100GB
+```
+
+### Installing PyEarthTools:
+- clone latest `develop` branch from https://github.com/ACCESS-Community-Hub/PyEarthTools to somewhere on gdata.
+- In that PyEarthTools directory, ensure that
+```
+pet > echo $PYTHONUSERBASE
+/g/data/dx2/rmh561/python-userbase
+```
+- Then do `/opt/conda/envs/pet/bin/python -m pip install --user -r requirements.txt`
+- Once installed, open a Jupyter notebook with the "PET-Python" kernel.
+- Run
+```
+import pyearthtools
+print(pyearthtools.__path__)
+```
+If this is pointing to directories in your PyEarthTools repository on gdata, then you're good to go.
