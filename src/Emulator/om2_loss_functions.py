@@ -10,6 +10,49 @@ import torch
 import torch.nn.functional as F
 
 
+def step_weight(weight, rollout_step, like):
+    """
+    Return a scalar tensor weight for the current rollout step.
+
+    ``weight`` may be either a scalar, applied to every rollout step, or a
+    sequence/tensor with one entry per rollout step. This lets later forecast
+    months be emphasized or de-emphasized without changing the rollout loop.
+    Per-step weights are normalised to have mean 1, so they do not need to sum
+    to 1 and do not change the overall loss scale just because the schedule has
+    larger numbers.
+    """
+    if torch.is_tensor(weight):
+        if weight.ndim == 0:
+            return weight.to(device=like.device, dtype=like.dtype)
+        if rollout_step is None:
+            raise ValueError("Per-step loss weights require rollout_step in the loss context")
+        if rollout_step >= weight.numel():
+            raise ValueError(
+                f"Per-step loss weights have length {weight.numel()}, "
+                f"but rollout_step={rollout_step} was requested"
+            )
+        flat_weight = weight.flatten().to(device=like.device, dtype=like.dtype)
+        normaliser = flat_weight.mean()
+        if float(normaliser.detach().cpu()) == 0.0:
+            raise ValueError("Per-step loss weights must have non-zero mean")
+        return flat_weight[rollout_step] / normaliser
+
+    if isinstance(weight, (list, tuple)):
+        if rollout_step is None:
+            raise ValueError("Per-step loss weights require rollout_step in the loss context")
+        if rollout_step >= len(weight):
+            raise ValueError(
+                f"Per-step loss weights have length {len(weight)}, "
+                f"but rollout_step={rollout_step} was requested"
+            )
+        normaliser = sum(weight) / len(weight)
+        if normaliser == 0.0:
+            raise ValueError("Per-step loss weights must have non-zero mean")
+        return like.new_tensor(weight[rollout_step] / normaliser)
+
+    return like.new_tensor(float(weight))
+
+
 def expand_ocean_mask(mask, like):
     valid_mask = mask.to(device=like.device, dtype=like.dtype)
     if valid_mask.ndim == 2:
@@ -42,25 +85,25 @@ def physical_field(normalised, mean_lookup, std_lookup, time_index):
 
 def local_mse_loss(weight=1.0):
     """Return a weighted masked local MSE loss callable."""
-    weight = float(weight)
 
-    def loss_fn(*, pred_t, target_t, mask, **_):
-        if weight == 0.0:
+    def loss_fn(*, pred_t, target_t, mask, rollout_step=None, **_):
+        current_weight = step_weight(weight, rollout_step, pred_t)
+        if current_weight == 0.0:
             return pred_t.new_zeros(())
         step_err = (pred_t - target_t) ** 2
         valid_mask = expand_ocean_mask(mask, step_err)
         loss = (step_err * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
-        return weight * loss
+        return current_weight * loss
 
     return loss_fn
 
 
 def spectral_loss(weight=1.0, eps=1.0e-6):
     """Return a weighted masked log-amplitude spectral loss callable."""
-    weight = float(weight)
 
-    def loss_fn(*, pred_t, target_t, mask, **_):
-        if weight == 0.0:
+    def loss_fn(*, pred_t, target_t, mask, rollout_step=None, **_):
+        current_weight = step_weight(weight, rollout_step, pred_t)
+        if current_weight == 0.0:
             return pred_t.new_zeros(())
 
         valid_mask = expand_ocean_mask(mask, pred_t)
@@ -76,7 +119,7 @@ def spectral_loss(weight=1.0, eps=1.0e-6):
         target_amp = torch.fft.rfft2(target_anom, norm="ortho").abs()
 
         loss = F.mse_loss(torch.log1p(pred_amp + eps), torch.log1p(target_amp + eps))
-        return weight * loss
+        return current_weight * loss
 
     return loss_fn
 
@@ -87,7 +130,6 @@ def global_closure_loss(
     closure_min_scale=1.0e20,
 ):
     """Return a weighted cumulative global heat-closure loss callable."""
-    weight = float(weight)
 
     def loss_fn(
         *,
@@ -104,9 +146,11 @@ def global_closure_loss(
         forcing_mean,
         forcing_std,
         dt_seconds,
+        rollout_step=None,
         **_,
     ):
-        if weight == 0.0:
+        current_weight = step_weight(weight, rollout_step, pred_t)
+        if current_weight == 0.0:
             return pred_t.new_zeros(())
 
         area_t = area.to(device=pred_t.device, dtype=pred_t.dtype)
@@ -134,7 +178,7 @@ def global_closure_loss(
             forcing_integral_global.detach().abs().mean(),
             ohc_change_global.detach().abs().mean(),
         ).clamp_min(closure_min_scale)
-        return weight * ((residual / scale) ** 2).mean()
+        return current_weight * ((residual / scale) ** 2).mean()
 
     return loss_fn
 
@@ -179,6 +223,7 @@ def total_rollout_loss(
             forcing_time_indices = target_time_indices[:, : step + 1].to(pred_t.device)
 
         context = dict(
+            rollout_step=step,
             pred_t=pred_t,
             target_t=target_t,
             mask=mask,
