@@ -2,6 +2,7 @@ data/*.nc
 data/*_rollout_*.pt
 notebooks/.ipynb*
 __pycache__/
+figures/*
 *.py[cod]
 *$py.class
 notebooks/*.invalid
