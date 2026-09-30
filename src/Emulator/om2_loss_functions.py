@@ -122,9 +122,14 @@ def global_closure_loss(
     surface_flux_sign=1.0,
     closure_min_scale=1.0e20,
     heat_flux_channel_index=0,
+    ohc_channel_index=0,
 ):
     """
     Return a weighted cumulative global heat-closure loss callable.
+
+    ``ohc_channel_index`` picks OHC out of the prediction and the initial state
+    when the model predicts several prognostic variables, (B, P, H, W). With a
+    single prognostic variable (P = 1) it has no effect.
 
     ``heat_flux_channel_index`` picks the surface heat flux out of a
     channel-stacked forcing tensor (e.g. heat flux + tau_x + tau_y). Only heat
@@ -221,8 +226,12 @@ def global_closure_loss(
         # axis, so indexing it with a (B,) tensor of time indices gives the
         # (B, H, W) std field for each sample's month. The initial and target
         # months generally differ, so each state needs its own std_t.
+        # With several prognostic variables, keep only the OHC channel.
+        if initial_ohc_norm.ndim == 4 and initial_ohc_norm.shape[1] > 1:
+            initial_ohc_norm = initial_ohc_norm[:, ohc_channel_index]
+        pred_ohc = pred_t[:, ohc_channel_index] if pred_t.ndim == 4 and pred_t.shape[1] > 1 else pred_t
         initial_ohc_norm = squeeze_field_axes(initial_ohc_norm)  # (B, H, W) z-score
-        pred_ohc_norm = squeeze_field_axes(pred_t)                # (B, H, W) z-score
+        pred_ohc_norm = squeeze_field_axes(pred_ohc)              # (B, H, W) z-score
         initial_ohc_std_t = ohc_std[initial_time_index].to(device=pred_t.device, dtype=pred_t.dtype)
         target_ohc_std_t = ohc_std[target_time_index].to(device=pred_t.device, dtype=pred_t.dtype)
 
@@ -312,9 +321,17 @@ def total_rollout_loss(
     forcing_std=None,
     dt_seconds=30 * 24 * 60 * 60,
     initial_forcing=None,
+    n_prognostic=1,
 ):
     """
     Run an autoregressive rollout and average any supplied loss callables.
+
+    ``initial_prior_states`` is (B, n_prior * n_prognostic, H, W): the prior
+    states stacked oldest first, each contributing ``n_prognostic`` channels.
+    After every step the oldest state is dropped and the prediction appended.
+
+    ``target_sequence`` is either (B, n_steps, H, W) for one prognostic variable
+    or (B, n_steps, n_prognostic, H, W).
 
     ``forcing_sequence`` is either (B, n_steps, H, W) for a single forcing
     variable, or (B, n_steps, C, H, W) for channel-stacked forcing. Each step
@@ -330,7 +347,9 @@ def total_rollout_loss(
         raise ValueError("total_rollout_loss requires at least one loss function")
 
     prior_states = initial_prior_states
-    initial_ohc_norm = initial_prior_states[:, 1:2]
+    # The most recent prior state (all prognostic variables): the rollout's
+    # starting point for the closure term.
+    initial_ohc_norm = initial_prior_states[:, -n_prognostic:]
     initial_time_index = None
     if target_time_indices is not None:
         initial_time_index = target_time_indices[:, 0].to(initial_prior_states.device) - 1
@@ -343,7 +362,11 @@ def total_rollout_loss(
             forcing_t = forcing_sequence[:, step]
         else:
             forcing_t = forcing_sequence[:, step : step + 1]
-        target_t = target_sequence[:, step : step + 1]
+        # (B, n_steps, P, H, W) -> (B, P, H, W); (B, n_steps, H, W) -> (B, 1, H, W).
+        if target_sequence.ndim == 5:
+            target_t = target_sequence[:, step]
+        else:
+            target_t = target_sequence[:, step : step + 1]
         pred_t = model(prior_states, forcing_t, mask)
 
         target_time_index = None
@@ -377,6 +400,7 @@ def total_rollout_loss(
         for loss_fn in losses:
             total = total + loss_fn(**context)
 
-        prior_states = torch.cat([prior_states[:, 1:2], pred_t], dim=1)
+        # Drop the oldest prior state (n_prognostic channels), append the prediction.
+        prior_states = torch.cat([prior_states[:, n_prognostic:], pred_t], dim=1)
 
     return total / n_steps

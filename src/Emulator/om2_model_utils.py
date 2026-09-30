@@ -345,13 +345,14 @@ class LatentResidualTuner(nn.Module):
         channel_count=64,
         hidden_channel_count=None,
         residual_scale=0.1,
+        padding_mode="replicate",
     ):
         super().__init__()
 
         hidden_channel_count = hidden_channel_count or channel_count
-        self.diff1 = PartialConv2d(channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1)
-        self.diff2 = PartialConv2d(hidden_channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1)
-        self.diff3 = PartialConv2d(hidden_channel_count, channel_count, kernel_size=3, stride=1, padding=1)
+        self.diff1 = PartialConv2d(channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
+        self.diff2 = PartialConv2d(hidden_channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
+        self.diff3 = PartialConv2d(hidden_channel_count, channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
         self.relu = nn.ReLU()
         self.residual_scale = residual_scale
 
@@ -382,12 +383,13 @@ class SpatialResidualHead(nn.Module):
         output_channel_count=1,
         hidden_channel_count=16,
         residual_scale=0.1,
+        padding_mode="replicate",
     ):
         super().__init__()
 
-        self.head1 = PartialConv2d(input_channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1)
-        self.head2 = PartialConv2d(hidden_channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1)
-        self.head3 = PartialConv2d(hidden_channel_count, output_channel_count, kernel_size=3, stride=1, padding=1)
+        self.head1 = PartialConv2d(input_channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
+        self.head2 = PartialConv2d(hidden_channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
+        self.head3 = PartialConv2d(hidden_channel_count, output_channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
         self.relu = nn.ReLU()
         self.residual_scale = residual_scale
 
