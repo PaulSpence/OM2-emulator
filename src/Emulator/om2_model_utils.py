@@ -74,14 +74,26 @@ class PartialConv2d(nn.Module):
     padding : int
         Padding size.
 
+    padding_mode : str
+        How the grid edges are padded, for both the data and the mask
+        convolution: "replicate" (default) or "zeros".
+
+        * "replicate" copies the edge values outwards, avoiding artificial
+          zeros near the boundary. It is slow in training on the GPU: PyTorch
+          pads explicitly and then calls cuDNN without padding, and for these
+          shapes cuDNN picks a slow backward kernel for the 7x7 convolutions.
+        * "zeros" is ~2x faster per training step and uses ~35% less memory
+          (measured on a V100). It is also consistent with the partial
+          convolution: the zero-padded mask marks the padded cells as invalid,
+          so the kernel_area / mask_sum renormalisation corrects the edges the
+          same way it corrects coastlines.
+
     Notes
     -----
-    * padding_mode='replicate' is used to avoid artificial zeros near the
-      boundary.
     * The mask convolution is fixed (all weights = 1) and has no gradients.
     """
 
-    def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1):
+    def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1, padding_mode="replicate"):
         super().__init__()
 
         self.conv = nn.Conv2d(
@@ -90,7 +102,7 @@ class PartialConv2d(nn.Module):
             kernel_size=kernel_size,
             stride=stride,
             padding=padding,
-            padding_mode="replicate",
+            padding_mode=padding_mode,
         )
 
         # convolution used only to count valid pixels
@@ -100,7 +112,7 @@ class PartialConv2d(nn.Module):
             kernel_size=kernel_size,
             stride=stride,
             padding=padding,
-            padding_mode="replicate",
+            padding_mode=padding_mode,
             bias=False,
         )
 
@@ -401,23 +413,26 @@ class UNet(nn.Module):
     def __init__(self,
                  input_channel_count=2,
                  output_channel_count=2,
-                 latent_processor=None):
+                 latent_processor=None,
+                 padding_mode="replicate"):
+        # padding_mode is passed to every PartialConv2d layer; see
+        # PartialConv2d for the "replicate" vs "zeros" trade-off.
 
         super(UNet, self).__init__()
 
         # ---------- Encoder ----------
-        self.enc1 = PartialConv2d(input_channel_count, 16, kernel_size=4, stride=2, padding=1)
-        self.enc2 = PartialConv2d(16, 32, kernel_size=3, stride=2, padding=1)
-        self.enc3 = PartialConv2d(32, 64, kernel_size=7, stride=1, padding=3)
+        self.enc1 = PartialConv2d(input_channel_count, 16, kernel_size=4, stride=2, padding=1, padding_mode=padding_mode)
+        self.enc2 = PartialConv2d(16, 32, kernel_size=3, stride=2, padding=1, padding_mode=padding_mode)
+        self.enc3 = PartialConv2d(32, 64, kernel_size=7, stride=1, padding=3, padding_mode=padding_mode)
 
         # ---------- Decoder ----------
         # After first upsample, latent has 64 channels and skip2 has 32 channels
-        self.dec1 = PartialConv2d(64 + 32, 32, kernel_size=7, stride=1, padding=3)
+        self.dec1 = PartialConv2d(64 + 32, 32, kernel_size=7, stride=1, padding=3, padding_mode=padding_mode)
 
         # After second upsample, dec1 has 32 channels and skip1 has 16 channels
-        self.dec2 = PartialConv2d(32 + 16, 16, kernel_size=3, stride=1, padding=1)
+        self.dec2 = PartialConv2d(32 + 16, 16, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
 
-        self.dec3 = PartialConv2d(16, output_channel_count, kernel_size=4, stride=1, padding=2)
+        self.dec3 = PartialConv2d(16, output_channel_count, kernel_size=4, stride=1, padding=2, padding_mode=padding_mode)
 
         self.latent_processor = latent_processor or IdentityLatentProcessor()
         self.relu = nn.ReLU()
