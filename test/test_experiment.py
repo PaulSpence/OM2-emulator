@@ -9,7 +9,12 @@ import importlib.util
 import sys
 import types
 
-import numpy as np
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 import pandas as pd
 import pytest
 import torch
@@ -36,10 +41,13 @@ from Experiment import (  # noqa: E402
     build_trainer,
     check_known_closure,
     compute_normalisation,
+    plot_global_rmse_all_variables,
+    plot_rmse_by_epoch,
+    plot_skill_evaluation,
     run_control,
     run_skill_test,
 )
-from Experiment.training import RolloutSchedule  # noqa: E402
+from Experiment.training import PerVariableError, RolloutSchedule  # noqa: E402
 
 PROGNOSTIC = ["ocean_heat_content_2d"]
 FORCING = ["total_surface_heat_flx", "tau_x", "tau_y"]
@@ -275,15 +283,24 @@ def test_model_options_forward_backward(data_and_cfg, output_head, latent_proces
     assert torch.isfinite(prior.grad).all()
 
 
-def test_two_prognostic_variables(synthetic_file, tmp_path):
-    """tau_x as a second prognostic variable: channels, rollout and closure all follow."""
-    cfg = make_cfg(
+TWO_PROGNOSTIC = ["ocean_heat_content_2d", "tau_x"]
+
+
+def two_prognostic_cfg(synthetic_file, tmp_path, **overrides):
+    """tau_x as a second prognostic variable (tau_y stays forcing)."""
+    return make_cfg(
         synthetic_file, tmp_path,
-        data=DataConfig(path=str(synthetic_file), prognostic=["ocean_heat_content_2d", "tau_x"],
+        data=DataConfig(path=str(synthetic_file), prognostic=list(TWO_PROGNOSTIC),
                         forcing=["total_surface_heat_flx", "tau_y"],
                         normalisation=NormalisationConfig(fit_period=("2000-01", "2003-12")),
                         cache_dir=str(tmp_path / "cache")),
+        **overrides,
     )
+
+
+def test_two_prognostic_variables(synthetic_file, tmp_path):
+    """tau_x as a second prognostic variable: channels, rollout and closure all follow."""
+    cfg = two_prognostic_cfg(synthetic_file, tmp_path)
     data = build_data(cfg, verbose=False)
     module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
     batch = next(iter(data.train_dl))
@@ -354,3 +371,75 @@ def test_known_closure_runs(data_and_cfg):
     result = check_known_closure(cfg, data, warn_threshold=np.inf)
     assert len(result["by_lead"]) == cfg.window.posterior_steps
     assert np.isfinite(result["mean"])
+
+
+# =============================================================================
+# Per-variable RMSE and the multi-variable evaluation figures
+# =============================================================================
+
+def test_per_variable_error_is_area_weighted_and_adds_no_loss():
+    rng = torch.Generator().manual_seed(0)
+    area = torch.rand(H, W, generator=rng) + 0.5
+    mask = (torch.rand(H, W, generator=rng) > 0.3).float()
+    pred = torch.randn(4, 3, H, W, generator=rng)
+    target = pred.clone()
+    target[:, 1] += 2.0
+    target[:, 2] += 3.0 * (1 - mask)  # error on land only: ignored
+    metric = PerVariableError(3)
+    for _ in range(3):
+        assert metric(pred_t=pred, target_t=target, mask=mask, area=area).item() == 0.0
+    np.testing.assert_allclose(metric.pop_rmse().numpy(), [0.0, 2.0, 0.0], atol=1e-5)
+    assert metric.pop_rmse() is None  # reset after popping
+
+
+def test_rmse_history_per_variable(synthetic_file, tmp_path):
+    """Training records train/val RMSE per variable and epoch, in memory and in metrics.csv."""
+    run_dir = tmp_path / "run"
+    cfg = two_prognostic_cfg(
+        synthetic_file, tmp_path,
+        train=TrainConfig(batch_size=8, max_epochs=2, gpu_check=False, run_dir=str(run_dir)),
+    )
+    data = build_data(cfg, verbose=False)
+    module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
+    build_trainer(cfg).fit(module, data.train_dl, data.valid_dl)
+
+    history = module.rmse_history
+    assert len(history) == 2 * 2 * len(TWO_PROGNOSTIC)  # epochs x stages x variables
+    assert set(history["variable"]) == set(TWO_PROGNOSTIC)
+    assert set(history["stage"]) == {"train", "val"}
+    assert sorted(set(history["epoch"])) == [0, 1]
+    assert np.isfinite(history["rmse"]).all() and (history["rmse"] > 0).all()
+
+    metrics = pd.read_csv(run_dir / "metrics.csv")
+    for stage in ("train", "val"):
+        for name in TWO_PROGNOSTIC:
+            assert f"{stage}_rmse_{name}" in metrics
+
+    for source in (history, run_dir):
+        fig = plot_rmse_by_epoch(source, TWO_PROGNOSTIC)
+        assert len(fig.axes) == len(TWO_PROGNOSTIC)
+        assert all(len(ax.lines) == 2 for ax in fig.axes)  # training + validation
+        plt.close(fig)
+
+
+def test_evaluation_figures_for_every_variable(synthetic_file, tmp_path):
+    cfg = two_prognostic_cfg(synthetic_file, tmp_path)
+    data = build_data(cfg, verbose=False)
+    skill = run_skill_test(cfg, build_model(cfg, data), data)
+    periods = ["2004-06", "2005-01", "2005"]
+
+    for name in TWO_PROGNOSTIC:
+        fig = plot_skill_evaluation(skill, name, periods, {"ocean_heat_content_2d": 2e9}, None)
+        maps = [ax for ax in fig.axes if ax.collections and ax.get_label() != "<colorbar>"]
+        assert len(maps) == 3 * len(periods)
+        timeseries = [ax for ax in fig.axes if len(ax.lines) >= 2]
+        assert len(timeseries) == 1  # predicted + truth, full width underneath
+        path = tmp_path / f"{name}_skill_evaluation.png"
+        fig.savefig(path)
+        assert path.stat().st_size > 0
+        plt.close(fig)
+
+    fig = plot_global_rmse_all_variables(skill, TWO_PROGNOSTIC)
+    assert len(fig.axes) == len(TWO_PROGNOSTIC)
+    assert all(np.isfinite(ax.lines[0].get_ydata()).all() for ax in fig.axes)
+    plt.close(fig)

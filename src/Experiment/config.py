@@ -192,8 +192,11 @@ class EvalConfig:
     run_control: bool = False
     # Snapshot maps: months ("YYYY-MM") or years ("YYYY"), one row each.
     snapshot_periods: list = field(default_factory=lambda: ["2005-05", "2010-12", "2015-12"])
-    anomaly_scale: float = 2e9
-    difference_scale: float = 2e9
+    # Colour limits of the anomaly / difference maps: a number for every
+    # variable, {variable: number}, or None. Variables without a number get
+    # the 99th percentile of |truth anomaly| / |difference|.
+    anomaly_scale: object = None
+    difference_scale: object = None
 
 
 @dataclass

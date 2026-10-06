@@ -12,6 +12,7 @@ import warnings
 from pathlib import Path
 
 import lightning as L
+import pandas as pd
 import torch
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
@@ -53,6 +54,39 @@ def check_gpu():
     return others
 
 
+class PerVariableError:
+    """
+    A zero-valued "loss" that accumulates the area-weighted squared error of
+    every prognostic variable (in normalised units) over a rollout, so the
+    module can report a per-variable RMSE each epoch without changing the loss.
+    """
+
+    def __init__(self, n_prognostic):
+        self.n_prognostic = n_prognostic
+        self.reset()
+
+    def reset(self):
+        self.squared_error = None  # (P,) sum of weighted squared error
+        self.weight = 0.0          # sum of the weights (one per sample and step)
+
+    def __call__(self, *, pred_t, target_t, mask, area, **_):
+        with torch.no_grad():
+            weight = (area * mask).float()
+            weight = weight / weight.sum()
+            error = ((pred_t.float() - target_t.float()) ** 2 * weight).sum(dim=(0, -2, -1))
+            self.squared_error = error if self.squared_error is None else self.squared_error + error
+            self.weight += pred_t.shape[0]
+        return pred_t.new_zeros(())
+
+    def pop_rmse(self):
+        """Per-variable RMSE since the last reset, or None; then reset."""
+        if self.squared_error is None:
+            return None
+        rmse = torch.sqrt(self.squared_error / self.weight).cpu()
+        self.reset()
+        return rmse
+
+
 class EmulatorModule(L.LightningModule):
     """
     Autoregressive rollout training for a ForwardEmulator.
@@ -67,6 +101,10 @@ class EmulatorModule(L.LightningModule):
         self.model = model
         self.losses = list(losses)
         self.n_prognostic = data.n_prognostic
+        self.prognostic_names = list(data.fields["prognostic_names"])
+        # Per-variable RMSE (normalised units) per epoch and stage; see rmse_history.
+        self.errors = {stage: PerVariableError(self.n_prognostic) for stage in ("train", "val")}
+        self.history = []
         w, tr = cfg.window, cfg.train
         self.train_steps = w.rollout_steps  # updated by RolloutSchedule, if used
         self.valid_steps = w.valid_rollout_steps or w.rollout_steps
@@ -93,7 +131,7 @@ class EmulatorModule(L.LightningModule):
             forcing_sequence=batch["forcing"],
             target_sequence=batch["target"],
             mask=self.mask,
-            losses=self.losses,
+            losses=[*self.losses, self.errors[stage]],
             n_steps=n_steps,
             target_time_indices=batch["target_time_index"],
             area=self.area,
@@ -110,6 +148,25 @@ class EmulatorModule(L.LightningModule):
             if value is not None:
                 self.log(f"{stage}_{term.name}", value / n_steps, on_step=False, on_epoch=True, batch_size=batch_size)
         return loss
+
+    def _log_rmse(self, stage):
+        rmse = self.errors[stage].pop_rmse()
+        if rmse is None or self.trainer.sanity_checking:
+            return
+        for name, value in zip(self.prognostic_names, rmse.tolist()):
+            self.log(f"{stage}_rmse_{name}", value)
+            self.history.append({"epoch": self.current_epoch, "stage": stage, "variable": name, "rmse": value})
+
+    def on_train_epoch_end(self):
+        self._log_rmse("train")
+
+    def on_validation_epoch_end(self):
+        self._log_rmse("val")
+
+    @property
+    def rmse_history(self):
+        """Per-variable RMSE (normalised units): DataFrame of epoch, stage, variable, rmse."""
+        return pd.DataFrame(self.history, columns=["epoch", "stage", "variable", "rmse"])
 
     def training_step(self, batch, batch_idx):
         return self._step(batch, self.train_steps, "train")

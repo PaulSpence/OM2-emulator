@@ -29,7 +29,17 @@ from .data import ExperimentData, RolloutWindowDataset, build_data, compute_norm
 from .evaluation import check_known_closure, global_integral, global_rmse, run_control, run_skill_test
 from .losses import build_losses
 from .models import ForwardEmulator, build_model, count_parameters
-from .plots import plot_control, plot_global_rmse, plot_global_timeseries, plot_snapshots, plot_training_history
+from .plots import (
+    plot_control,
+    plot_global_rmse,
+    plot_global_rmse_all_variables,
+    plot_global_timeseries,
+    plot_rmse_by_epoch,
+    plot_skill_evaluation,
+    plot_snapshots,
+    plot_training_history,
+    prognostic_variables,
+)
 from .training import EmulatorModule, build_module, build_trainer, check_gpu
 
 __all__ = [
@@ -57,9 +67,13 @@ __all__ = [
     "count_parameters",
     "plot_control",
     "plot_global_rmse",
+    "plot_global_rmse_all_variables",
     "plot_global_timeseries",
+    "plot_rmse_by_epoch",
+    "plot_skill_evaluation",
     "plot_snapshots",
     "plot_training_history",
+    "prognostic_variables",
     "EmulatorModule",
     "build_module",
     "build_trainer",
