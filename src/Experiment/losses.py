@@ -14,28 +14,51 @@ so ``step_weights`` shifts emphasis between lead times without changing the
 overall size of the loss.
 """
 
-from Emulator import global_closure_loss, local_mse_loss, spectral_loss
+from Emulator import budget_closure_loss, local_mse_loss, spectral_loss
 
-from .config import _is_active
+from .config import CLOSURE_SUFFIX, _is_active
 
 
-def _closure(cfg, data):
-    d, lo = cfg.data, cfg.loss
-    return global_closure_loss(
+def closure_loss(cfg, budget):
+    """The unit-weight closure callable for cfg.loss.closures[budget]."""
+    d, closure = cfg.data, cfg.loss.closures[budget]
+    return budget_closure_loss(
         weight=1.0,
-        surface_flux_sign=lo.surface_flux_sign,
-        closure_min_scale=lo.closure_min_scale,
-        heat_flux_channel_index=d.forcing.index(d.heat_flux_variable),
-        ohc_channel_index=d.prognostic.index(d.ohc_variable),
+        budget=budget,
+        content_channel_index=d.prognostic.index(closure.content_variable),
+        flux_channel_index=d.forcing.index(closure.flux_variable),
+        surface_flux_sign=closure.surface_flux_sign,
+        min_scale=closure.min_scale,
     )
 
 
-# Loss terms by name: (cfg, data) -> callable(**rollout_context) with unit weight.
+def closure_std_fields(cfg, data):
+    """
+    {budget: (content_std, flux_std)} for every active closure, each (T, H, W)
+    in physical units: the rollout context's ``closure_std``.
+    """
+    d, f = cfg.data, data.fields
+    return {
+        budget: (
+            f["prognostic_std"][:, d.prognostic.index(closure.content_variable)],
+            f["forcing_std"][:, d.forcing.index(closure.flux_variable)],
+        )
+        for budget, closure in cfg.active_closures().items()
+    }
+
+
+# Fitting terms by name: (cfg, data) -> callable(**rollout_context) with unit
+# weight. "<budget>_closure" terms are built by closure_loss.
 LOSS_TERMS = {
     "local_mse": lambda cfg, data: local_mse_loss(weight=1.0),
     "spectral": lambda cfg, data: spectral_loss(weight=1.0),
-    "global_closure": _closure,
 }
+
+
+def _term(cfg, data, name):
+    if name.endswith(CLOSURE_SUFFIX):
+        return closure_loss(cfg, name[: -len(CLOSURE_SUFFIX)])
+    return LOSS_TERMS[name](cfg, data)
 
 
 class WeightedLossTerm:
@@ -83,5 +106,5 @@ def build_losses(cfg, data):
         if not _is_active(weight):
             continue
         per_step = list(weight) if isinstance(weight, (list, tuple)) else [weight] * n_steps
-        terms.append(WeightedLossTerm(name, LOSS_TERMS[name](cfg, data), [w * r for w, r in zip(per_step, relative)]))
+        terms.append(WeightedLossTerm(name, _term(cfg, data, name), [w * r for w, r in zip(per_step, relative)]))
     return terms

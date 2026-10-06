@@ -61,11 +61,16 @@ def _power_of_ten(values):
     return 10.0**exponent, f"$10^{{{exponent}}}$"
 
 
-def plot_snapshots(skill, periods, anomaly_scale=2e9, difference_scale=2e9, variable=None):
-    """Predicted anomaly, true anomaly and their difference, one row per period."""
+def plot_snapshots(skill, periods, anomaly_scale=None, difference_scale=None, variable=None):
+    """
+    Predicted anomaly, true anomaly and their difference, one row per period.
+    Scales as in plot_skill_evaluation (None = automatic).
+    """
     variable = variable or _default_variable(skill)
     pred, truth = skill[f"{variable}_pred_anom"], skill[f"{variable}_truth_anom"]
     units = pred.attrs.get("units", "")
+    anomaly_scale = _scale_for(anomaly_scale, variable, truth)
+    difference_scale = _scale_for(difference_scale, variable, pred - truth)
     fig, axes = plt.subplots(len(periods), 3, figsize=(15, 4 * len(periods)), squeeze=False, constrained_layout=True)
     for row, period in enumerate(periods):
         p, label = _select_period(pred, period)
@@ -113,18 +118,7 @@ def plot_skill_evaluation(skill, variable, periods, anomaly_scale=None, differen
         fig.colorbar(image, ax=axes[:2], shrink=0.9, label=f"anomaly ({units})")
         fig.colorbar(diff, ax=axes[2], shrink=0.9, label=f"difference ({units})")
 
-    ax = fig.add_subplot(grid[n_rows, :])
-    area = skill["area"]
-    series = {label: global_integral(skill[f"{variable}_{suffix}"], area).values
-              for suffix, label in (("pred_anom", "Predicted"), ("truth_anom", "Truth"))}
-    scale, scale_label = _power_of_ten(np.concatenate(list(series.values())))
-    for label, values in series.items():
-        ax.plot(skill.time.values, values / scale, label=label, lw=2)
-    ax.axhline(0.0, color="0.5", lw=0.8)
-    ax.set_title(f"Global-integrated {variable} anomaly through the skill test")
-    ax.set_ylabel(f"Integrated anomaly ({scale_label} {units} m$^2$)")
-    ax.grid(alpha=0.3)
-    ax.legend(frameon=False)
+    _plot_global_anomaly(fig.add_subplot(grid[n_rows, :]), skill, variable)
     fig.suptitle(f"{variable}: skill test", fontsize=14)
     return fig
 
@@ -178,17 +172,27 @@ def plot_rmse_by_epoch(history, variables=None):
     return fig
 
 
-def plot_global_timeseries(skill, variable=None, scale=1e22, scale_label="$10^{22}$"):
+def _plot_global_anomaly(ax, ds, variable, suffixes=(("pred_anom", "Predicted"), ("truth_anom", "Truth")),
+                         x="time"):
+    """Area-integrated anomaly series on ax, scaled by a power of ten (units x m^2)."""
+    units = ds[f"{variable}_pred_anom"].attrs.get("units", "")
+    series = {label: global_integral(ds[f"{variable}_{suffix}"], ds["area"]).values for suffix, label in suffixes}
+    scale, scale_label = _power_of_ten(np.concatenate(list(series.values())))
+    for label, values in series.items():
+        ax.plot(ds[x].values, values / scale, label=label, lw=2)
+    ax.axhline(0.0, color="0.5", lw=0.8)
+    ax.set_ylabel(f"Integrated anomaly ({scale_label} {units} m$^2$)")
+    ax.grid(alpha=0.3)
+    if len(series) > 1:
+        ax.legend(frameon=False)
+
+
+def plot_global_timeseries(skill, variable=None):
     """Global-integrated anomaly, predicted vs true, through the skill test."""
     variable = variable or _default_variable(skill)
-    area = skill["area"]
     fig, ax = plt.subplots(figsize=(11, 4.5), constrained_layout=True)
-    for suffix, label in (("pred_anom", "Predicted"), ("truth_anom", "Truth")):
-        ax.plot(skill.time.values, global_integral(skill[f"{variable}_{suffix}"], area).values / scale, label=label, lw=2)
+    _plot_global_anomaly(ax, skill, variable)
     ax.set_title(f"Global-integrated {variable} anomaly through the skill test")
-    ax.set_ylabel(f"Integrated anomaly ({scale_label} x area units)")
-    ax.grid(alpha=0.3)
-    ax.legend(frameon=False)
     return fig
 
 
@@ -204,16 +208,18 @@ def plot_global_rmse(skill, variable=None):
     return fig
 
 
-def plot_control(control, variable=None, scale=1e22, scale_label="$10^{22}$"):
-    """Global-integrated anomaly through the control run (drift under repeated forcing)."""
-    variable = variable or _default_variable(control)
-    series = global_integral(control[f"{variable}_pred_anom"], control["area"])
-    fig, ax = plt.subplots(figsize=(11, 4.5), constrained_layout=True)
-    ax.plot(control.step.values, series.values / scale, lw=2)
-    ax.set_title(f"Control run: global-integrated {variable} anomaly")
-    ax.set_xlabel("Rollout step (months)")
-    ax.set_ylabel(f"Integrated anomaly ({scale_label} x area units)")
-    ax.grid(alpha=0.3)
+def plot_control(control, variables=None):
+    """
+    Global-integrated anomaly through the control run (drift under repeated
+    forcing), one panel per variable (default: every prognostic variable).
+    """
+    variables = [variables] if isinstance(variables, str) else variables or prognostic_variables(control)
+    fig, axes = plt.subplots(len(variables), 1, figsize=(11, 3.2 * len(variables)), sharex=True,
+                             squeeze=False, constrained_layout=True)
+    for ax, variable in zip(axes[:, 0], variables):
+        _plot_global_anomaly(ax, control, variable, suffixes=(("pred_anom", "Predicted"),), x="step")
+        ax.set_title(f"Control run: global-integrated {variable} anomaly")
+    axes[-1, 0].set_xlabel("Rollout step (months)")
     return fig
 
 

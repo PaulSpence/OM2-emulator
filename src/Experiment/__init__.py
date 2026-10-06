@@ -15,6 +15,7 @@ pipeline, model, losses, training and evaluation all live in this package.
 """
 
 from .config import (
+    ClosureConfig,
     DataConfig,
     EvalConfig,
     ExperimentConfig,
@@ -25,7 +26,7 @@ from .config import (
     TrainConfig,
     WindowConfig,
 )
-from .data import ExperimentData, RolloutWindowDataset, build_data, compute_normalisation
+from .data import ExperimentData, InitialMonthDataset, build_data, compute_normalisation, gather_windows
 from .evaluation import check_known_closure, global_integral, global_rmse, run_control, run_skill_test
 from .losses import build_losses
 from .models import ForwardEmulator, build_model, count_parameters
@@ -43,6 +44,7 @@ from .plots import (
 from .training import EmulatorModule, build_module, build_trainer, check_gpu
 
 __all__ = [
+    "ClosureConfig",
     "DataConfig",
     "EvalConfig",
     "ExperimentConfig",
@@ -53,8 +55,9 @@ __all__ = [
     "TrainConfig",
     "WindowConfig",
     "ExperimentData",
-    "RolloutWindowDataset",
+    "InitialMonthDataset",
     "build_data",
+    "gather_windows",
     "compute_normalisation",
     "check_known_closure",
     "global_integral",

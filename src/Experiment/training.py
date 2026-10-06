@@ -19,6 +19,9 @@ from lightning.pytorch.loggers import CSVLogger
 
 from Emulator import total_rollout_loss
 
+from .data import gather_windows
+from .losses import closure_std_fields
+
 
 def cuda_is_usable():
     """True if CUDA is available AND this PyTorch build supports the GPU."""
@@ -91,14 +94,23 @@ class EmulatorModule(L.LightningModule):
     """
     Autoregressive rollout training for a ForwardEmulator.
 
-    Each batch is a dict from RolloutWindowDataset. The loss is
-    Emulator.total_rollout_loss over the configured loss terms, which feeds
-    every prediction back in as the newest prior state.
+    Each batch is a (B,) tensor of initial months from the dataloaders. The
+    normalised fields live on the module's device (non-persistent buffers, so
+    they stay out of checkpoints), and each batch's windows are cut there with
+    gather_windows: only the rollout steps in use, with no CPU work and no
+    host-to-device copy. A ready-made window dict (gather_windows' output) is
+    accepted too. The loss is Emulator.total_rollout_loss over the configured
+    loss terms, which feeds every prediction back in as the newest prior state.
     """
 
     def __init__(self, model, losses, data, cfg):
         super().__init__()
         self.model = model
+        # The compiled wrapper shares self.model's parameters. It is kept out
+        # of the module tree so state_dict / checkpoints keep plain key names.
+        self.__dict__["_run_model"] = torch.compile(model) if cfg.train.compile_model else model
+        self.checkpoint_steps = cfg.train.checkpoint_rollout_steps
+        self.steps_in_memory = cfg.train.rollout_steps_in_memory
         self.losses = list(losses)
         self.n_prognostic = data.n_prognostic
         self.prognostic_names = list(data.fields["prognostic_names"])
@@ -106,26 +118,43 @@ class EmulatorModule(L.LightningModule):
         self.errors = {stage: PerVariableError(self.n_prognostic) for stage in ("train", "val")}
         self.history = []
         w, tr = cfg.window, cfg.train
+        self.n_prior = w.n_prior
         self.train_steps = w.rollout_steps  # updated by RolloutSchedule, if used
         self.valid_steps = w.valid_rollout_steps or w.rollout_steps
         self.dt_seconds = cfg.loss.seconds_per_step
         self.lr, self.weight_decay = tr.lr, tr.weight_decay
         self.lr_scheduler, self.max_epochs = tr.lr_scheduler, tr.max_epochs
 
-        f, d = data.fields, cfg.data
+        f = data.fields
+        # The normalised fields, moved to the GPU with the module (~1 GB per
+        # four variables at 1 degree). Not saved in checkpoints.
+        self.register_buffer("prognostic_z", f["prognostic"].float(), persistent=False)
+        self.register_buffer("forcing_z", f["forcing"].float(), persistent=False)
         self.register_buffer("mask", f["mask"].float())
         self.register_buffer("area", f["area"].float())
-        # Normalisation std fields used by the closure term to turn z-scores
-        # into physical anomalies. Placeholders of 1 if the closure is unused.
-        ones = torch.ones_like(f["prognostic"][:, 0])
-        ohc_std = f["prognostic_std"][:, d.prognostic.index(d.ohc_variable)] if d.ohc_variable in d.prognostic else ones
-        heat_flux_std = f["heat_flux_std"] if f["heat_flux_std"] is not None else ones
-        self.register_buffer("ohc_std", ohc_std.float())
-        self.register_buffer("heat_flux_std", heat_flux_std.float())
+        # Normalisation std fields that the closure terms use to turn z-scores
+        # into physical anomalies: (T, H, W) content and flux std per active
+        # budget. Only active budgets are kept, as each pair costs GPU memory.
+        self.budgets = []
+        for budget, (content_std, flux_std) in closure_std_fields(cfg, data).items():
+            self.register_buffer(f"{budget}_content_std", content_std.float())
+            self.register_buffer(f"{budget}_flux_std", flux_std.float())
+            self.budgets.append(budget)
+
+    @property
+    def closure_std(self):
+        """{budget: (content_std, flux_std)} on the module's device."""
+        return {b: (getattr(self, f"{b}_content_std"), getattr(self, f"{b}_flux_std")) for b in self.budgets}
+
+    def windows(self, t0, n_steps):
+        """Rollout windows for initial months t0, cut on the module's device."""
+        return gather_windows(self.prognostic_z, self.forcing_z, t0, self.n_prior, n_steps)
 
     def _step(self, batch, n_steps, stage):
+        if not isinstance(batch, dict):
+            batch = self.windows(batch, n_steps)
         loss = total_rollout_loss(
-            model=self.model,
+            model=self._run_model,
             # (B, n_prior, P, H, W) -> (B, n_prior * P, H, W), oldest state first
             initial_prior_states=batch["prior"].flatten(1, 2),
             forcing_sequence=batch["forcing"],
@@ -135,11 +164,12 @@ class EmulatorModule(L.LightningModule):
             n_steps=n_steps,
             target_time_indices=batch["target_time_index"],
             area=self.area,
-            ohc_std=self.ohc_std,
-            forcing_std=self.heat_flux_std,
+            closure_std=self.closure_std,
             dt_seconds=self.dt_seconds,
             initial_forcing=batch["initial_forcing"],
             n_prognostic=self.n_prognostic,
+            checkpoint_steps=self.checkpoint_steps,
+            steps_in_memory=self.steps_in_memory,
         )
         batch_size = batch["prior"].shape[0]
         self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size)
@@ -227,6 +257,10 @@ def build_trainer(cfg):
     if use_gpu:
         torch.cuda.empty_cache()
 
+    # Batches are B integers (windows are cut on the GPU), so Lightning's
+    # advice to add DataLoader workers does not apply.
+    warnings.filterwarnings("ignore", message=".*does not have many workers.*")
+
     return L.Trainer(
         max_epochs=tr.max_epochs,
         accelerator="gpu" if use_gpu else "cpu",
@@ -236,6 +270,8 @@ def build_trainer(cfg):
         gradient_clip_val=tr.gradient_clip_val,
         check_val_every_n_epoch=tr.check_val_every_n_epoch,
         num_sanity_val_steps=0,
+        # Input shapes are fixed, so let cuDNN pick the fastest kernels once.
+        benchmark=True,
         logger=logger,
         enable_checkpointing=checkpointing,
         enable_model_summary=False,

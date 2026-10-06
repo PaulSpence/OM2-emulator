@@ -25,7 +25,7 @@ import torch
 import xarray as xr
 from torch.utils.data import DataLoader, Dataset
 
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2  # 2: forcing_std for every forcing channel (replaces heat_flux_std)
 
 
 # =============================================================================
@@ -104,7 +104,8 @@ def _open_time_axis(cfg):
         raise KeyError(f"{cfg.data.path} is missing {missing}; it has {sorted(ds.data_vars)}")
 
     # Guard against the Kelvin-OHC bug (fixed in Extract_om2_data.ipynb).
-    ohc = cfg.data.ohc_variable
+    heat = cfg.active_closures().get("heat")
+    ohc = heat.content_variable if heat is not None else None
     if ohc in ds and "273.15" not in str(ds[ohc].attrs.get("description", "")):
         warnings.warn(
             f"{ohc} in {cfg.data.path} does not say it was computed from Celsius "
@@ -155,11 +156,7 @@ def build_fields(cfg):
         stat = lambda s: lambda v: _broadcast_stat(s[v], like).fillna(0.0)
         prognostic_mean = stack(d.prognostic, stat(mean))
         prognostic_std = stack(d.prognostic, stat(std))
-        heat_flux_std = None
-        if d.heat_flux_variable in variables:
-            heat_flux_std = torch.as_tensor(
-                np.asarray(_broadcast_stat(std[d.heat_flux_variable], like).fillna(0.0).values), dtype=torch.float32
-            )
+        forcing_std = stack(d.forcing, stat(std))
 
         area = ds[d.area_variable]
         if "time" in area.dims:
@@ -178,7 +175,7 @@ def build_fields(cfg):
         "forcing": forcing,                  # (T, C, H, W) z-scores
         "prognostic_mean": prognostic_mean,  # (T, P, H, W) physical units
         "prognostic_std": prognostic_std,    # (T, P, H, W) physical units
-        "heat_flux_std": heat_flux_std,      # (T, H, W) or None
+        "forcing_std": forcing_std,          # (T, C, H, W) physical units (closure fluxes)
         "mask": torch.as_tensor(mask_np),    # (H, W), 1 = ocean
         "area": torch.as_tensor(area_np, dtype=torch.float64),  # (H, W) m^2, 0 on land
         "months": months,
@@ -226,43 +223,60 @@ def load_or_build_fields(cfg, rebuild=False, verbose=True):
 # Rollout windows
 # =============================================================================
 
-class RolloutWindowDataset(Dataset):
+def gather_windows(prognostic, forcing, t0, n_prior, n_steps):
     """
-    Rollout samples as windows into the normalised fields.
+    Rollout windows for the initial months t0 (B,), cut from the normalised
+    fields on the device they live on (no CPU work, no host-to-device copy
+    when the fields are on the GPU). Returns:
 
-    Sample i has initial month t0 = initial_indices[i] and returns:
-      prior           (n_prior, P, H, W)  months t0-n_prior+1 ... t0
-      target          (S, P, H, W)        months t0+1 ... t0+S
-      forcing         (S, C, H, W)        months t0+1 ... t0+S
-      initial_forcing (C, H, W)           month t0 (closure's two-month flux average)
-      target_time_index (S,)              time indices t0+1 ... t0+S
+      prior             (B, n_prior, P, H, W)  months t0-n_prior+1 ... t0
+      target            (B, n_steps, P, H, W)  months t0+1 ... t0+n_steps
+      forcing           (B, n_steps, C, H, W)  months t0+1 ... t0+n_steps
+      initial_forcing   (B, C, H, W)           month t0 (closure's two-month flux average)
+      target_time_index (B, n_steps)           time indices t0+1 ... t0+n_steps
+
+    Only n_steps target/forcing months are cut, so short rollouts (e.g. early
+    in a rollout_schedule) move proportionally less data.
+    """
+    device = prognostic.device
+    t0 = torch.as_tensor(t0, dtype=torch.long).to(device)
+    prior_index = t0[:, None] + torch.arange(-n_prior + 1, 1, device=device)
+    target_index = t0[:, None] + torch.arange(1, n_steps + 1, device=device)
+    return {
+        "prior": prognostic[prior_index],
+        "target": prognostic[target_index],
+        "forcing": forcing[target_index],
+        "initial_forcing": forcing[t0],
+        "target_time_index": target_index,
+    }
+
+
+class InitialMonthDataset(Dataset):
+    """
+    The samples' initial months (time indices), so a batch is just B integers.
+    The windows themselves are cut by gather_windows, on the GPU during
+    training (EmulatorModule keeps the normalised fields there).
     """
 
-    def __init__(self, prognostic, forcing, initial_indices, n_prior, n_steps):
-        self.prognostic = prognostic
-        self.forcing = forcing
+    def __init__(self, initial_indices):
         self.initial_indices = torch.as_tensor(initial_indices, dtype=torch.long)
-        self.n_prior = n_prior
-        self.n_steps = n_steps
 
     def __len__(self):
         return len(self.initial_indices)
 
     def __getitem__(self, i):
-        t0 = int(self.initial_indices[i])
-        first, last = t0 + 1, t0 + 1 + self.n_steps
-        return {
-            "prior": self.prognostic[t0 - self.n_prior + 1 : t0 + 1],
-            "target": self.prognostic[first:last],
-            "forcing": self.forcing[first:last],
-            "initial_forcing": self.forcing[t0],
-            "target_time_index": torch.arange(first, last),
-        }
+        return self.initial_indices[i]
 
 
 @dataclass
 class ExperimentData:
-    """Everything downstream code needs from the data, plus the dataloaders."""
+    """
+    Everything downstream code needs from the data, plus the dataloaders.
+
+    The dataloaders yield batches of initial months (B,) only; turn them into
+    windows with ``windows`` (on the CPU) or let EmulatorModule cut them on
+    the GPU.
+    """
 
     fields: dict
     month_index: dict
@@ -270,6 +284,8 @@ class ExperimentData:
     valid_indices: torch.Tensor
     train_dl: DataLoader
     valid_dl: DataLoader
+    n_prior: int
+    posterior_steps: int
 
     @property
     def n_prognostic(self):
@@ -282,6 +298,14 @@ class ExperimentData:
     @property
     def months(self):
         return self.fields["months"]
+
+    def windows(self, t0, n_steps=None, n_prior=None):
+        """Rollout windows (see gather_windows) for initial months t0, from the CPU fields."""
+        f = self.fields
+        return gather_windows(
+            f["prognostic"], f["forcing"], t0,
+            n_prior or self.n_prior, n_steps or self.posterior_steps,
+        )
 
     def index_of(self, month):
         try:
@@ -324,11 +348,15 @@ def build_data(cfg, rebuild=False, verbose=True):
     train_indices = split_indices(month_index, cfg.time.train, w.n_prior, w.posterior_steps, n_time, "train")
     valid_indices = split_indices(month_index, cfg.time.valid, w.n_prior, w.posterior_steps, n_time, "valid")
 
-    make = lambda idx: RolloutWindowDataset(fields["prognostic"], fields["forcing"], idx, w.n_prior, w.posterior_steps)
+    # Batches are initial months only; the windows are cut on the GPU (see
+    # gather_windows), so no worker processes are needed.
     tr = cfg.train
-    train_dl = DataLoader(make(train_indices), batch_size=tr.batch_size, shuffle=True, num_workers=tr.num_workers)
-    valid_dl = DataLoader(make(valid_indices), batch_size=tr.batch_size, shuffle=False, num_workers=tr.num_workers)
-    data = ExperimentData(fields, month_index, train_indices, valid_indices, train_dl, valid_dl)
+    train_dl = DataLoader(InitialMonthDataset(train_indices), batch_size=tr.batch_size, shuffle=True,
+                          num_workers=tr.num_workers)
+    valid_dl = DataLoader(InitialMonthDataset(valid_indices), batch_size=tr.batch_size, shuffle=False,
+                          num_workers=tr.num_workers)
+    data = ExperimentData(fields, month_index, train_indices, valid_indices, train_dl, valid_dl,
+                          w.n_prior, w.posterior_steps)
     if verbose:
         print(data.summary())
     return data

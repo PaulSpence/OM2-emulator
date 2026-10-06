@@ -15,19 +15,17 @@ import torch.nn as nn
 
 from Emulator import LatentResidualTuner, SpatialResidualHead, UNet
 
-# Backbones by name: (in_channels, out_channels, latent_processor, padding_mode) -> nn.Module
+# Backbones by name: (in_channels, out_channels, latent_processor, model config) -> nn.Module
 # mapping (B, in, H, W) and a (B, 1, H, W) mask to (B, out, H, W).
 ARCHITECTURES = {
-    "unet": lambda in_ch, out_ch, latent_processor, padding_mode: UNet(
+    "unet": lambda in_ch, out_ch, latent_processor, m: UNet(
         input_channel_count=in_ch,
         output_channel_count=out_ch,
         latent_processor=latent_processor,
-        padding_mode=padding_mode,
+        padding_mode=m.padding_mode,
+        width_multiplier=m.width_multiplier,
     ),
 }
-
-# Channels of the UNet bottleneck (enc3), which the latent processor refines.
-UNET_LATENT_CHANNELS = 64
 
 
 class ForwardEmulator(nn.Module):
@@ -41,13 +39,21 @@ class ForwardEmulator(nn.Module):
     returns (B, P, H, W): the next state, always float32 (so the losses stay
     in full precision when training with 16-bit mixed precision).
 
-    If ``output_processor`` is set it receives the backbone's prediction and
-    all model inputs, and returns the corrected prediction
+    The backbone predicts the CHANGE from the most recent prior state, so
+    next = prior[-1] + backbone(...). Persisting the current anomaly then costs
+    the network nothing, and it only has to learn the tendency. Land values
+    are ignored: the losses and the evaluation mask them out.
+
+    If ``output_processor`` is set it receives that prediction and all model
+    inputs, and returns the corrected prediction
     (e.g. SpatialResidualHead: pred + residual_scale * correction).
     """
 
-    def __init__(self, backbone, n_prior, n_prognostic, n_forcing, output_processor=None):
+    def __init__(self, backbone, n_prior, n_prognostic, n_forcing, output_processor=None, channels_last=False):
         super().__init__()
+        # channels_last: NHWC memory layout, faster for fp16 convolutions on
+        # tensor cores (V100); no effect on the results.
+        self.channels_last = channels_last
         self.backbone = backbone
         self.n_prior = n_prior
         self.n_prognostic = n_prognostic
@@ -56,14 +62,18 @@ class ForwardEmulator(nn.Module):
 
     def forward(self, prior, forcing, mask):
         x = torch.cat([prior, forcing], dim=1)
+        if self.channels_last:
+            x = x.contiguous(memory_format=torch.channels_last)
+        # One (1, 1, H, W) land mask broadcast over the batch: every partial
+        # convolution then counts valid pixels once, not once per sample.
         mask = mask.to(device=x.device, dtype=x.dtype)
         if mask.ndim == 2:
             mask = mask[None, None]
         elif mask.ndim == 3:
             mask = mask[:, None]
-        mask = mask.expand(x.shape[0], 1, x.shape[2], x.shape[3])
 
-        pred = self.backbone(x, mask)
+        # Most recent prior state: the last n_prognostic channels (oldest first).
+        pred = prior[:, -self.n_prognostic :] + self.backbone(x, mask)
         if self.output_processor is not None:
             pred = self.output_processor(pred, x, mask)
         return pred.float()
@@ -84,7 +94,8 @@ def build_model(cfg, data):
     latent_processor = None
     if m.latent_processor == "latent_residual":
         latent_processor = LatentResidualTuner(
-            channel_count=UNET_LATENT_CHANNELS,
+            # The UNet bottleneck width, which scales with in_channels.
+            channel_count=UNet.channel_widths(in_channels, m.width_multiplier)[-1],
             residual_scale=m.latent_residual_scale,
             padding_mode=m.padding_mode,
         )
@@ -100,8 +111,11 @@ def build_model(cfg, data):
             padding_mode=m.padding_mode,
         )
 
-    backbone = ARCHITECTURES[m.arch](in_channels, n_prognostic, latent_processor, m.padding_mode)
-    return ForwardEmulator(backbone, w.n_prior, n_prognostic, n_forcing, output_processor)
+    backbone = ARCHITECTURES[m.arch](in_channels, n_prognostic, latent_processor, m)
+    model = ForwardEmulator(backbone, w.n_prior, n_prognostic, n_forcing, output_processor, m.channels_last)
+    if m.channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    return model
 
 
 def count_parameters(model):

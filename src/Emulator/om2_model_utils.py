@@ -81,7 +81,7 @@ class PartialConv2d(nn.Module):
         * "replicate" copies the edge values outwards, avoiding artificial
           zeros near the boundary. It is slow in training on the GPU: PyTorch
           pads explicitly and then calls cuDNN without padding, and for these
-          shapes cuDNN picks a slow backward kernel for the 7x7 convolutions.
+          shapes cuDNN picks slow backward kernels (worst for large kernels).
         * "zeros" is ~2x faster per training step and uses ~35% less memory
           (measured on a V100). It is also consistent with the partial
           convolution: the zero-padded mask marks the padded cells as invalid,
@@ -91,6 +91,12 @@ class PartialConv2d(nn.Module):
     Notes
     -----
     * The mask convolution is fixed (all weights = 1) and has no gradients.
+    * The renormalisation depends only on the mask. When every sample shares
+      the land mask, pass it as (1, 1, H, W): the mask convolution then runs
+      once and is broadcast over the batch.
+    * The masking and the renormalisation are folded into one multiplication
+      by a precomputed factor (0 where no valid pixel exists), so each layer
+      keeps one fewer full-size activation for the backward pass.
     """
 
     def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1, padding_mode="replicate"):
@@ -136,7 +142,8 @@ class PartialConv2d(nn.Module):
         mask : torch.Tensor
             Binary mask tensor:
 
-                (batch, 1, height, width)
+                (batch, 1, height, width), or (1, 1, height, width) to
+                share one mask across the batch
 
             1 = valid pixel
             0 = invalid pixel
@@ -154,27 +161,48 @@ class PartialConv2d(nn.Module):
                 (batch, 1, new_height, new_width)
         """
 
-        # apply mask to input
-        x_masked = x * mask
-
-        # convolution
-        out = self.conv(x_masked)
-
-        # count valid pixels in each convolution window
         with torch.no_grad():
+            # count valid pixels in each convolution window
             mask_sum = self.mask_conv(mask)
+            valid = mask_sum > 0
+            # renormalisation factor, 0 where the window has no valid pixel
+            scale = torch.where(valid, self.kernel_area / (mask_sum + self.eps), torch.zeros_like(mask_sum))
+            # updated mask
+            new_mask = valid.to(mask.dtype)
 
-        # renormalize output
-        out = torch.where(
-            mask_sum > 0,
-            out * (self.kernel_area / (mask_sum + self.eps)),
-            torch.zeros_like(out),
-        )
-
-        # updated mask
-        new_mask = (mask_sum > 0).float()
+        # mask the input, convolve, renormalise
+        out = self.conv(x * mask) * scale
 
         return out, new_mask
+
+class PartialConvStack(nn.Module):
+    """
+    n_layers 3x3 partial convolutions with ReLUs in between (not after the
+    last): the receptive field and mask growth of one (2 * n_layers + 1)^2
+    partial convolution, e.g. a 7x7 for n_layers=3.
+
+    It replaces large kernels, which cost (k / 3)^2 more per channel pair and
+    get slow cuDNN kernels on the V100, while adding depth. in_channels ->
+    hidden_channels -> ... -> out_channels.
+    """
+
+    def __init__(self, in_channels, out_channels, hidden_channels, n_layers=3, padding_mode="replicate"):
+        super().__init__()
+        widths = [in_channels] + [hidden_channels] * (n_layers - 1) + [out_channels]
+        self.layers = nn.ModuleList(
+            PartialConv2d(a, b, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
+            for a, b in zip(widths[:-1], widths[1:])
+        )
+        self.relu = nn.ReLU(inplace=True)
+        self.in_channels, self.out_channels = in_channels, out_channels
+
+    def forward(self, x, mask):
+        for i, layer in enumerate(self.layers):
+            if i:
+                x = self.relu(x)
+            x, mask = layer(x, mask)
+        return x, mask
+
 
 # The below is a Lightning wrapper that is used to train the autoencoder. 
 # This was implemented so that we could interface with PET's training workflow
@@ -353,7 +381,7 @@ class LatentResidualTuner(nn.Module):
         self.diff1 = PartialConv2d(channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
         self.diff2 = PartialConv2d(hidden_channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
         self.diff3 = PartialConv2d(hidden_channel_count, channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
-        self.relu = nn.ReLU()
+        self.relu = nn.ReLU(inplace=True)
         self.residual_scale = residual_scale
 
     def forward(self, latent, latent_mask):
@@ -390,7 +418,7 @@ class SpatialResidualHead(nn.Module):
         self.head1 = PartialConv2d(input_channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
         self.head2 = PartialConv2d(hidden_channel_count, hidden_channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
         self.head3 = PartialConv2d(hidden_channel_count, output_channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
-        self.relu = nn.ReLU()
+        self.relu = nn.ReLU(inplace=True)
         self.residual_scale = residual_scale
 
     def forward(self, prediction, conditioning, mask):
@@ -411,33 +439,71 @@ class SpatialResidualHead(nn.Module):
 
 
 class UNet(nn.Module):
+    """
+    Mask-aware U-Net: two stride-2 encoder levels, a bottleneck, and a decoder
+    with skip connections at every resolution.
+
+    Channel widths scale with the number of input channels, so adding
+    predictors or predicted variables widens the network instead of squeezing
+    them through a fixed bottleneck:
+
+        level 1 (1/2 resolution)   : width_multiplier * input_channel_count
+        level 2 (1/4 resolution)   : 2 x level 1
+        bottleneck (1/4 resolution): 4 x level 1
+
+    width_multiplier must be >= 2 for the first layer to be able to carry every
+    signed input field through its ReLU (each needs a +/- pair of channels).
+
+    The bottleneck and the first decoder layer are stacks of three 3x3 partial
+    convolutions (PartialConvStack): the receptive field of the original 7x7
+    layers at a fraction of the cost.
+
+    The output layer works at full resolution on the upsampled decoder features
+    concatenated with the raw input, so grid-scale structure in the inputs
+    (e.g. the current state) reaches the output without passing through the
+    downsampled levels.
+    """
 
     def __init__(self,
                  input_channel_count=2,
                  output_channel_count=2,
                  latent_processor=None,
-                 padding_mode="replicate"):
+                 padding_mode="replicate",
+                 width_multiplier=4):
         # padding_mode is passed to every PartialConv2d layer; see
         # PartialConv2d for the "replicate" vs "zeros" trade-off.
 
         super(UNet, self).__init__()
 
+        width1, width2, latent_width = self.channel_widths(input_channel_count, width_multiplier)
+        self.latent_channel_count = latent_width
+
         # ---------- Encoder ----------
-        self.enc1 = PartialConv2d(input_channel_count, 16, kernel_size=4, stride=2, padding=1, padding_mode=padding_mode)
-        self.enc2 = PartialConv2d(16, 32, kernel_size=3, stride=2, padding=1, padding_mode=padding_mode)
-        self.enc3 = PartialConv2d(32, 64, kernel_size=7, stride=1, padding=3, padding_mode=padding_mode)
+        self.enc1 = PartialConv2d(input_channel_count, width1, kernel_size=4, stride=2, padding=1, padding_mode=padding_mode)
+        self.enc2 = PartialConv2d(width1, width2, kernel_size=3, stride=2, padding=1, padding_mode=padding_mode)
+        # Bottleneck: three 3x3 layers, the receptive field of one 7x7.
+        self.enc3 = PartialConvStack(width2, latent_width, hidden_channels=width2, padding_mode=padding_mode)
 
         # ---------- Decoder ----------
-        # After first upsample, latent has 64 channels and skip2 has 32 channels
-        self.dec1 = PartialConv2d(64 + 32, 32, kernel_size=7, stride=1, padding=3, padding_mode=padding_mode)
+        # After the first upsample: latent + skip from enc2 (three 3x3 layers, as a 7x7).
+        self.dec1 = PartialConvStack(latent_width + width2, width2, hidden_channels=width2, padding_mode=padding_mode)
 
-        # After second upsample, dec1 has 32 channels and skip1 has 16 channels
-        self.dec2 = PartialConv2d(32 + 16, 16, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
+        # After the second upsample: dec1 + skip from enc1.
+        self.dec2 = PartialConv2d(width2 + width1, width1, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
 
-        self.dec3 = PartialConv2d(16, output_channel_count, kernel_size=4, stride=1, padding=2, padding_mode=padding_mode)
+        # Full resolution: dec2 upsampled + the raw input (full-resolution skip).
+        self.dec3 = PartialConv2d(width1 + input_channel_count, output_channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
 
         self.latent_processor = latent_processor or IdentityLatentProcessor()
-        self.relu = nn.ReLU()
+        self.relu = nn.ReLU(inplace=True)
+
+    @staticmethod
+    def channel_widths(input_channel_count, width_multiplier=4):
+        """(level 1, level 2, bottleneck) channel widths for this many input channels."""
+        if width_multiplier < 1:
+            raise ValueError(f"width_multiplier must be >= 1, got {width_multiplier}")
+        width1 = int(round(width_multiplier * input_channel_count))
+        return width1, 2 * width1, 4 * width1
 
     def encode(self, x, mask):
         """Encoder: returns latent representation, updated mask, and skip features"""
@@ -453,8 +519,8 @@ class UNet(nn.Module):
 
         return latent, latent_mask, x1, mask1, x2, mask2
 
-    def decode(self, x, mask, x1, mask1, x2, mask2):
-        """Decoder with U-Net skip connections"""
+    def decode(self, x, mask, x1, mask1, x2, mask2, x0, mask0):
+        """Decoder with U-Net skip connections; x0/mask0 are the full-resolution input"""
 
         # ---------- Upsample to enc2 resolution ----------
         x = F.interpolate(x, size=x2.shape[2:], mode="bilinear", align_corners=False)
@@ -477,16 +543,16 @@ class UNet(nn.Module):
         x = self.relu(x)
 
         # ---------- Final upsample to input resolution ----------
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        mask = F.interpolate(mask, scale_factor=2, mode="nearest")
+        # Upsample to the input's exact size (odd grids included) and append the
+        # raw input as a full-resolution skip connection.
+        x = F.interpolate(x, size=x0.shape[2:], mode="bilinear", align_corners=False)
+        x = torch.cat([x, x0], dim=1)
 
-        x, mask = self.dec3(x, mask)
+        x, mask = self.dec3(x, mask0)
 
         return x, mask
 
     def forward(self, x, mask):
-        input_h, input_w = x.shape[2], x.shape[3]
-
         latent, latent_mask, x1, mask1, x2, mask2 = self.encode(x, mask)
         latent, latent_mask = self.latent_processor(latent, latent_mask)
 
@@ -494,9 +560,8 @@ class UNet(nn.Module):
             latent, latent_mask,
             x1, mask1,
             x2, mask2,
+            x, mask,
         )
-
-        reconstructed = reconstructed[:, :, :input_h, :input_w]
 
         return reconstructed
 

@@ -16,7 +16,7 @@ import pandas as pd
 import torch
 import xarray as xr
 
-from .losses import _closure
+from .losses import closure_loss, closure_std_fields
 
 
 # =============================================================================
@@ -26,32 +26,33 @@ from .losses import _closure
 @torch.no_grad()
 def check_known_closure(cfg, data, dataloader=None, max_batches=None, warn_threshold=0.25):
     """
-    Run the closure loss on true targets instead of predictions.
+    Run every active closure loss on true targets instead of predictions.
 
-    This is the lowest value the closure term can reach with a perfect model.
-    Returns {"mean", "max", "by_lead"}; warns if the mean exceeds warn_threshold
-    (see issue #43: with monthly means the anomaly budget scores ~0.5).
+    This is the lowest value each closure term can reach with a perfect model.
+    Returns {budget: {"mean", "max", "by_lead"}}; warns for any budget whose
+    mean exceeds warn_threshold (see issue #43: with monthly means the anomaly
+    heat budget scores ~0.5).
     """
-    d, f = cfg.data, data.fields
-    closure = _closure(cfg, data)
+    f = data.fields
+    closures = {budget: closure_loss(cfg, budget) for budget in cfg.active_closures()}
     dataloader = dataloader or data.train_dl
-    ohc_std = f["prognostic_std"][:, d.prognostic.index(d.ohc_variable)]
     common = dict(
         area=f["area"].float(),
         mask=f["mask"].float(),
-        ohc_std=ohc_std,
-        forcing_std=f["heat_flux_std"],
+        closure_std=closure_std_fields(cfg, data),
         dt_seconds=cfg.loss.seconds_per_step,
     )
     n_steps = cfg.window.posterior_steps
-    by_lead = [[] for _ in range(n_steps)]
+    by_lead = {budget: [[] for _ in range(n_steps)] for budget in closures}
     for batch_idx, batch in enumerate(dataloader):
         if max_batches is not None and batch_idx >= max_batches:
             break
+        if not isinstance(batch, dict):  # initial months -> windows
+            batch = data.windows(batch, n_steps)
         tti = batch["target_time_index"]
         for step in range(n_steps):
-            value = closure(
-                initial_ohc_norm=batch["prior"][:, -1],        # (B, P, H, W) last prior state
+            context = dict(
+                initial_state_norm=batch["prior"][:, -1],      # (B, P, H, W) last prior state
                 pred_t=batch["target"][:, step],               # the truth
                 forcing_history=batch["forcing"][:, : step + 1],
                 initial_forcing=batch["initial_forcing"],
@@ -61,24 +62,29 @@ def check_known_closure(cfg, data, dataloader=None, max_batches=None, warn_thres
                 rollout_step=step,
                 **common,
             )
-            by_lead[step].append(float(value))
-    all_values = np.concatenate([np.array(v) for v in by_lead])
-    result = {
-        "mean": float(all_values.mean()),
-        "max": float(all_values.max()),
-        "by_lead": [float(np.mean(v)) for v in by_lead],
-    }
-    print(
-        f"Known closure loss on the true data | mean {result['mean']:.3f}, max {result['max']:.3f}\n"
-        f"  by lead: " + " ".join(f"{v:.2f}" for v in result["by_lead"])
-    )
-    if result["mean"] > warn_threshold:
-        warnings.warn(
-            f"The closure loss on the TRUE data averages {result['mean']:.3f} (> {warn_threshold}), so a "
-            "perfect model would still be penalised by it (see issue #43). Consider a smaller "
-            "global_closure weight."
+            for budget, closure in closures.items():
+                by_lead[budget][step].append(float(closure(**context)))
+
+    results = {}
+    for budget, values in by_lead.items():
+        all_values = np.concatenate([np.array(v) for v in values])
+        result = {
+            "mean": float(all_values.mean()),
+            "max": float(all_values.max()),
+            "by_lead": [float(np.mean(v)) for v in values],
+        }
+        print(
+            f"Known {budget} closure loss on the true data | mean {result['mean']:.3f}, max {result['max']:.3f}\n"
+            f"  by lead: " + " ".join(f"{v:.2f}" for v in result["by_lead"])
         )
-    return result
+        if result["mean"] > warn_threshold:
+            warnings.warn(
+                f"The {budget} closure loss on the TRUE data averages {result['mean']:.3f} (> {warn_threshold}), "
+                "so a perfect model would still be penalised by it (see issue #43). Consider a smaller "
+                f"{budget}_closure weight."
+            )
+        results[budget] = result
+    return results
 
 
 # =============================================================================

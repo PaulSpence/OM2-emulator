@@ -25,6 +25,7 @@ from conftest import REPO_ROOT
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from Experiment import (  # noqa: E402
+    ClosureConfig,
     DataConfig,
     EvalConfig,
     ExperimentConfig,
@@ -78,6 +79,8 @@ def synthetic_file(tmp_path_factory):
         {
             "ocean_heat_content_2d": (dims, field(5e10, 2e9, 5e8), {"units": "J/m2", "description": "cp * ((temp - 273.15) * rho_dzt)"}),
             "total_surface_heat_flx": (dims, field(0.0, 80.0, 20.0), {"units": "W/m2"}),
+            "ocean_freshwater_content_2d": (dims, field(-3e3, 50.0, 10.0), {"units": "kg m-2"}),
+            "ocean_freshwater_flux": (dims, field(0.0, 2e-5, 5e-6), {"units": "kg m-2 s-1"}),
             "tau_x": (dims, field(0.0, 0.05, 0.02)),
             "tau_y": (dims, field(0.0, 0.03, 0.02)),
             "area_t": (dims, np.repeat(rng.uniform(1e9, 1e10, (1, H, W)), n_time, 0).astype(np.float32)),
@@ -108,7 +111,7 @@ def make_cfg(path, tmp_path, **overrides):
             control_repeats=2,
         ),
         window=WindowConfig(n_prior=2, posterior_steps=4, rollout_steps=4),
-        loss=LossConfig(terms={"local_mse": 1.0, "spectral": 0.0, "global_closure": 0.1}),
+        loss=LossConfig(terms={"local_mse": 1.0, "spectral": 0.0, "heat_closure": 0.1}),
         model=ModelConfig(padding_mode="zeros"),
         train=TrainConfig(batch_size=8, max_epochs=1, gpu_check=False),
         eval=EvalConfig(snapshot_periods=["2004-06"]),
@@ -195,7 +198,7 @@ def test_windows_match_direct_normalisation(data_and_cfg, synthetic_file):
             for v in variables
         }
 
-    sample = data.train_dl.dataset[5]
+    sample = {k: v[0] for k, v in data.windows(data.train_indices[5:6]).items()}
     t0 = int(data.train_indices[5])
     assert data.months[t0] == "2000-07"  # train starts 2000-02, sample 5 -> 2000-07
     np.testing.assert_allclose(sample["prior"][:, 0].numpy(), z["ocean_heat_content_2d"][t0 - 1 : t0 + 1], rtol=1e-6)
@@ -303,7 +306,7 @@ def test_two_prognostic_variables(synthetic_file, tmp_path):
     cfg = two_prognostic_cfg(synthetic_file, tmp_path)
     data = build_data(cfg, verbose=False)
     module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
-    batch = next(iter(data.train_dl))
+    batch = data.windows(next(iter(data.train_dl)))
     assert batch["prior"].shape[1:3] == (2, 2)
     loss = module._step(batch, 4, "train")
     loss.backward()
@@ -312,17 +315,17 @@ def test_two_prognostic_variables(synthetic_file, tmp_path):
 
 def test_loss_step_weights(data_and_cfg):
     data, cfg = data_and_cfg
-    cfg.loss.terms = {"local_mse": [1.0, 1.0, 2.0, 2.0], "global_closure": 0.5}
+    cfg.loss.terms = {"local_mse": [1.0, 1.0, 2.0, 2.0], "heat_closure": 0.5}
     cfg.loss.step_weights = [1.0, 1.0, 1.0, 3.0]
     try:
         terms = {t.name: t.step_weights for t in build_losses(cfg, data)}
     finally:
-        cfg.loss.terms = {"local_mse": 1.0, "spectral": 0.0, "global_closure": 0.1}
+        cfg.loss.terms = {"local_mse": 1.0, "spectral": 0.0, "heat_closure": 0.1}
         cfg.loss.step_weights = None
     relative = [2 / 3, 2 / 3, 2 / 3, 2.0]  # step_weights / mean(step_weights)
-    assert set(terms) == {"local_mse", "global_closure"}  # spectral (0) dropped
+    assert set(terms) == {"local_mse", "heat_closure"}  # spectral (0) dropped
     np.testing.assert_allclose(terms["local_mse"], [a * r for a, r in zip([1, 1, 2, 2], relative)])
-    np.testing.assert_allclose(terms["global_closure"], [0.5 * r for r in relative])
+    np.testing.assert_allclose(terms["heat_closure"], [0.5 * r for r in relative])
 
 
 # =============================================================================
@@ -337,7 +340,7 @@ def test_one_epoch_trains(data_and_cfg):
     trainer = build_trainer(cfg)
     trainer.fit(module, data.train_dl, data.valid_dl)
     assert torch.isfinite(trainer.callback_metrics["val_loss"])
-    assert "train_global_closure" in trainer.callback_metrics
+    assert "train_heat_closure" in trainer.callback_metrics
     assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters())), "weights did not change"
 
 
@@ -368,9 +371,10 @@ def test_skill_test_and_control(data_and_cfg):
 
 def test_known_closure_runs(data_and_cfg):
     data, cfg = data_and_cfg
-    result = check_known_closure(cfg, data, warn_threshold=np.inf)
-    assert len(result["by_lead"]) == cfg.window.posterior_steps
-    assert np.isfinite(result["mean"])
+    results = check_known_closure(cfg, data, warn_threshold=np.inf)
+    assert set(results) == {"heat"}  # freshwater_closure is off in make_cfg
+    assert len(results["heat"]["by_lead"]) == cfg.window.posterior_steps
+    assert np.isfinite(results["heat"]["mean"])
 
 
 # =============================================================================
@@ -443,3 +447,319 @@ def test_evaluation_figures_for_every_variable(synthetic_file, tmp_path):
     assert len(fig.axes) == len(TWO_PROGNOSTIC)
     assert all(np.isfinite(ax.lines[0].get_ydata()).all() for ax in fig.axes)
     plt.close(fig)
+
+
+# =============================================================================
+# Heat and freshwater closures as independent loss terms
+# =============================================================================
+
+HEAT_AND_FRESHWATER = dict(
+    prognostic=["ocean_heat_content_2d", "ocean_freshwater_content_2d"],
+    forcing=["total_surface_heat_flx", "ocean_freshwater_flux", "tau_x"],
+)
+
+
+def closure_cfg(synthetic_file, tmp_path, terms, **data_overrides):
+    variables = {**HEAT_AND_FRESHWATER, **data_overrides}
+    return make_cfg(
+        synthetic_file, tmp_path,
+        data=DataConfig(path=str(synthetic_file), **variables,
+                        normalisation=NormalisationConfig(fit_period=("2000-01", "2003-12")),
+                        cache_dir=str(tmp_path / "cache")),
+        loss=LossConfig(terms=terms),
+    )
+
+
+def test_global_closure_term_is_renamed(synthetic_file, tmp_path):
+    with pytest.raises(ValueError, match="heat_closure"):
+        closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0, "global_closure": 0.1})
+
+
+def test_closure_needs_its_variables(synthetic_file, tmp_path):
+    with pytest.raises(ValueError, match="ocean_freshwater_content_2d"):
+        closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0, "freshwater_closure": 0.1},
+                    prognostic=["ocean_heat_content_2d"])
+    with pytest.raises(ValueError, match="ocean_freshwater_flux"):
+        closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0, "freshwater_closure": 0.1},
+                    forcing=["total_surface_heat_flx", "tau_x"],
+                    prognostic=["ocean_heat_content_2d", "ocean_freshwater_content_2d"])
+    # An inactive closure (weight 0) needs nothing.
+    closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0, "freshwater_closure": 0.0},
+                prognostic=["ocean_heat_content_2d"])
+
+
+def test_custom_budget_becomes_a_loss_term(synthetic_file, tmp_path):
+    with pytest.raises(ValueError, match="Unknown loss terms"):
+        closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0, "fw2_closure": 0.2})
+    cfg = closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0})
+    cfg.loss.closures["fw2"] = ClosureConfig("ocean_freshwater_content_2d", "ocean_freshwater_flux", 1.0, 1.0)
+    cfg.loss.terms["fw2_closure"] = 0.2
+    cfg.validate()
+    assert set(cfg.active_closures()) == {"fw2"}
+
+
+def test_heat_and_freshwater_closures_train_with_independent_weights(synthetic_file, tmp_path):
+    cfg = closure_cfg(synthetic_file, tmp_path,
+                      {"local_mse": 1.0, "heat_closure": 0.1, "freshwater_closure": [0.0, 0.0, 0.3, 0.3]})
+    data = build_data(cfg, verbose=False)
+    assert data.fields["forcing_std"].shape[1] == len(HEAT_AND_FRESHWATER["forcing"])
+    losses = build_losses(cfg, data)
+    weights = {t.name: t.step_weights for t in losses}
+    assert weights["heat_closure"] == [0.1] * 4
+    assert weights["freshwater_closure"] == [0.0, 0.0, 0.3, 0.3]
+
+    module = build_module(cfg, build_model(cfg, data), losses, data)
+    assert set(module.closure_std) == {"heat", "freshwater"}
+    # Each budget gets its own content and flux std (OHC and FWC are very different sizes).
+    assert not torch.equal(module.closure_std["heat"][0], module.closure_std["freshwater"][0])
+    batch = data.windows(next(iter(data.train_dl)))
+    loss = module._step(batch, 4, "train")
+    loss.backward()
+    assert torch.isfinite(loss)
+
+    results = check_known_closure(cfg, data, warn_threshold=np.inf, max_batches=2)
+    assert set(results) == {"heat", "freshwater"}
+    assert all(np.isfinite(r["mean"]) for r in results.values())
+
+
+def test_only_active_closures_use_gpu_buffers(synthetic_file, tmp_path):
+    cfg = closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0, "freshwater_closure": 0.1})
+    data = build_data(cfg, verbose=False)
+    module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
+    assert module.budgets == ["freshwater"]
+    assert not hasattr(module, "heat_content_std")
+
+
+def test_plot_scales_are_automatic(data_and_cfg):
+    """No fixed colour limits: each variable's maps scale to its own anomalies."""
+    from Experiment import plot_snapshots
+
+    data, cfg = data_and_cfg
+    skill = run_skill_test(cfg, build_model(cfg, data), data)
+    fig = plot_snapshots(skill, ["2004-06"])
+    vmax = fig.axes[0].collections[0].get_clim()[1]
+    truth = np.abs(skill["ocean_heat_content_2d_truth_anom"].values)
+    assert vmax == pytest.approx(np.nanquantile(truth, 0.99))
+    plt.close(fig)
+
+
+# =============================================================================
+# Architecture: widths scale with the variables, residual prediction,
+# full-resolution input skip
+# =============================================================================
+
+def test_unet_widths_scale_with_input_channels(synthetic_file, tmp_path):
+    for cfg in (make_cfg(synthetic_file, tmp_path), two_prognostic_cfg(synthetic_file, tmp_path)):
+        data = build_data(cfg, verbose=False)
+        unet = build_model(cfg, data).backbone
+        in_ch = cfg.window.n_prior * data.n_prognostic + data.n_forcing
+        width1 = cfg.model.width_multiplier * in_ch
+        assert unet.enc1.conv.in_channels == in_ch
+        assert unet.enc1.conv.out_channels == width1
+        assert unet.enc2.conv.out_channels == 2 * width1
+        assert unet.latent_channel_count == unet.enc3.out_channels == 4 * width1
+        assert unet.dec3.conv.in_channels == width1 + in_ch  # full-resolution input skip
+        assert unet.dec3.conv.out_channels == data.n_prognostic
+
+
+def test_width_multiplier_must_be_positive(synthetic_file, tmp_path):
+    with pytest.raises(ValueError, match="width_multiplier"):
+        make_cfg(synthetic_file, tmp_path, model=ModelConfig(width_multiplier=0))
+
+
+def test_zero_backbone_output_persists_last_state(data_and_cfg):
+    """The emulator predicts the change: a backbone that outputs 0 persists the last prior state."""
+    data, cfg = data_and_cfg
+    model = build_model(cfg, data)
+    with torch.no_grad():
+        model.backbone.dec3.conv.weight.zero_()
+        model.backbone.dec3.conv.bias.zero_()
+    prior = torch.randn(2, cfg.window.n_prior * data.n_prognostic, H, W)
+    out = model(prior, torch.randn(2, data.n_forcing, H, W), data.fields["mask"])
+    torch.testing.assert_close(out, prior[:, -data.n_prognostic :])
+
+
+def test_unet_full_resolution_skip_can_copy_the_input():
+    """
+    The output layer sees the raw input at full resolution, so the UNet can
+    reproduce grid-scale structure exactly (impossible through the 1/2-resolution path).
+    """
+    from Emulator import UNet
+
+    channels, h, w = 3, 15, 21  # odd grid: the output must still match the input size
+    unet = UNet(input_channel_count=channels, output_channel_count=channels, padding_mode="zeros")
+    width1 = unet.dec3.conv.in_channels - channels
+    with torch.no_grad():
+        unet.dec3.conv.weight.zero_()
+        unet.dec3.conv.bias.zero_()
+        for c in range(channels):
+            unet.dec3.conv.weight[c, width1 + c, 1, 1] = 1.0  # centre tap on raw input channel c
+    x = torch.randn(2, channels, h, w)
+    out = unet(x, torch.ones(2, 1, h, w))
+    assert out.shape == x.shape
+    # Interior cells (the edges are renormalised by the zero padding).
+    torch.testing.assert_close(out[..., 1:-1, 1:-1], x[..., 1:-1, 1:-1])
+
+
+# =============================================================================
+# Speed and memory: lean partial convolution, 3x3 stacks, gradient
+# checkpointing, channels_last, compile
+# =============================================================================
+
+def _reference_partial_conv(layer, x, mask):
+    """The original PartialConv2d forward: mask, convolve, where(renormalise, 0)."""
+    out = layer.conv(x * mask)
+    mask_sum = layer.mask_conv(mask)
+    out = torch.where(mask_sum > 0, out * (layer.kernel_area / (mask_sum + layer.eps)), torch.zeros_like(out))
+    return out, (mask_sum > 0).float()
+
+
+@pytest.mark.parametrize("kernel_size,stride,padding", [(3, 1, 1), (4, 2, 1), (7, 1, 3)])
+def test_partial_conv_matches_original(kernel_size, stride, padding):
+    from Emulator import PartialConv2d
+
+    torch.manual_seed(0)
+    layer = PartialConv2d(5, 6, kernel_size, stride, padding, padding_mode="zeros")
+    x = torch.randn(3, 5, H, W)
+    mask = (torch.rand(1, 1, H, W) > 0.3).float()
+    expected, expected_mask = _reference_partial_conv(layer, x, mask.expand(3, 1, H, W))
+    for m in (mask, mask.expand(3, 1, H, W)):  # shared (1, 1, H, W) or per-sample mask
+        out, new_mask = layer(x, m)
+        torch.testing.assert_close(out, expected)
+        torch.testing.assert_close(new_mask.expand_as(expected_mask), expected_mask)
+
+
+def test_conv_stack_grows_the_mask_like_a_7x7():
+    from Emulator import PartialConv2d, PartialConvStack
+
+    mask = (torch.rand(1, 1, H, W, generator=torch.Generator().manual_seed(1)) > 0.85).float()
+    _, mask7 = PartialConv2d(2, 2, kernel_size=7, padding=3, padding_mode="zeros")(torch.randn(1, 2, H, W), mask)
+    stack = PartialConvStack(2, 3, hidden_channels=4, padding_mode="zeros")
+    out, mask_stack = stack(torch.randn(2, 2, H, W), mask)
+    assert out.shape == (2, 3, H, W)
+    torch.testing.assert_close(mask_stack, mask7)
+
+
+def test_unet_has_no_large_kernels(data_and_cfg):
+    data, cfg = data_and_cfg
+    sizes = {m.kernel_size for m in build_model(cfg, data).modules() if isinstance(m, torch.nn.Conv2d)}
+    assert max(max(k) for k in sizes) <= 4
+
+
+def test_checkpointed_rollout_gives_same_loss_and_gradients(data_and_cfg):
+    from Emulator import total_rollout_loss
+
+    data, cfg = data_and_cfg
+    model = build_model(cfg, data)
+    losses = build_losses(cfg, data)
+    module = build_module(cfg, model, losses, data)
+    batch = data.windows(next(iter(data.train_dl)))
+    results = []
+    # No checkpointing, every step checkpointed, and steps 0-1 checkpointed with 2-3 kept.
+    for checkpoint_steps, steps_in_memory in ((False, 0), (True, 0), (True, 2)):
+        model.zero_grad()
+        loss = total_rollout_loss(
+            model=model,
+            initial_prior_states=batch["prior"].flatten(1, 2),
+            forcing_sequence=batch["forcing"],
+            target_sequence=batch["target"],
+            mask=module.mask,
+            losses=losses,
+            n_steps=4,
+            target_time_indices=batch["target_time_index"],
+            area=module.area,
+            closure_std=module.closure_std,
+            dt_seconds=cfg.loss.seconds_per_step,
+            initial_forcing=batch["initial_forcing"],
+            n_prognostic=data.n_prognostic,
+            checkpoint_steps=checkpoint_steps,
+            steps_in_memory=steps_in_memory,
+        )
+        loss.backward()
+        for term in losses:
+            term.pop_running()
+        results.append((loss.detach(), [p.grad.clone() for p in model.parameters()]))
+    for loss, grads in results[1:]:
+        torch.testing.assert_close(loss, results[0][0])
+        for a, b in zip(grads, results[0][1]):
+            torch.testing.assert_close(a, b)
+
+
+def test_checkpointed_training_runs(synthetic_file, tmp_path):
+    cfg = make_cfg(synthetic_file, tmp_path,
+                   train=TrainConfig(batch_size=8, max_epochs=1, gpu_check=False, checkpoint_rollout_steps=True,
+                                     rollout_steps_in_memory=2))
+    data = build_data(cfg, verbose=False)
+    module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
+    build_trainer(cfg).fit(module, data.train_dl, data.valid_dl)
+    assert len(module.rmse_history) > 0
+
+
+def test_channels_last_gives_same_output(synthetic_file, tmp_path):
+    outputs = []
+    prior = torch.randn(2, 2, H, W)
+    forcing = torch.randn(2, len(FORCING), H, W)
+    for channels_last in (False, True):
+        cfg = make_cfg(synthetic_file, tmp_path, model=ModelConfig(channels_last=channels_last))
+        data = build_data(cfg, verbose=False)
+        model = build_model(cfg, data)  # same seed -> same weights
+        outputs.append(model(prior, forcing, data.fields["mask"]))
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=1e-4, atol=1e-5)
+
+
+def test_compiled_model_keeps_plain_state_dict(data_and_cfg):
+    """torch.compile is lazy, so building the wrapper is cheap; checkpoints must not change keys."""
+    data, cfg = data_and_cfg
+    model = build_model(cfg, data)
+    plain = build_module(cfg, model, build_losses(cfg, data), data)
+    cfg.train.compile_model = True
+    try:
+        compiled = build_module(cfg, model, build_losses(cfg, data), data)
+    finally:
+        cfg.train.compile_model = False
+    assert compiled._run_model is not compiled.model
+    assert list(compiled.state_dict()) == list(plain.state_dict())
+
+
+# =============================================================================
+# Data pipeline: index batches, windows cut on the module's device
+# =============================================================================
+
+def test_dataloaders_yield_initial_months(data_and_cfg):
+    data, cfg = data_and_cfg
+    batch = next(iter(data.valid_dl))
+    assert batch.dtype == torch.long and batch.ndim == 1
+    torch.testing.assert_close(batch, data.valid_indices[: cfg.train.batch_size])
+
+
+def test_windows_cut_only_the_steps_in_use(data_and_cfg):
+    data, cfg = data_and_cfg
+    t0 = data.train_indices[:3]
+    full = data.windows(t0)
+    short = data.windows(t0, n_steps=2)
+    assert full["target"].shape[1] == cfg.window.posterior_steps
+    assert short["target"].shape[1] == short["forcing"].shape[1] == 2
+    for key in ("prior", "initial_forcing"):
+        torch.testing.assert_close(short[key], full[key])
+    torch.testing.assert_close(short["target"], full["target"][:, :2])
+    torch.testing.assert_close(short["forcing"], full["forcing"][:, :2])
+    torch.testing.assert_close(short["target_time_index"], full["target_time_index"][:, :2])
+
+
+def test_module_cuts_windows_from_its_own_fields(data_and_cfg):
+    """An index batch gives the same loss as the equivalent window dict; the fields stay out of checkpoints."""
+    data, cfg = data_and_cfg
+    module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
+    t0 = next(iter(data.train_dl))
+    with torch.no_grad():
+        from_indices = module._step(t0, 3, "val")
+        from_windows = module._step(data.windows(t0, n_steps=3), 3, "val")
+    torch.testing.assert_close(from_indices, from_windows)
+    keys = set(module.state_dict())
+    assert "prognostic_z" not in keys and "forcing_z" not in keys
+    assert module.prognostic_z.data_ptr() == data.fields["prognostic"].data_ptr()  # no CPU copy
+
+
+def test_rollout_steps_in_memory_must_be_non_negative(synthetic_file, tmp_path):
+    with pytest.raises(ValueError, match="rollout_steps_in_memory"):
+        make_cfg(synthetic_file, tmp_path, train=TrainConfig(rollout_steps_in_memory=-1))
