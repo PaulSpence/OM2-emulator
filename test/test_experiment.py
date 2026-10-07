@@ -929,11 +929,9 @@ def test_persistence_rmse_matches_direct_computation(data_and_cfg):
     weight /= weight.sum()
     squared, count = np.zeros(data.n_prognostic), 0
     for t0 in t0s:
-        anomaly0 = (f["prognostic"][t0] * f["prognostic_std"][t0]).double().numpy()
+        z0 = f["prognostic"][t0].double().numpy()
         for t in range(t0 + 1, t0 + n_steps + 1):
-            std = f["prognostic_std"][t].double().numpy()
-            z = np.where(std > 0, anomaly0 / np.where(std > 0, std, 1.0), 0.0)
-            squared += (((z - f["prognostic"][t].double().numpy()) ** 2) * weight).sum(axis=(-2, -1))
+            squared += (((z0 - f["prognostic"][t].double().numpy()) ** 2) * weight).sum(axis=(-2, -1))
             count += 1
     expected = np.sqrt(squared / count)
     result = persistence_rmse(cfg, data, n_steps=n_steps)
@@ -996,3 +994,21 @@ def test_fill_land_keeps_channels_last():
     out_cl = fill_land(x_cl, mask, dirichlet={2: 0.5})
     assert out_cl.is_contiguous(memory_format=torch.channels_last)
     torch.testing.assert_close(out_cl, fill_land(x, mask, dirichlet={2: 0.5}))
+
+
+def test_local_mse_is_area_weighted():
+    """Each cell's squared error counts in proportion to its area; without area every ocean cell counts equally."""
+    from Emulator import local_mse_loss
+
+    g = torch.Generator().manual_seed(4)
+    mask = (torch.rand(H, W, generator=g) > 0.3).float()
+    area = torch.rand(H, W, generator=g) * 1e10 + 1e9
+    pred, target = torch.randn(2, 3, H, W, generator=g), torch.randn(2, 3, H, W, generator=g)
+    loss_fn = local_mse_loss(weight=1.0)
+
+    weights = (mask * area).expand(2, 3, H, W)
+    expected = (((pred - target) ** 2) * weights).sum() / weights.sum()
+    torch.testing.assert_close(loss_fn(pred_t=pred, target_t=target, mask=mask, area=area, rollout_step=0), expected)
+
+    unweighted = (((pred - target) ** 2) * mask).sum() / (mask.sum() * 6)
+    torch.testing.assert_close(loss_fn(pred_t=pred, target_t=target, mask=mask, rollout_step=0), unweighted)

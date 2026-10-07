@@ -211,12 +211,17 @@ def run_control(cfg, model, data):
 
 def persistence_rmse(cfg, data, initial_indices=None, n_steps=None):
     """
-    Per-variable RMSE of the persistence forecast over rollout windows, in the
-    same units as the per-epoch validation RMSE (normalised, area-weighted over
-    the ocean, averaged over windows and lead times, square-rooted).
+    Per-variable RMSE of persistence over rollout windows, in the same units
+    as the per-epoch validation RMSE (normalised, area-weighted over the
+    ocean, averaged over windows and lead times, square-rooted).
 
-    Persistence holds the initial month's PHYSICAL anomaly fixed; in z-score
-    units that is z(t0) * std(t0) / std(t). Defaults: the validation windows
+    Persistence here holds the initial month's z-score fixed: z(t) = z(t0).
+    That is what the residual ForwardEmulator predicts when it outputs zero
+    change, so it is the null model for the training metric. (Holding the
+    PHYSICAL anomaly fixed instead, z(t0) * std(t0) / std(t), is the usual
+    forecast baseline and is what the skill test reports in physical units;
+    in z-score units it blows up wherever a cell's std is much smaller in the
+    target month than in the initial month.) Defaults: the validation windows
     and the validation rollout length. Returns {variable: rmse}.
     """
     f = data.fields
@@ -227,11 +232,9 @@ def persistence_rmse(cfg, data, initial_indices=None, n_steps=None):
     squared = torch.zeros(len(f["prognostic_names"]), dtype=torch.float64)
     count = 0
     for t0 in indices.tolist():
-        anomaly0 = f["prognostic"][t0] * f["prognostic_std"][t0]
+        z0 = f["prognostic"][t0]
         for t in range(t0 + 1, t0 + n_steps + 1):
-            std = f["prognostic_std"][t]
-            z_persist = torch.where(std > 0, anomaly0 / std.clamp_min(1e-30), torch.zeros_like(std))
-            squared += (((z_persist - f["prognostic"][t]) ** 2) * weight).sum(dim=(-2, -1)).double()
+            squared += (((z0 - f["prognostic"][t]) ** 2) * weight).sum(dim=(-2, -1)).double()
             count += 1
     return dict(zip(f["prognostic_names"], torch.sqrt(squared / count).tolist()))
 

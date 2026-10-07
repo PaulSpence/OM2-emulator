@@ -173,7 +173,7 @@ def plot_rmse_by_epoch(history, variables=None, baseline=None):
             if not rows.empty:
                 ax.plot(rows["epoch"], rows["rmse"], label=label, lw=2)
         if baseline and variable in baseline:
-            ax.axhline(baseline[variable], color="0.4", ls="--", lw=1.5, label="Validation persistence")
+            ax.axhline(baseline[variable], color="0.4", ls="--", lw=1.5, label="Validation persistence (z held fixed)")
         ax.set_yscale("log")
         ax.set_title(f"{variable}: area-weighted RMSE per epoch")
         ax.set_ylabel("RMSE (normalised)")

@@ -78,15 +78,28 @@ def squeeze_field_axes(field):
 
 
 def local_mse_loss(weight=1.0):
-    """Return a weighted masked local MSE loss callable."""
+    """
+    Return a weighted, ocean-masked, AREA-WEIGHTED local MSE loss callable.
 
-    def loss_fn(*, pred_t, target_t, mask, rollout_step=None, **_):
+    Each cell's squared error is weighted by its area (``area`` from the rollout
+    context, m^2), so the loss is an area mean over the ocean like every
+    evaluation metric, the per-variable RMSE logged in training, and the closure
+    terms. On the ACCESS-OM2 1-degree grid cell areas vary 17x (latitudinal
+    refinement near the equator, small cells near the poles): an unweighted
+    per-cell mean gave the regions poleward of 60 degrees ~27% of the loss for
+    ~10% of the ocean area. Without ``area`` in the context, every ocean cell
+    counts equally.
+    """
+
+    def loss_fn(*, pred_t, target_t, mask, rollout_step=None, area=None, **_):
         current_weight = step_weight(weight, rollout_step, pred_t)
         if current_weight == 0.0:
             return pred_t.new_zeros(())
         step_err = (pred_t - target_t) ** 2
-        valid_mask = expand_ocean_mask(mask, step_err)
-        loss = (step_err * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
+        cell_weight = expand_ocean_mask(mask, step_err)
+        if area is not None:
+            cell_weight = cell_weight * area.to(device=step_err.device, dtype=step_err.dtype)
+        loss = (step_err * cell_weight).sum() / cell_weight.sum().clamp_min(1e-12)
         return current_weight * loss
 
     return loss_fn
@@ -218,7 +231,8 @@ def budget_closure_loss(
 
     Note the contrast with `local_mse_loss` / `spectral_loss`: those are fitting
     objectives, not conservation laws, so they deliberately stay in z-score
-    space, where every cell and month is weighted roughly equally.
+    space, where every month and every unit of ocean area is weighted roughly
+    equally (local_mse_loss is area-weighted).
     """
     name = "global_closure_loss" if budget is None else f"{budget} closure loss"
 
