@@ -437,7 +437,10 @@ def test_evaluation_figures_for_every_variable(synthetic_file, tmp_path):
         maps = [ax for ax in fig.axes if ax.collections and ax.get_label() != "<colorbar>"]
         assert len(maps) == 3 * len(periods)
         timeseries = [ax for ax in fig.axes if len(ax.lines) >= 2]
-        assert len(timeseries) == 1  # predicted + truth, full width underneath
+        assert len(timeseries) == 1  # predicted, truth and persistence, full width underneath
+        labels = [line.get_label() for line in timeseries[0].lines]
+        assert labels[:3] == ["Predicted", "Truth", "Persistence"]
+        assert timeseries[0].lines[2].get_linestyle() == "--"
         path = tmp_path / f"{name}_skill_evaluation.png"
         fig.savefig(path)
         assert path.stat().st_size > 0

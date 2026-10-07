@@ -183,14 +183,20 @@ def plot_rmse_by_epoch(history, variables=None, baseline=None):
     return fig
 
 
-def _plot_global_anomaly(ax, ds, variable, suffixes=(("pred_anom", "Predicted"), ("truth_anom", "Truth")),
+def _plot_global_anomaly(ax, ds, variable,
+                         suffixes=(("pred_anom", "Predicted"), ("truth_anom", "Truth"), ("persist_anom", "Persistence")),
                          x="time"):
-    """Area-integrated anomaly series on ax, scaled by a power of ten (units x m^2)."""
+    """
+    Area-integrated anomaly series on ax, scaled by a power of ten (units x m^2).
+    Series missing from ds are skipped; persistence is drawn dashed grey.
+    """
     units = ds[f"{variable}_pred_anom"].attrs.get("units", "")
-    series = {label: global_integral(ds[f"{variable}_{suffix}"], ds["area"]).values for suffix, label in suffixes}
+    series = {label: global_integral(ds[f"{variable}_{suffix}"], ds["area"]).values
+              for suffix, label in suffixes if f"{variable}_{suffix}" in ds}
     scale, scale_label = _power_of_ten(np.concatenate(list(series.values())))
     for label, values in series.items():
-        ax.plot(ds[x].values, values / scale, label=label, lw=2)
+        style = dict(color="0.4", lw=1.5, ls="--") if label == "Persistence" else dict(lw=2)
+        ax.plot(ds[x].values, values / scale, label=label, **style)
     ax.axhline(0.0, color="0.5", lw=0.8)
     ax.set_ylabel(f"Integrated anomaly ({scale_label} {units} m$^2$)")
     ax.grid(alpha=0.3)
