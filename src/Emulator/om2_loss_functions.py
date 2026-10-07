@@ -8,6 +8,7 @@ that list to ``total_rollout_loss`` without changing the rollout loop.
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 def step_weight(weight, rollout_step, like):
@@ -92,14 +93,16 @@ def local_mse_loss(weight=1.0):
 
 
 def spectral_loss(weight=1.0, eps=1.0e-6):
-    """Return a weighted masked log-amplitude spectral loss callable."""
+    """
+    Return a weighted masked log-amplitude spectral loss callable.
 
-    def loss_fn(*, pred_t, target_t, mask, rollout_step=None, **_):
-        current_weight = step_weight(weight, rollout_step, pred_t)
-        if current_weight == 0.0:
-            return pred_t.new_zeros(())
+    The spectrum is computed under gradient checkpointing: otherwise it keeps
+    several full-size tensors (masked field, anomaly, complex FFT, amplitude)
+    per rollout step for the backward pass, and they are cheap to recompute.
+    The value and gradients are unchanged.
+    """
 
-        valid_mask = expand_ocean_mask(mask, pred_t)
+    def log_amplitude_mse(pred_t, target_t, valid_mask):
         ocean_count = valid_mask.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0)
 
         pred_mean = (pred_t * valid_mask).sum(dim=(-2, -1), keepdim=True) / ocean_count
@@ -111,47 +114,79 @@ def spectral_loss(weight=1.0, eps=1.0e-6):
         pred_amp = torch.fft.rfft2(pred_anom, norm="ortho").abs()
         target_amp = torch.fft.rfft2(target_anom, norm="ortho").abs()
 
-        loss = F.mse_loss(torch.log1p(pred_amp + eps), torch.log1p(target_amp + eps))
+        return F.mse_loss(torch.log1p(pred_amp + eps), torch.log1p(target_amp + eps))
+
+    def loss_fn(*, pred_t, target_t, mask, rollout_step=None, **_):
+        current_weight = step_weight(weight, rollout_step, pred_t)
+        if current_weight == 0.0:
+            return pred_t.new_zeros(())
+
+        valid_mask = expand_ocean_mask(mask, pred_t)
+        if torch.is_grad_enabled() and pred_t.requires_grad:
+            loss = checkpoint(log_amplitude_mse, pred_t, target_t, valid_mask, use_reentrant=False)
+        else:
+            loss = log_amplitude_mse(pred_t, target_t, valid_mask)
         return current_weight * loss
 
     return loss_fn
 
 
-def global_closure_loss(
+def budget_closure_loss(
     weight=1.0,
+    budget=None,
+    content_channel_index=0,
+    flux_channel_index=0,
     surface_flux_sign=1.0,
-    closure_min_scale=1.0e20,
-    heat_flux_channel_index=0,
+    min_scale=1.0e20,
 ):
     """
-    Return a weighted cumulative global heat-closure loss callable.
+    Return a weighted cumulative global budget-closure loss callable.
 
-    ``heat_flux_channel_index`` picks the surface heat flux out of a
-    channel-stacked forcing tensor (e.g. heat flux + tau_x + tau_y). Only heat
-    flux enters the heat budget; wind stress does not. ``forcing_std`` must be
-    the heat-flux variable's own normalisation std.
+    A budget pairs a vertically integrated CONTENT (a prognostic variable, per
+    unit area) with the SURFACE FLUX that changes it (a forcing variable, per
+    unit area per second), e.g.
+
+        heat       : OHC (J/m^2)                and surface heat flux (W/m^2)
+        freshwater : freshwater content (kg/m^2) and surface freshwater flux (kg/m^2/s)
+
+    The flux must be in content units per second; no unit conversion is applied.
+
+    ``content_channel_index`` picks the content out of the prediction and the
+    initial state when the model predicts several prognostic variables,
+    (B, P, H, W). ``flux_channel_index`` picks the flux out of channel-stacked
+    forcing (B, C, H, W). With a single channel neither has any effect.
+
+    Normalisation std fields (to turn z-scores into physical anomalies):
+        budget=None : the rollout context's ``ohc_std`` (content) and
+                      ``forcing_std`` (flux), as in the original heat-only loss.
+        budget=name : ``closure_std[name] = (content_std, flux_std)`` from the
+                      rollout context, so several budgets can be used at once.
+    Each std is (T, H, W), indexed with the sample's time indices.
+
+    ``min_scale`` is a floor (in content units x m^2, e.g. J or kg) on the
+    normalisation scale of the residual; see the end of loss_fn.
 
     The closure is evaluated on ANOMALIES relative to the monthly spatial
     climatology, in PHYSICAL units. For a window from the initial month t0 to
     the target month t0+n:
 
-        sum_xy area * (OHC'[t0+n] - OHC'[t0])
+        sum_xy area * (C'[t0+n] - C'[t0])
             ~= dt * sum_xy area * ( 1/2 F'[t0] + F'[t0+1] + ... + F'[t0+n-1] + 1/2 F'[t0+n] )
 
     where ' denotes the anomaly from the climatological mean for that calendar
-    month, OHC is in J/m^2 and F (surface heat flux) is in W/m^2.
+    month, C is the content and F the surface flux (times surface_flux_sign).
 
     Why the flux is averaged over two months (the 1/2 weights):
-        OHC and F are both MONTHLY MEANS. The difference between two consecutive
-        monthly-mean OHCs is the heat added between the two month centres, i.e.
-        during the second half of month t and the first half of month t+1. The
-        matching flux for one step is therefore (F[t] + F[t+1]) / 2, not F[t+1]
-        alone. Summing that over the window gives the trapezoid weights above:
-        the initial and target months count half, every month in between counts
-        fully. On raw ACCESS-OM2 output (output360-362, full fields, degC OHC)
-        this cuts the one-step global residual from ~34% of the OHC change
-        (using F[t+1] only) to ~7%; the remaining ~7% comes from working with
-        monthly means rather than snapshots.
+        C and F are both MONTHLY MEANS. The difference between two consecutive
+        monthly-mean contents is what was added between the two month centres,
+        i.e. during the second half of month t and the first half of month t+1.
+        The matching flux for one step is therefore (F[t] + F[t+1]) / 2, not
+        F[t+1] alone. Summing that over the window gives the trapezoid weights
+        above: the initial and target months count half, every month in between
+        counts fully. For heat, on raw ACCESS-OM2 output (output360-362, full
+        fields, degC OHC) this cuts the one-step global residual from ~34% of
+        the OHC change (using F[t+1] only) to ~7%; the remaining ~7% comes from
+        working with monthly means rather than snapshots.
 
         This needs the flux in the INITIAL month, F[t0], which is not part of
         the rollout forcing (that starts at the first target month). It must be
@@ -170,25 +205,25 @@ def global_closure_loss(
 
     Why the standard deviation IS still multiplied back in:
         The model works in z-scores, z = anomaly / std, where std varies per grid
-        cell and per calendar month, and differs between OHC and heat flux. The
-        heat budget is linear in PHYSICAL anomalies, not z-scores:
+        cell and per calendar month, and differs between content and flux. The
+        budget is linear in PHYSICAL anomalies, not z-scores:
           * area-integrating raw z-scores would weight each cell by 1/std,
-            so quiet regions would dominate the "global" heat content;
-          * OHC and flux are divided by different std fields, so equal z-score
-            changes do not correspond to equal energy;
-          * OHC std changes month to month, so z[target] - z[initial] is not
-            an anomaly change even at a single grid point.
+            so quiet regions would dominate the "global" content;
+          * content and flux are divided by different std fields, so equal
+            z-score changes do not correspond to equal amounts;
+          * the content std changes month to month, so z[target] - z[initial]
+            is not an anomaly change even at a single grid point.
         Multiplying by std_t (and only std_t) converts z-scores back to physical
-        anomalies (J/m^2 and W/m^2) so both sides of the budget are comparable.
+        anomalies so both sides of the budget are comparable.
 
     Note the contrast with `local_mse_loss` / `spectral_loss`: those are fitting
     objectives, not conservation laws, so they deliberately stay in z-score
     space, where every cell and month is weighted roughly equally.
     """
+    name = "global_closure_loss" if budget is None else f"{budget} closure loss"
 
     def loss_fn(
         *,
-        initial_ohc_norm,
         pred_t,
         forcing_history,
         initial_time_index,
@@ -196,9 +231,12 @@ def global_closure_loss(
         forcing_time_indices,
         area,
         mask,
-        ohc_std,
-        forcing_std,
         dt_seconds,
+        initial_state_norm=None,
+        initial_ohc_norm=None,
+        ohc_std=None,
+        forcing_std=None,
+        closure_std=None,
         initial_forcing=None,
         rollout_step=None,
         **_,
@@ -210,31 +248,47 @@ def global_closure_loss(
         if current_weight == 0.0:
             return pred_t.new_zeros(())
 
+        if budget is None:
+            content_std, flux_std = ohc_std, forcing_std
+        else:
+            if closure_std is None or budget not in closure_std:
+                raise ValueError(
+                    f"The {name} needs closure_std[{budget!r}] = (content_std, flux_std) "
+                    "in the rollout context (see total_rollout_loss)."
+                )
+            content_std, flux_std = closure_std[budget]
+
         # Cell areas (m^2), zeroed over land so land never contributes to the
         # global integrals below.
         area_t = area.to(device=pred_t.device, dtype=pred_t.dtype)
         ocean_mask = mask.to(device=pred_t.device, dtype=pred_t.dtype)
         area_t = area_t * ocean_mask
 
-        # --- OHC anomaly change over the rollout window --------------------
-        # ohc_std is the per-month climatological std, tiled along the full time
-        # axis, so indexing it with a (B,) tensor of time indices gives the
+        # --- Content anomaly change over the rollout window ----------------
+        # content_std is the per-month climatological std, tiled along the full
+        # time axis, so indexing it with a (B,) tensor of time indices gives the
         # (B, H, W) std field for each sample's month. The initial and target
         # months generally differ, so each state needs its own std_t.
-        initial_ohc_norm = squeeze_field_axes(initial_ohc_norm)  # (B, H, W) z-score
-        pred_ohc_norm = squeeze_field_axes(pred_t)                # (B, H, W) z-score
-        initial_ohc_std_t = ohc_std[initial_time_index].to(device=pred_t.device, dtype=pred_t.dtype)
-        target_ohc_std_t = ohc_std[target_time_index].to(device=pred_t.device, dtype=pred_t.dtype)
+        # With several prognostic variables, keep only the content channel.
+        # initial_ohc_norm is the older name of initial_state_norm.
+        initial_norm = initial_state_norm if initial_state_norm is not None else initial_ohc_norm
+        if initial_norm.ndim == 4 and initial_norm.shape[1] > 1:
+            initial_norm = initial_norm[:, content_channel_index]
+        pred_content = pred_t[:, content_channel_index] if pred_t.ndim == 4 and pred_t.shape[1] > 1 else pred_t
+        initial_norm = squeeze_field_axes(initial_norm)        # (B, H, W) z-score
+        pred_content_norm = squeeze_field_axes(pred_content)   # (B, H, W) z-score
+        initial_std_t = content_std[initial_time_index].to(device=pred_t.device, dtype=pred_t.dtype)
+        target_std_t = content_std[target_time_index].to(device=pred_t.device, dtype=pred_t.dtype)
 
-        # z-score * std = physical anomaly (J/m^2). No "+ mean": we stay in
-        # anomaly space on purpose.
-        initial_ohc_anom = initial_ohc_norm * initial_ohc_std_t
-        predicted_ohc_anom = pred_ohc_norm * target_ohc_std_t
+        # z-score * std = physical anomaly (e.g. J/m^2). No "+ mean": we stay
+        # in anomaly space on purpose.
+        initial_anom = initial_norm * initial_std_t
+        predicted_anom = pred_content_norm * target_std_t
 
-        # Area-integrate the anomaly change: J/m^2 * m^2 -> J, one value per sample.
-        ohc_change_global = ((predicted_ohc_anom - initial_ohc_anom) * area_t).sum(dim=(-2, -1))
+        # Area-integrate the anomaly change (e.g. J/m^2 * m^2 -> J), one value per sample.
+        content_change_global = ((predicted_anom - initial_anom) * area_t).sum(dim=(-2, -1))
 
-        # --- Accumulated surface heat-flux anomaly over the same window ----
+        # --- Accumulated surface-flux anomaly over the same window ----------
         # Trapezoid rule over the monthly-mean fluxes (see the docstring):
         #   initial month t0            -> weight 1/2  (initial_forcing)
         #   months t0+1 ... t0+n-1      -> weight 1    (forcing_history[:, :-1])
@@ -243,7 +297,7 @@ def global_closure_loss(
         # up to the current target, so its last entry is the target month.
         if initial_forcing is None:
             raise ValueError(
-                "global_closure_loss needs `initial_forcing`: the forcing in the "
+                f"The {name} needs `initial_forcing`: the forcing in the "
                 "initial month (time index target_time_indices[:, 0] - 1). The "
                 "two-month flux average uses half of it for the first step. Add it "
                 "to the rollout batch and pass it to total_rollout_loss."
@@ -258,23 +312,23 @@ def global_closure_loss(
             for history_step in range(n_history)
         ]
 
-        forcing_integral_global = pred_t.new_zeros(ohc_change_global.shape)
+        flux_integral_global = pred_t.new_zeros(content_change_global.shape)
         for flux_norm, flux_time_index, trapezoid_weight in flux_terms:
-            # Multi-channel forcing arrives as (B, C, H, W): keep only the heat
-            # flux channel, since forcing_std is the heat-flux std and wind
-            # stress has no place in a heat budget. Single-channel forcing is
-            # already (B, H, W) or (B, 1, H, W) and is left as is.
+            # Multi-channel forcing arrives as (B, C, H, W): keep only this
+            # budget's flux channel, since flux_std is that variable's std and
+            # the other forcings (e.g. wind stress) have no place in the budget.
+            # Single-channel forcing is already (B, H, W) or (B, 1, H, W).
             if flux_norm.ndim == 4 and flux_norm.shape[1] > 1:
-                flux_norm = flux_norm[:, heat_flux_channel_index]
+                flux_norm = flux_norm[:, flux_channel_index]
             flux_norm = squeeze_field_axes(flux_norm)  # (B, H, W) z-score
-            flux_std_t = forcing_std[flux_time_index].to(device=pred_t.device, dtype=pred_t.dtype)
-            # z-score * std = physical flux anomaly (W/m^2); again no "+ mean".
+            flux_std_t = flux_std[flux_time_index].to(device=pred_t.device, dtype=pred_t.dtype)
+            # z-score * std = physical flux anomaly (e.g. W/m^2); again no "+ mean".
             flux_anom = flux_norm * flux_std_t
 
-            # W/m^2 * m^2 * s -> J, times the trapezoid weight (1/2 at the two
-            # ends of the window, 1 in between). surface_flux_sign flips the
-            # convention if positive flux means heat leaving the ocean.
-            forcing_integral_global = forcing_integral_global + (
+            # e.g. W/m^2 * m^2 * s -> J, times the trapezoid weight (1/2 at the
+            # two ends of the window, 1 in between). surface_flux_sign flips the
+            # convention if positive flux means leaving the ocean.
+            flux_integral_global = flux_integral_global + (
                 (flux_anom * area_t).sum(dim=(-2, -1))
                 * dt_seconds
                 * trapezoid_weight
@@ -282,18 +336,87 @@ def global_closure_loss(
             )
 
         # --- Normalised squared residual -------------------------------------
-        # Residual in Joules. Divide by the typical magnitude of the anomaly
-        # signal in this batch (detached, so the scale itself is not optimised)
-        # to make the penalty dimensionless. closure_min_scale is a floor so
-        # windows with near-zero anomalies do not blow the penalty up.
-        residual = ohc_change_global - forcing_integral_global
+        # Residual in content units x m^2 (e.g. J). Divide by the typical
+        # magnitude of the anomaly signal in this batch (detached, so the scale
+        # itself is not optimised) to make the penalty dimensionless. min_scale
+        # is a floor so windows with near-zero anomalies do not blow it up.
+        residual = content_change_global - flux_integral_global
         scale = torch.maximum(
-            forcing_integral_global.detach().abs().mean(),
-            ohc_change_global.detach().abs().mean(),
-        ).clamp_min(closure_min_scale)
+            flux_integral_global.detach().abs().mean(),
+            content_change_global.detach().abs().mean(),
+        ).clamp_min(min_scale)
         return current_weight * ((residual / scale) ** 2).mean()
 
     return loss_fn
+
+
+def heat_closure_loss(
+    weight=1.0,
+    ohc_channel_index=0,
+    heat_flux_channel_index=0,
+    surface_flux_sign=1.0,
+    min_scale=1.0e20,
+    budget="heat",
+):
+    """
+    Global heat-budget closure: OHC (J/m^2) against the surface heat flux
+    (W/m^2, positive into the ocean for surface_flux_sign=+1). min_scale in J.
+    Reads closure_std[budget] from the rollout context; see budget_closure_loss.
+    """
+    return budget_closure_loss(
+        weight=weight,
+        budget=budget,
+        content_channel_index=ohc_channel_index,
+        flux_channel_index=heat_flux_channel_index,
+        surface_flux_sign=surface_flux_sign,
+        min_scale=min_scale,
+    )
+
+
+def freshwater_closure_loss(
+    weight=1.0,
+    freshwater_content_channel_index=0,
+    freshwater_flux_channel_index=0,
+    surface_flux_sign=1.0,
+    min_scale=1.0e12,
+    budget="freshwater",
+):
+    """
+    Global freshwater-budget closure: freshwater content (kg/m^2, relative to
+    a reference salinity) against the surface freshwater flux (kg/m^2/s,
+    positive into the ocean for surface_flux_sign=+1). min_scale in kg.
+    Reads closure_std[budget] from the rollout context; see budget_closure_loss.
+    """
+    return budget_closure_loss(
+        weight=weight,
+        budget=budget,
+        content_channel_index=freshwater_content_channel_index,
+        flux_channel_index=freshwater_flux_channel_index,
+        surface_flux_sign=surface_flux_sign,
+        min_scale=min_scale,
+    )
+
+
+def global_closure_loss(
+    weight=1.0,
+    surface_flux_sign=1.0,
+    closure_min_scale=1.0e20,
+    heat_flux_channel_index=0,
+    ohc_channel_index=0,
+):
+    """
+    The original heat-only closure, kept for the older notebooks: uses the
+    rollout context's ``ohc_std`` and ``forcing_std`` (the heat-flux std).
+    New code should use heat_closure_loss / freshwater_closure_loss.
+    """
+    return budget_closure_loss(
+        weight=weight,
+        budget=None,
+        content_channel_index=ohc_channel_index,
+        flux_channel_index=heat_flux_channel_index,
+        surface_flux_sign=surface_flux_sign,
+        min_scale=closure_min_scale,
+    )
 
 
 def total_rollout_loss(
@@ -312,9 +435,20 @@ def total_rollout_loss(
     forcing_std=None,
     dt_seconds=30 * 24 * 60 * 60,
     initial_forcing=None,
+    n_prognostic=1,
+    closure_std=None,
+    checkpoint_steps=False,
+    steps_in_memory=0,
 ):
     """
     Run an autoregressive rollout and average any supplied loss callables.
+
+    ``initial_prior_states`` is (B, n_prior * n_prognostic, H, W): the prior
+    states stacked oldest first, each contributing ``n_prognostic`` channels.
+    After every step the oldest state is dropped and the prediction appended.
+
+    ``target_sequence`` is either (B, n_steps, H, W) for one prognostic variable
+    or (B, n_steps, n_prognostic, H, W).
 
     ``forcing_sequence`` is either (B, n_steps, H, W) for a single forcing
     variable, or (B, n_steps, C, H, W) for channel-stacked forcing. Each step
@@ -325,12 +459,26 @@ def total_rollout_loss(
     single step of ``forcing_sequence``: (B, H, W) or (B, C, H, W). The model
     never sees it; it is only used by global_closure_loss for the two-month
     flux average in the first rollout step.
+
+    ``closure_std`` is {budget: (content_std, flux_std)} for the closure losses
+    built with a budget name (heat_closure_loss, freshwater_closure_loss, ...).
+    ``ohc_std`` / ``forcing_std`` serve the original global_closure_loss.
+
+    ``checkpoint_steps=True`` recomputes each step's model activations during
+    the backward pass instead of keeping them (gradient checkpointing): peak
+    memory is about one step's activations instead of n_steps', for roughly
+    one extra forward pass of compute. The loss and gradients are unchanged.
+    ``steps_in_memory`` keeps the activations of the last that many steps
+    (no recompute for them) and checkpoints only the earlier ones: memory for
+    about steps_in_memory + 1 steps, with proportionally less recompute.
     """
     if not losses:
         raise ValueError("total_rollout_loss requires at least one loss function")
 
     prior_states = initial_prior_states
-    initial_ohc_norm = initial_prior_states[:, 1:2]
+    # The most recent prior state (all prognostic variables): the rollout's
+    # starting point for the closure terms.
+    initial_state_norm = initial_prior_states[:, -n_prognostic:]
     initial_time_index = None
     if target_time_indices is not None:
         initial_time_index = target_time_indices[:, 0].to(initial_prior_states.device) - 1
@@ -343,8 +491,15 @@ def total_rollout_loss(
             forcing_t = forcing_sequence[:, step]
         else:
             forcing_t = forcing_sequence[:, step : step + 1]
-        target_t = target_sequence[:, step : step + 1]
-        pred_t = model(prior_states, forcing_t, mask)
+        # (B, n_steps, P, H, W) -> (B, P, H, W); (B, n_steps, H, W) -> (B, 1, H, W).
+        if target_sequence.ndim == 5:
+            target_t = target_sequence[:, step]
+        else:
+            target_t = target_sequence[:, step : step + 1]
+        if checkpoint_steps and step < n_steps - steps_in_memory and torch.is_grad_enabled():
+            pred_t = checkpoint(model, prior_states, forcing_t, mask, use_reentrant=False)
+        else:
+            pred_t = model(prior_states, forcing_t, mask)
 
         target_time_index = None
         forcing_time_indices = None
@@ -357,7 +512,7 @@ def total_rollout_loss(
             pred_t=pred_t,
             target_t=target_t,
             mask=mask,
-            initial_ohc_norm=initial_ohc_norm,
+            initial_state_norm=initial_state_norm,
             forcing_history=forcing_sequence[:, : step + 1],
             initial_time_index=initial_time_index,
             target_time_index=target_time_index,
@@ -370,6 +525,7 @@ def total_rollout_loss(
             ohc_std=ohc_std,
             forcing_mean=forcing_mean,
             forcing_std=forcing_std,
+            closure_std=closure_std,
             dt_seconds=dt_seconds,
             initial_forcing=initial_forcing,
         )
@@ -377,6 +533,7 @@ def total_rollout_loss(
         for loss_fn in losses:
             total = total + loss_fn(**context)
 
-        prior_states = torch.cat([prior_states[:, 1:2], pred_t], dim=1)
+        # Drop the oldest prior state (n_prognostic channels), append the prediction.
+        prior_states = torch.cat([prior_states[:, n_prognostic:], pred_t], dim=1)
 
     return total / n_steps
