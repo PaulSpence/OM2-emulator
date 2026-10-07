@@ -166,14 +166,6 @@ class LossConfig:
     # The budgets available as "<budget>_closure" terms: {budget: ClosureConfig}.
     closures: dict = field(default_factory=_default_closures)
     seconds_per_step: float = 30 * 24 * 60 * 60  # one month
-    # Perturbation-growth penalty (0 = off): perturb the true input state with
-    # small grid-scale noise (RMS growth_perturbation, in z-score units) and
-    # penalise relu(growth - growth_target)^2, where growth is the one-step
-    # amplification ||f(x + d) - f(x)|| / ||d||. Costs two forward passes per
-    # batch. val_growth is logged every epoch either way.
-    growth_penalty: float = 0.0
-    growth_target: float = 1.0
-    growth_perturbation: float = 0.1
 
 
 @dataclass
@@ -219,10 +211,6 @@ class TrainConfig:
     # (this + 1) steps; each kept step saves ~1/4 of a step's compute. Raise it
     # until training runs out of memory, then step back. 0 = checkpoint all.
     rollout_steps_in_memory: int = 0
-    # Gaussian noise (z-score units) added to the prior states of training
-    # samples only; targets stay clean, so the model learns to damp
-    # perturbations instead of passing them on. 0 = off.
-    input_noise_std: float = 0.0
     # torch.compile the model (fuses the elementwise mask/ReLU operations).
     # Experimental: the first steps are slow while it compiles, and a smaller
     # last batch triggers one recompile.
@@ -360,10 +348,6 @@ class ExperimentConfig:
             raise ValueError("train.batch_size and train.accumulate_grad_batches must be >= 1")
         if tr.rollout_steps_in_memory < 0:
             raise ValueError("train.rollout_steps_in_memory must be >= 0")
-        if tr.input_noise_std < 0:
-            raise ValueError("train.input_noise_std must be >= 0")
-        if lo.growth_penalty < 0 or lo.growth_perturbation <= 0:
-            raise ValueError("loss.growth_penalty must be >= 0 and loss.growth_perturbation > 0")
         if tr.lr_scheduler not in (None, "cosine"):
             raise ValueError("train.lr_scheduler must be None or 'cosine'")
 

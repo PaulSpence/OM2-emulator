@@ -770,7 +770,7 @@ def test_checkpointed_spectral_loss_matches_direct_computation():
 
 
 # =============================================================================
-# Stability: growth diagnostic, growth penalty, input noise
+# Stability diagnostic: leading growth mode
 # =============================================================================
 
 class _ScaledPersistence(torch.nn.Module):
@@ -805,62 +805,6 @@ def test_leading_growth_mode_runs_on_the_emulator(data_and_cfg):
     assert np.isfinite(result["growth"]) and result["growth"] > 0
     assert result["mode"].shape == (data.n_prognostic, H, W)
     plt.close(plot_growth_mode(result, data))
-
-
-def test_perturbation_growth_is_one_for_exact_persistence(data_and_cfg):
-    """The emulator predicts the change; a zero change persists any perturbation exactly."""
-    data, cfg = data_and_cfg
-    model = build_model(cfg, data)
-    with torch.no_grad():
-        model.backbone.dec3.conv.weight.zero_()
-        model.backbone.dec3.conv.bias.zero_()
-    module = build_module(cfg, model, build_losses(cfg, data), data)
-    growth = module.perturbation_growth(data.windows(data.train_indices[:3], n_steps=2))
-    torch.testing.assert_close(growth, torch.ones(3), rtol=1e-4, atol=1e-4)
-
-
-def test_growth_penalty_adds_to_the_training_loss(synthetic_file, tmp_path):
-    def loss_with(penalty):
-        cfg = make_cfg(synthetic_file, tmp_path,
-                       loss=LossConfig(terms={"local_mse": 1.0}, growth_penalty=penalty, growth_target=0.5))
-        data = build_data(cfg, verbose=False)
-        module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
-        torch.manual_seed(0)
-        loss = module._step(data.windows(data.train_indices[:4], n_steps=2), 2, "train")
-        return loss, module
-
-    plain, _ = loss_with(0.0)
-    penalised, module = loss_with(1.0)
-    assert penalised > plain  # a fresh model's growth is well above the 0.5 target
-    penalised.backward()
-    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in module.parameters())
-
-
-def test_input_noise_only_perturbs_training(synthetic_file, tmp_path):
-    def module_with(noise, model=None):
-        cfg = make_cfg(synthetic_file, tmp_path,
-                       train=TrainConfig(batch_size=8, max_epochs=1, gpu_check=False, input_noise_std=noise))
-        data = build_data(cfg, verbose=False)
-        model = model or build_model(cfg, data)
-        return build_module(cfg, model, build_losses(cfg, data), data), data, model
-
-    clean, data, model = module_with(0.0)
-    noisy, _, _ = module_with(0.5, model)  # same weights
-    batch = data.windows(data.train_indices[:4], n_steps=2)
-    with torch.no_grad():
-        assert not torch.isclose(noisy._step(batch, 2, "train"), clean._step(batch, 2, "train"))
-        torch.manual_seed(0)
-        val_noisy = noisy._step(batch, 2, "val")
-        torch.manual_seed(0)
-        val_clean = clean._step(batch, 2, "val")
-    torch.testing.assert_close(val_noisy, val_clean)
-
-
-def test_stability_options_are_validated(synthetic_file, tmp_path):
-    with pytest.raises(ValueError, match="input_noise_std"):
-        make_cfg(synthetic_file, tmp_path, train=TrainConfig(input_noise_std=-1.0))
-    with pytest.raises(ValueError, match="growth"):
-        make_cfg(synthetic_file, tmp_path, loss=LossConfig(terms={"local_mse": 1.0}, growth_perturbation=0.0))
 
 
 # =============================================================================
