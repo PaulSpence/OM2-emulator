@@ -154,34 +154,38 @@ class EmulatorModule(L.LightningModule):
         """Rollout windows for initial months t0, cut on the module's device."""
         return gather_windows(self.prognostic_z, self.forcing_z, t0, self.n_prior, n_steps)
 
-    def push_forward(self, batch, n_free):
+    def push_forward(self, t0, n_free, n_steps):
         """
-        Run the first n_free steps of the windows WITHOUT gradients (see
-        WindowConfig.rollout_steps) and return the windows of the remaining
-        steps, starting from the model's own state: prior = the last n_prior
-        states of the free run (true states while n_free < n_prior).
+        Run n_free steps from the true states at initial months t0 WITHOUT
+        gradients (see WindowConfig.rollout_steps), then return the windows of
+        the next n_steps months (gather_windows layout) starting from the
+        model's own state: prior = the last n_prior states of the free run
+        (true states while n_free < n_prior).
+
+        Each free step reads its forcing month straight from the fields, and
+        windows are cut only for the n_steps scored months, so a [24, 12]
+        rollout holds 12 months of targets and forcing per sample, not 36.
         """
+        t0 = torch.as_tensor(t0, dtype=torch.long, device=self.prognostic_z.device)
         # (B, n_prior, P, H, W) -> (B, n_prior * P, H, W), oldest state first
-        prior = batch["prior"].flatten(1, 2)
+        prior = self.windows(t0, 0)["prior"].flatten(1, 2)
         with torch.no_grad():
-            for k in range(n_free):
-                pred = self._run_model(prior, batch["forcing"][:, k], self.mask)
+            for k in range(1, n_free + 1):
+                pred = self._run_model(prior, self.forcing_z[t0 + k], self.mask)
                 prior = torch.cat([prior[:, self.n_prognostic:], pred.to(prior.dtype)], dim=1)
-        return {
-            "prior": prior.unflatten(1, (self.n_prior, self.n_prognostic)),
-            "target": batch["target"][:, n_free:],
-            "forcing": batch["forcing"][:, n_free:],
-            # Forcing in the month of the new initial state, for the closure terms.
-            "initial_forcing": batch["forcing"][:, n_free - 1] if n_free else batch["initial_forcing"],
-            "target_time_index": batch["target_time_index"][:, n_free:],
-        }
+        batch = self.windows(t0 + n_free, n_steps)
+        batch["prior"] = prior.unflatten(1, (self.n_prior, self.n_prognostic))
+        return batch
 
     def _step(self, batch, steps, stage):
         n_free, n_steps = rollout_spec(steps)  # n or (n_free, n_trained)
-        if not isinstance(batch, dict):
-            batch = self.windows(batch, n_free + n_steps)
-        if n_free:
-            batch = self.push_forward(batch, n_free)
+        if isinstance(batch, dict):
+            if n_free:
+                raise ValueError("A [n_free, n_trained] rollout needs initial months, not ready-made windows")
+        elif n_free:
+            batch = self.push_forward(batch, n_free, n_steps)
+        else:
+            batch = self.windows(batch, n_steps)
         loss = total_rollout_loss(
             model=self._run_model,
             # (B, n_prior, P, H, W) -> (B, n_prior * P, H, W), oldest state first

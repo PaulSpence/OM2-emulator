@@ -359,25 +359,27 @@ def test_rollout_schedule():
 
 
 def test_push_forward_starts_from_the_models_own_state(data_and_cfg):
-    """n_free gradient-free steps, then windows of the remaining steps from the predicted state."""
+    """n_free gradient-free steps, then windows of the next steps from the predicted state."""
     data, cfg = data_and_cfg
-    a, n_free = 0.5, 3
+    a, n_free, n_steps = 0.5, 3, 1
     module = build_module(cfg, _ScaledPersistence(a, data.n_prognostic), build_losses(cfg, data), data)
-    batch = data.windows(data.train_indices[:2], n_steps=4)
-    pushed = module.push_forward(batch, n_free)
+    t0 = data.train_indices[:2]
+    full = data.windows(t0, n_steps=n_free + n_steps)
+    pushed = module.push_forward(t0, n_free, n_steps)
 
     # next = a * last state, so after k steps the newest state is a^k * the true initial state.
-    initial = batch["prior"][:, -1]
+    initial = full["prior"][:, -1]
     expected_prior = torch.stack([a ** (n_free - 1) * initial, a**n_free * initial], dim=1)  # n_prior = 2
     torch.testing.assert_close(pushed["prior"], expected_prior)
     assert not pushed["prior"].requires_grad
-    torch.testing.assert_close(pushed["target"], batch["target"][:, n_free:])
-    torch.testing.assert_close(pushed["forcing"], batch["forcing"][:, n_free:])
-    torch.testing.assert_close(pushed["initial_forcing"], batch["forcing"][:, n_free - 1])
-    assert torch.equal(pushed["target_time_index"], batch["target_time_index"][:, n_free:])
+    # The scored steps are the same months as the tail of the full window.
+    torch.testing.assert_close(pushed["target"], full["target"][:, n_free:])
+    torch.testing.assert_close(pushed["forcing"], full["forcing"][:, n_free:])
+    torch.testing.assert_close(pushed["initial_forcing"], full["forcing"][:, n_free - 1])
+    assert torch.equal(pushed["target_time_index"], full["target_time_index"][:, n_free:])
 
     # With fewer free steps than prior states, the true states fill the rest.
-    pushed = module.push_forward(batch, 1)
+    pushed = module.push_forward(t0, 1, n_steps)
     torch.testing.assert_close(pushed["prior"], torch.stack([initial, a * initial], dim=1))
 
 
