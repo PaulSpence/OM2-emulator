@@ -10,3 +10,4 @@ notebooks/*.invalid
 src/.ipynb*
 .ipynb_checkpoints/
 *__pycache__*
+runs/
