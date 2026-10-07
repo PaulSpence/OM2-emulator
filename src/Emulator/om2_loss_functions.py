@@ -93,14 +93,16 @@ def local_mse_loss(weight=1.0):
 
 
 def spectral_loss(weight=1.0, eps=1.0e-6):
-    """Return a weighted masked log-amplitude spectral loss callable."""
+    """
+    Return a weighted masked log-amplitude spectral loss callable.
 
-    def loss_fn(*, pred_t, target_t, mask, rollout_step=None, **_):
-        current_weight = step_weight(weight, rollout_step, pred_t)
-        if current_weight == 0.0:
-            return pred_t.new_zeros(())
+    The spectrum is computed under gradient checkpointing: otherwise it keeps
+    several full-size tensors (masked field, anomaly, complex FFT, amplitude)
+    per rollout step for the backward pass, and they are cheap to recompute.
+    The value and gradients are unchanged.
+    """
 
-        valid_mask = expand_ocean_mask(mask, pred_t)
+    def log_amplitude_mse(pred_t, target_t, valid_mask):
         ocean_count = valid_mask.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0)
 
         pred_mean = (pred_t * valid_mask).sum(dim=(-2, -1), keepdim=True) / ocean_count
@@ -112,7 +114,18 @@ def spectral_loss(weight=1.0, eps=1.0e-6):
         pred_amp = torch.fft.rfft2(pred_anom, norm="ortho").abs()
         target_amp = torch.fft.rfft2(target_anom, norm="ortho").abs()
 
-        loss = F.mse_loss(torch.log1p(pred_amp + eps), torch.log1p(target_amp + eps))
+        return F.mse_loss(torch.log1p(pred_amp + eps), torch.log1p(target_amp + eps))
+
+    def loss_fn(*, pred_t, target_t, mask, rollout_step=None, **_):
+        current_weight = step_weight(weight, rollout_step, pred_t)
+        if current_weight == 0.0:
+            return pred_t.new_zeros(())
+
+        valid_mask = expand_ocean_mask(mask, pred_t)
+        if torch.is_grad_enabled() and pred_t.requires_grad:
+            loss = checkpoint(log_amplitude_mse, pred_t, target_t, valid_mask, use_reentrant=False)
+        else:
+            loss = log_amplitude_mse(pred_t, target_t, valid_mask)
         return current_weight * loss
 
     return loss_fn

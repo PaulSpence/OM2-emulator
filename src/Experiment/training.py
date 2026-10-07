@@ -14,8 +14,10 @@ from pathlib import Path
 import lightning as L
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
+from torch.utils.checkpoint import checkpoint
 
 from Emulator import total_rollout_loss
 
@@ -111,6 +113,10 @@ class EmulatorModule(L.LightningModule):
         self.__dict__["_run_model"] = torch.compile(model) if cfg.train.compile_model else model
         self.checkpoint_steps = cfg.train.checkpoint_rollout_steps
         self.steps_in_memory = cfg.train.rollout_steps_in_memory
+        self.input_noise_std = cfg.train.input_noise_std
+        lo = cfg.loss
+        self.growth_penalty, self.growth_target = lo.growth_penalty, lo.growth_target
+        self.growth_perturbation = lo.growth_perturbation
         self.losses = list(losses)
         self.n_prognostic = data.n_prognostic
         self.prognostic_names = list(data.fields["prognostic_names"])
@@ -150,9 +156,44 @@ class EmulatorModule(L.LightningModule):
         """Rollout windows for initial months t0, cut on the module's device."""
         return gather_windows(self.prognostic_z, self.forcing_z, t0, self.n_prior, n_steps)
 
+    def _ocean_rms(self, x):
+        """Per-sample RMS over the ocean of a (B, C, H, W) field."""
+        mask = self.mask.to(x.dtype)
+        return torch.sqrt((x.pow(2) * mask).sum(dim=(1, 2, 3)) / (mask.sum() * x.shape[1]))
+
+    def perturbation_growth(self, batch):
+        """
+        One-step amplification of a small grid-scale perturbation, per sample:
+        ||f(x + d) - f(x)|| / ||d|| over the ocean. The same perturbation d
+        (high-pass filtered noise, RMS growth_perturbation) is added to every
+        prior state, so a model that persists it exactly scores 1. Differentiable.
+        """
+        prior = batch["prior"].flatten(1, 2)
+        forcing = batch["forcing"][:, 0]
+        noise = torch.randn(prior.shape[0], self.n_prognostic, *self.mask.shape, device=prior.device, dtype=prior.dtype)
+        # High-pass: noise minus its 3x3 local mean, to target grid-scale modes.
+        noise = (noise - F.avg_pool2d(noise, 3, stride=1, padding=1, count_include_pad=False)) * self.mask
+        delta = noise * (self.growth_perturbation / self._ocean_rms(noise).clamp_min(1e-12))[:, None, None, None]
+        delta_prior = delta.repeat(1, self.n_prior, 1, 1)
+
+        def run(state):
+            if self.checkpoint_steps and torch.is_grad_enabled():
+                return checkpoint(self._run_model, state, forcing, self.mask, use_reentrant=False)
+            return self._run_model(state, forcing, self.mask)
+
+        diff = run(prior + delta_prior) - run(prior)
+        return self._ocean_rms(diff) / self._ocean_rms(delta)
+
+    def _add_input_noise(self, batch):
+        noise = torch.randn_like(batch["prior"]) * self.input_noise_std * self.mask
+        return {**batch, "prior": batch["prior"] + noise}
+
     def _step(self, batch, n_steps, stage):
         if not isinstance(batch, dict):
             batch = self.windows(batch, n_steps)
+        clean_batch = batch
+        if stage == "train" and self.input_noise_std > 0:
+            batch = self._add_input_noise(batch)
         loss = total_rollout_loss(
             model=self._run_model,
             # (B, n_prior, P, H, W) -> (B, n_prior * P, H, W), oldest state first
@@ -172,6 +213,15 @@ class EmulatorModule(L.LightningModule):
             steps_in_memory=self.steps_in_memory,
         )
         batch_size = batch["prior"].shape[0]
+        penalise = stage == "train" and self.growth_penalty > 0
+        if penalise or stage == "val":
+            with torch.set_grad_enabled(penalise and torch.is_grad_enabled()):
+                growth = self.perturbation_growth(clean_batch)
+            self.log(f"{stage}_growth", growth.detach().mean(), on_step=False, on_epoch=True, batch_size=batch_size)
+            if penalise:
+                penalty = torch.relu(growth - self.growth_target).pow(2).mean()
+                self.log(f"{stage}_growth_penalty", penalty.detach(), on_step=False, on_epoch=True, batch_size=batch_size)
+                loss = loss + self.growth_penalty * penalty
         self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size)
         for term in self.losses:
             value = term.pop_running()

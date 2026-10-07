@@ -200,6 +200,58 @@ def run_control(cfg, model, data):
 
 
 # =============================================================================
+# Stability diagnostic
+# =============================================================================
+
+@torch.no_grad()
+def leading_growth_mode(model, data, month, n_iter=40, eps=1e-2, seed=0):
+    """
+    Fastest-growing small perturbation of the one-step map around the true
+    state at ``month`` (forcing fixed at the following month), by power
+    iteration with finite-difference Jacobian-vector products.
+
+    With n_prior > 1 the iteration runs on the stacked prior states (the
+    shift-and-append form of the rollout), so ``growth`` is the per-step
+    amplification factor of autoregressive rollouts linearised about that
+    state: > 1 means small perturbations grow by that factor every step.
+
+    Returns {"growth", "history", "mode", "names", "month"}: ``mode`` is the
+    (P, H, W) newest-state part of the leading perturbation, unit RMS, NaN on land.
+    """
+    device = next(model.parameters()).device
+    was_training = model.training
+    model.eval()
+    f = data.fields
+    n_prior = data.n_prior
+    t0 = data.index_of(month)
+    prior = f["prognostic"][t0 - n_prior + 1 : t0 + 1].to(device).float()  # (n_prior, P, H, W)
+    forcing = f["forcing"][t0 + 1 : t0 + 2].to(device).float()           # (1, C, H, W)
+    mask = f["mask"].to(device).float()
+
+    def step(states):
+        return model(states.flatten(0, 1)[None], forcing, mask)[0].float()
+
+    base = step(prior)
+    generator = torch.Generator().manual_seed(seed)
+    v = torch.randn(prior.shape, generator=generator).to(device) * mask
+    history = []
+    for _ in range(n_iter):
+        v = v / v.norm()
+        newest = (step(prior + eps * v) - base) / eps
+        v = torch.cat([v[1:], newest[None]]) * mask
+        history.append(float(v.norm()))
+    model.train(was_training)
+
+    tail = history[-min(5, len(history)):]
+    growth = float(np.exp(np.mean(np.log(np.maximum(tail, 1e-30)))))
+    mode = v[-1] / v[-1].norm() * np.sqrt(mask.sum().item() * v.shape[1])
+    mode = mode.cpu().numpy()
+    mode[:, f["mask"].numpy() == 0] = np.nan
+    return {"growth": growth, "history": history, "mode": mode,
+            "names": list(f["prognostic_names"]), "month": str(month)}
+
+
+# =============================================================================
 # Metrics
 # =============================================================================
 

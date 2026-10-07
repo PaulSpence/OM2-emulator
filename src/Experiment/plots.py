@@ -237,3 +237,17 @@ def plot_training_history(run_dir):
     ax.grid(alpha=0.3)
     ax.legend(frameon=False)
     return fig
+
+
+def plot_growth_mode(result, data):
+    """Maps of the leading growth mode from evaluation.leading_growth_mode, one panel per variable."""
+    lat, lon = data.fields["latitude"], data.fields["longitude"]
+    names = result["names"]
+    fig, axes = plt.subplots(1, len(names), figsize=(5 * len(names), 4), squeeze=False, constrained_layout=True)
+    for ax, name, field in zip(axes[0], names, result["mode"]):
+        vmax = np.nanquantile(np.abs(field), 0.99) or 1.0
+        image = ax.pcolormesh(lon, lat, field, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
+        ax.set_title(name)
+        fig.colorbar(image, ax=ax, shrink=0.8)
+    fig.suptitle(f"Leading growth mode around {result['month']}: growth factor {result['growth']:.3f} per step")
+    return fig

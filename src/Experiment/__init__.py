@@ -27,11 +27,19 @@ from .config import (
     WindowConfig,
 )
 from .data import ExperimentData, InitialMonthDataset, build_data, compute_normalisation, gather_windows
-from .evaluation import check_known_closure, global_integral, global_rmse, run_control, run_skill_test
+from .evaluation import (
+    check_known_closure,
+    global_integral,
+    global_rmse,
+    leading_growth_mode,
+    run_control,
+    run_skill_test,
+)
 from .losses import build_losses
 from .models import ForwardEmulator, build_model, count_parameters
 from .plots import (
     plot_control,
+    plot_growth_mode,
     plot_global_rmse,
     plot_global_rmse_all_variables,
     plot_global_timeseries,
@@ -62,6 +70,7 @@ __all__ = [
     "check_known_closure",
     "global_integral",
     "global_rmse",
+    "leading_growth_mode",
     "run_control",
     "run_skill_test",
     "build_losses",
@@ -69,6 +78,7 @@ __all__ = [
     "build_model",
     "count_parameters",
     "plot_control",
+    "plot_growth_mode",
     "plot_global_rmse",
     "plot_global_rmse_all_variables",
     "plot_global_timeseries",

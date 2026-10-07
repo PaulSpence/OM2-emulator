@@ -75,18 +75,21 @@ class PartialConv2d(nn.Module):
         Padding size.
 
     padding_mode : str
-        How the grid edges are padded, for both the data and the mask
-        convolution: "replicate" (default) or "zeros".
+        How the south edge is padded, for both the data and the mask
+        convolution: "replicate" (default) or "zeros". The other edges follow
+        the ACCESS-OM2 tripolar grid topology:
+          * x (longitude) is padded circularly. With non-periodic padding the
+            seam acts as a coastline neither side can see across; in the
+            autoregressive OHC emulator 98% of the fastest-growing perturbation
+            sat at that seam.
+          * the north edge is the tripole fold: row-top cell i neighbours
+            row-top cell nx - 1 - i, so the ghost rows above the top row are
+            the top rows reversed in x (and in y).
 
-        * "replicate" copies the edge values outwards, avoiding artificial
-          zeros near the boundary. It is slow in training on the GPU: PyTorch
-          pads explicitly and then calls cuDNN without padding, and for these
-          shapes cuDNN picks slow backward kernels (worst for large kernels).
-        * "zeros" is ~2x faster per training step and uses ~35% less memory
-          (measured on a V100). It is also consistent with the partial
-          convolution: the zero-padded mask marks the padded cells as invalid,
-          so the kernel_area / mask_sum renormalisation corrects the edges the
-          same way it corrects coastlines.
+        * "replicate" copies the edge values outwards.
+        * "zeros" is consistent with the partial convolution: the zero-padded
+          mask marks the padded cells as invalid, so the kernel_area / mask_sum
+          renormalisation treats the north/south edges like coastlines.
 
     Notes
     -----
@@ -102,25 +105,15 @@ class PartialConv2d(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1, padding_mode="replicate"):
         super().__init__()
 
-        self.conv = nn.Conv2d(
-            in_ch,
-            out_ch,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            padding_mode=padding_mode,
-        )
+        # Padding is applied in forward: circular in x (longitude is periodic
+        # on a global grid), padding_mode in y. The convolutions do not pad.
+        self.padding = padding
+        self.y_pad_mode = {"zeros": "constant", "replicate": "replicate", "reflect": "reflect", "circular": "circular"}[padding_mode]
+
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, stride=stride)
 
         # convolution used only to count valid pixels
-        self.mask_conv = nn.Conv2d(
-            1,
-            1,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            padding_mode=padding_mode,
-            bias=False,
-        )
+        self.mask_conv = nn.Conv2d(1, 1, kernel_size=kernel_size, stride=stride, bias=False)
 
         self.mask_conv.weight.data[:] = 1.0
         self.mask_conv.requires_grad_(False)
@@ -161,6 +154,10 @@ class PartialConv2d(nn.Module):
                 (batch, 1, new_height, new_width)
         """
 
+        if self.padding:
+            x = self._pad(x)
+            mask = self._pad(mask)
+
         with torch.no_grad():
             # count valid pixels in each convolution window
             mask_sum = self.mask_conv(mask)
@@ -174,6 +171,33 @@ class PartialConv2d(nn.Module):
         out = self.conv(x * mask) * scale
 
         return out, new_mask
+
+    def _pad(self, t):
+        """
+        Pad for the ACCESS-OM2 tripolar grid: the north edge folds onto itself
+        (the ghost rows above the top row are the top rows reversed in x),
+        x is periodic, and the south edge uses padding_mode.
+        """
+        p = self.padding
+        fold = torch.flip(t[..., -p:, :], dims=(-2, -1))
+        t = torch.cat([F.pad(t, (0, 0, p, 0), mode=self.y_pad_mode), fold], dim=-2)
+        return F.pad(t, (p, p, 0, 0), mode="circular")
+
+def upsample_periodic_x(x, size):
+    """
+    Bilinear upsampling (align_corners=False) to ``size`` = (height, width),
+    treating x (longitude, the last dimension) as periodic so the east and west
+    edges interpolate across the seam. Falls back to plain interpolation if the
+    target width is not a whole multiple of the input width.
+    """
+    height, width = size
+    scale = width // x.shape[-1]
+    if scale * x.shape[-1] != width:
+        return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+    x = F.pad(x, (1, 1, 0, 0), mode="circular")
+    x = F.interpolate(x, size=(height, width + 2 * scale), mode="bilinear", align_corners=False)
+    return x[..., scale:-scale]
+
 
 class PartialConvStack(nn.Module):
     """
@@ -308,14 +332,14 @@ class AutoEncoder(nn.Module):
     def decode(self, x, mask):
         """Decoder: takes latent representation and reconstructs output"""
         # upsample 1
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = upsample_periodic_x(x, (2 * x.shape[-2], 2 * x.shape[-1]))
         mask = F.interpolate(mask, scale_factor=2, mode="nearest")
 
         x, mask = self.dec1(x, mask)
         x = self.relu(x)
 
         # upsample 2
-        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
+        x = upsample_periodic_x(x, (2 * x.shape[-2], 2 * x.shape[-1]))
         mask = F.interpolate(mask, scale_factor=2, mode="nearest")
 
         x, mask = self.dec2(x, mask)
@@ -458,10 +482,11 @@ class UNet(nn.Module):
     convolutions (PartialConvStack): the receptive field of the original 7x7
     layers at a fraction of the cost.
 
-    The output layer works at full resolution on the upsampled decoder features
-    concatenated with the raw input, so grid-scale structure in the inputs
-    (e.g. the current state) reaches the output without passing through the
-    downsampled levels.
+    The output layer works at full resolution on the upsampled decoder
+    features only. Feeding it the raw input as well was tried and removed: in
+    autoregressive use it learned a sharpening stencil that grew grid-scale
+    noise by ~17% per step. A residual wrapper (next = state + output) carries
+    the state's grid-scale content forward unchanged instead.
     """
 
     def __init__(self,
@@ -491,8 +516,8 @@ class UNet(nn.Module):
         # After the second upsample: dec1 + skip from enc1.
         self.dec2 = PartialConv2d(width2 + width1, width1, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
 
-        # Full resolution: dec2 upsampled + the raw input (full-resolution skip).
-        self.dec3 = PartialConv2d(width1 + input_channel_count, output_channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
+        # Full resolution: dec2 upsampled.
+        self.dec3 = PartialConv2d(width1, output_channel_count, kernel_size=3, stride=1, padding=1, padding_mode=padding_mode)
 
         self.latent_processor = latent_processor or IdentityLatentProcessor()
         self.relu = nn.ReLU(inplace=True)
@@ -523,7 +548,7 @@ class UNet(nn.Module):
         """Decoder with U-Net skip connections; x0/mask0 are the full-resolution input"""
 
         # ---------- Upsample to enc2 resolution ----------
-        x = F.interpolate(x, size=x2.shape[2:], mode="bilinear", align_corners=False)
+        x = upsample_periodic_x(x, x2.shape[2:])
         mask = F.interpolate(mask, size=mask2.shape[2:], mode="nearest")
 
         x = torch.cat([x, x2], dim=1)
@@ -533,7 +558,7 @@ class UNet(nn.Module):
         x = self.relu(x)
 
         # ---------- Upsample to enc1 resolution ----------
-        x = F.interpolate(x, size=x1.shape[2:], mode="bilinear", align_corners=False)
+        x = upsample_periodic_x(x, x1.shape[2:])
         mask = F.interpolate(mask, size=mask1.shape[2:], mode="nearest")
 
         x = torch.cat([x, x1], dim=1)
@@ -543,10 +568,8 @@ class UNet(nn.Module):
         x = self.relu(x)
 
         # ---------- Final upsample to input resolution ----------
-        # Upsample to the input's exact size (odd grids included) and append the
-        # raw input as a full-resolution skip connection.
-        x = F.interpolate(x, size=x0.shape[2:], mode="bilinear", align_corners=False)
-        x = torch.cat([x, x0], dim=1)
+        # Upsample to the input's exact size (odd grids included).
+        x = upsample_periodic_x(x, x0.shape[2:])
 
         x, mask = self.dec3(x, mask0)
 

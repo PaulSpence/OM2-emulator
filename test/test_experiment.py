@@ -558,7 +558,7 @@ def test_unet_widths_scale_with_input_channels(synthetic_file, tmp_path):
         assert unet.enc1.conv.out_channels == width1
         assert unet.enc2.conv.out_channels == 2 * width1
         assert unet.latent_channel_count == unet.enc3.out_channels == 4 * width1
-        assert unet.dec3.conv.in_channels == width1 + in_ch  # full-resolution input skip
+        assert unet.dec3.conv.in_channels == width1  # no raw-input skip at full resolution
         assert unet.dec3.conv.out_channels == data.n_prognostic
 
 
@@ -579,27 +579,6 @@ def test_zero_backbone_output_persists_last_state(data_and_cfg):
     torch.testing.assert_close(out, prior[:, -data.n_prognostic :])
 
 
-def test_unet_full_resolution_skip_can_copy_the_input():
-    """
-    The output layer sees the raw input at full resolution, so the UNet can
-    reproduce grid-scale structure exactly (impossible through the 1/2-resolution path).
-    """
-    from Emulator import UNet
-
-    channels, h, w = 3, 15, 21  # odd grid: the output must still match the input size
-    unet = UNet(input_channel_count=channels, output_channel_count=channels, padding_mode="zeros")
-    width1 = unet.dec3.conv.in_channels - channels
-    with torch.no_grad():
-        unet.dec3.conv.weight.zero_()
-        unet.dec3.conv.bias.zero_()
-        for c in range(channels):
-            unet.dec3.conv.weight[c, width1 + c, 1, 1] = 1.0  # centre tap on raw input channel c
-    x = torch.randn(2, channels, h, w)
-    out = unet(x, torch.ones(2, 1, h, w))
-    assert out.shape == x.shape
-    # Interior cells (the edges are renormalised by the zero padding).
-    torch.testing.assert_close(out[..., 1:-1, 1:-1], x[..., 1:-1, 1:-1])
-
 
 # =============================================================================
 # Speed and memory: lean partial convolution, 3x3 stacks, gradient
@@ -607,7 +586,8 @@ def test_unet_full_resolution_skip_can_copy_the_input():
 # =============================================================================
 
 def _reference_partial_conv(layer, x, mask):
-    """The original PartialConv2d forward: mask, convolve, where(renormalise, 0)."""
+    """The original PartialConv2d forward (mask, convolve, where(renormalise, 0)), with its padding."""
+    x, mask = layer._pad(x), layer._pad(mask)
     out = layer.conv(x * mask)
     mask_sum = layer.mask_conv(mask)
     out = torch.where(mask_sum > 0, out * (layer.kernel_area / (mask_sum + layer.eps)), torch.zeros_like(out))
@@ -763,3 +743,181 @@ def test_module_cuts_windows_from_its_own_fields(data_and_cfg):
 def test_rollout_steps_in_memory_must_be_non_negative(synthetic_file, tmp_path):
     with pytest.raises(ValueError, match="rollout_steps_in_memory"):
         make_cfg(synthetic_file, tmp_path, train=TrainConfig(rollout_steps_in_memory=-1))
+
+
+def test_checkpointed_spectral_loss_matches_direct_computation():
+    """The spectral loss under checkpointing has the original value and gradient."""
+    from Emulator import spectral_loss
+
+    g = torch.Generator().manual_seed(3)
+    mask = (torch.rand(H, W, generator=g) > 0.3).float()
+    pred = torch.randn(2, 3, H, W, generator=g, requires_grad=True)
+    target = torch.randn(2, 3, H, W, generator=g)
+
+    def reference(pred_t):
+        valid = mask.expand_as(pred_t)
+        count = valid.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0)
+        anomaly = lambda x: (x - (x * valid).sum(dim=(-2, -1), keepdim=True) / count) * valid
+        amp = lambda x: torch.fft.rfft2(anomaly(x), norm="ortho").abs()
+        return torch.nn.functional.mse_loss(torch.log1p(amp(pred_t) + 1e-6), torch.log1p(amp(target) + 1e-6))
+
+    expected = reference(pred)
+    (expected_grad,) = torch.autograd.grad(expected, pred)
+    loss = spectral_loss(weight=1.0)(pred_t=pred, target_t=target, mask=mask, rollout_step=0)
+    (grad,) = torch.autograd.grad(loss, pred)
+    torch.testing.assert_close(loss, expected)
+    torch.testing.assert_close(grad, expected_grad)
+
+
+# =============================================================================
+# Stability: growth diagnostic, growth penalty, input noise
+# =============================================================================
+
+class _ScaledPersistence(torch.nn.Module):
+    """next state = a * last state: every perturbation grows by exactly a per step."""
+
+    def __init__(self, a, n_prognostic):
+        super().__init__()
+        self.a, self.n_prognostic = a, n_prognostic
+        self.dummy = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, prior, forcing, mask):
+        return self.a * prior[:, -self.n_prognostic :]
+
+
+@pytest.mark.parametrize("a", [0.9, 1.2])
+def test_leading_growth_mode_recovers_known_growth(data_and_cfg, a):
+    from Experiment import leading_growth_mode
+
+    data, _ = data_and_cfg
+    result = leading_growth_mode(_ScaledPersistence(a, data.n_prognostic), data, "2004-01")
+    assert result["growth"] == pytest.approx(a, rel=1e-3)
+    land = data.fields["mask"].numpy() == 0
+    assert np.isnan(result["mode"][:, land]).all()
+    assert np.isfinite(result["mode"][:, ~land]).all()
+
+
+def test_leading_growth_mode_runs_on_the_emulator(data_and_cfg):
+    from Experiment import leading_growth_mode, plot_growth_mode
+
+    data, cfg = data_and_cfg
+    result = leading_growth_mode(build_model(cfg, data), data, "2004-01", n_iter=5)
+    assert np.isfinite(result["growth"]) and result["growth"] > 0
+    assert result["mode"].shape == (data.n_prognostic, H, W)
+    plt.close(plot_growth_mode(result, data))
+
+
+def test_perturbation_growth_is_one_for_exact_persistence(data_and_cfg):
+    """The emulator predicts the change; a zero change persists any perturbation exactly."""
+    data, cfg = data_and_cfg
+    model = build_model(cfg, data)
+    with torch.no_grad():
+        model.backbone.dec3.conv.weight.zero_()
+        model.backbone.dec3.conv.bias.zero_()
+    module = build_module(cfg, model, build_losses(cfg, data), data)
+    growth = module.perturbation_growth(data.windows(data.train_indices[:3], n_steps=2))
+    torch.testing.assert_close(growth, torch.ones(3), rtol=1e-4, atol=1e-4)
+
+
+def test_growth_penalty_adds_to_the_training_loss(synthetic_file, tmp_path):
+    def loss_with(penalty):
+        cfg = make_cfg(synthetic_file, tmp_path,
+                       loss=LossConfig(terms={"local_mse": 1.0}, growth_penalty=penalty, growth_target=0.5))
+        data = build_data(cfg, verbose=False)
+        module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
+        torch.manual_seed(0)
+        loss = module._step(data.windows(data.train_indices[:4], n_steps=2), 2, "train")
+        return loss, module
+
+    plain, _ = loss_with(0.0)
+    penalised, module = loss_with(1.0)
+    assert penalised > plain  # a fresh model's growth is well above the 0.5 target
+    penalised.backward()
+    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in module.parameters())
+
+
+def test_input_noise_only_perturbs_training(synthetic_file, tmp_path):
+    def module_with(noise, model=None):
+        cfg = make_cfg(synthetic_file, tmp_path,
+                       train=TrainConfig(batch_size=8, max_epochs=1, gpu_check=False, input_noise_std=noise))
+        data = build_data(cfg, verbose=False)
+        model = model or build_model(cfg, data)
+        return build_module(cfg, model, build_losses(cfg, data), data), data, model
+
+    clean, data, model = module_with(0.0)
+    noisy, _, _ = module_with(0.5, model)  # same weights
+    batch = data.windows(data.train_indices[:4], n_steps=2)
+    with torch.no_grad():
+        assert not torch.isclose(noisy._step(batch, 2, "train"), clean._step(batch, 2, "train"))
+        torch.manual_seed(0)
+        val_noisy = noisy._step(batch, 2, "val")
+        torch.manual_seed(0)
+        val_clean = clean._step(batch, 2, "val")
+    torch.testing.assert_close(val_noisy, val_clean)
+
+
+def test_stability_options_are_validated(synthetic_file, tmp_path):
+    with pytest.raises(ValueError, match="input_noise_std"):
+        make_cfg(synthetic_file, tmp_path, train=TrainConfig(input_noise_std=-1.0))
+    with pytest.raises(ValueError, match="growth"):
+        make_cfg(synthetic_file, tmp_path, loss=LossConfig(terms={"local_mse": 1.0}, growth_perturbation=0.0))
+
+
+# =============================================================================
+# Grid topology: periodic longitude, tripolar north fold
+# =============================================================================
+
+def test_padding_follows_the_tripolar_grid():
+    """Ghost rows above the top row are the top rows reversed in x; x wraps; the south edge is zero."""
+    from Emulator import PartialConv2d
+
+    layer = PartialConv2d(1, 1, kernel_size=5, padding=2, padding_mode="zeros")
+    t = torch.arange(6 * 8, dtype=torch.float32).reshape(1, 1, 6, 8)
+    padded = layer._pad(t)                      # (1, 1, 10, 12)
+    interior = padded[..., 2:-2]
+    torch.testing.assert_close(interior[..., 2:-2, :], t)                           # original field
+    torch.testing.assert_close(interior[..., -2, :], torch.flip(t[..., -1, :], dims=(-1,)))  # first ghost row
+    torch.testing.assert_close(interior[..., -1, :], torch.flip(t[..., -2, :], dims=(-1,)))  # second ghost row
+    assert (interior[..., :2, :] == 0).all()                                        # south edge
+    torch.testing.assert_close(padded[..., :2], padded[..., -4:-2])                 # x wraps
+    torch.testing.assert_close(padded[..., -2:], padded[..., 2:4])
+
+
+@pytest.mark.parametrize("kernel_size,stride,padding", [(3, 1, 1), (4, 2, 1)])
+def test_partial_conv_respects_the_grid_symmetry(kernel_size, stride, padding):
+    """Rolling by half the grid width is a symmetry of the periodic, folded grid: the output rolls with it."""
+    from Emulator import PartialConv2d
+
+    torch.manual_seed(0)
+    layer = PartialConv2d(3, 4, kernel_size, stride, padding, padding_mode="zeros")
+    x = torch.randn(2, 3, H, W)
+    mask = (torch.rand(1, 1, H, W) > 0.3).float()
+    shift = W // 2
+    out, new_mask = layer(x, mask)
+    out_rolled, mask_rolled = layer(torch.roll(x, shift, dims=-1), torch.roll(mask, shift, dims=-1))
+    torch.testing.assert_close(out_rolled, torch.roll(out, shift // stride, dims=-1))
+    torch.testing.assert_close(mask_rolled, torch.roll(new_mask, shift // stride, dims=-1))
+
+
+def test_periodic_upsampling_matches_interpolating_a_tiled_field():
+    from Emulator.om2_model_utils import upsample_periodic_x
+
+    x = torch.randn(2, 3, 5, 10)
+    tiled = torch.cat([x, x, x], dim=-1)  # three copies side by side: the middle one has true neighbours
+    expected = torch.nn.functional.interpolate(tiled, size=(10, 60), mode="bilinear", align_corners=False)[..., 20:40]
+    torch.testing.assert_close(upsample_periodic_x(x, (10, 20)), expected)
+
+
+def test_unet_respects_the_grid_symmetry():
+    """The whole backbone has no seam: rolling inputs and mask by half the width rolls the output by half."""
+    from Emulator import UNet
+
+    torch.manual_seed(0)
+    h, w = 16, 32  # width divisible by 8 so the half-width roll is exact at every UNet level
+    unet = UNet(input_channel_count=3, output_channel_count=2, padding_mode="zeros").eval()
+    x = torch.randn(1, 3, h, w)
+    mask = (torch.rand(1, 1, h, w) > 0.3).float()
+    with torch.no_grad():
+        out = unet(x, mask)
+        out_rolled = unet(torch.roll(x, w // 2, dims=-1), torch.roll(mask, w // 2, dims=-1))
+    torch.testing.assert_close(out_rolled, torch.roll(out, w // 2, dims=-1), rtol=1e-4, atol=1e-5)
