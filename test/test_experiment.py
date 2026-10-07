@@ -658,7 +658,7 @@ def test_checkpointed_rollout_gives_same_loss_and_gradients(data_and_cfg):
         loss.backward()
         for term in losses:
             term.pop_running()
-        results.append((loss.detach(), [p.grad.clone() for p in model.parameters()]))
+        results.append((loss.detach(), [p.grad.clone() for p in model.parameters() if p.requires_grad]))
     for loss, grads in results[1:]:
         torch.testing.assert_close(loss, results[0][0])
         for a, b in zip(grads, results[0][1]):
