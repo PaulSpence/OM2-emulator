@@ -19,6 +19,7 @@ import xarray as xr
 from Emulator import zonal_wavenumber_bands
 from Emulator.om2_loss_functions import SPECTRAL_BANDS_PER_DECADE
 
+from .config import rollout_spec
 from .losses import closure_loss, closure_std_fields
 
 
@@ -229,7 +230,7 @@ def persistence_rmse(cfg, data, initial_indices=None, n_steps=None):
     """
     f = data.fields
     indices = data.valid_indices if initial_indices is None else torch.as_tensor(initial_indices)
-    n_steps = n_steps or cfg.window.valid_rollout_steps or cfg.window.rollout_steps
+    n_steps = n_steps or cfg.window.valid_rollout_steps or sum(rollout_spec(cfg.window.rollout_steps))
     weight = f["area"].float() * f["mask"].float()
     weight = weight / weight.sum()
     squared = torch.zeros(len(f["prognostic_names"]), dtype=torch.float64)

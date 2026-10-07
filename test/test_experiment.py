@@ -211,7 +211,11 @@ def test_windows_match_direct_normalisation(data_and_cfg, synthetic_file):
 
 def test_split_sizes_and_bounds(data_and_cfg):
     data, _ = data_and_cfg
-    assert len(data.train_indices) == 41  # 2000-02 .. 2003-06
+    # Initial months 2000-02 .. 2003-02: training windows (4 targets) end by 2003-06,
+    # inside the training period, so training never sees validation or test months.
+    assert len(data.train_indices) == 37
+    last_target = int(data.train_indices.max()) + 4
+    assert data.months[last_target] == "2003-06"
     assert len(data.valid_indices) == 6   # 2003-07 .. 2003-12
 
 
@@ -254,6 +258,10 @@ def test_split_outside_time_axis_raises(synthetic_file, tmp_path):
         (dict(loss=LossConfig(terms={"mae": 1.0})), "Unknown loss terms"),
         (dict(model=ModelConfig(output_head="resnet")), "Unknown output_head"),
         (dict(window=WindowConfig(rollout_schedule={5: 4})), "epoch 0"),
+        (dict(window=WindowConfig(rollout_steps=[10, 4], posterior_steps=12)), "at most posterior_steps"),
+        (dict(window=WindowConfig(rollout_schedule={0: 1, 3: [10, 4]}, posterior_steps=12)), "more than posterior"),
+        (dict(window=WindowConfig(rollout_schedule={0: [2, 0]})), "n_trained >= 1"),
+        (dict(window=WindowConfig(rollout_steps=[1, 2, 3])), "n_free, n_trained"),
     ],
 )
 def test_config_rejects_inconsistent_settings(synthetic_file, tmp_path, overrides, message):
@@ -345,8 +353,48 @@ def test_one_epoch_trains(data_and_cfg):
 
 
 def test_rollout_schedule():
-    schedule = RolloutSchedule({0: 1, 3: 4, 10: 12})
-    assert [schedule.steps_for(e) for e in (0, 2, 3, 9, 10, 50)] == [1, 1, 4, 4, 12, 12]
+    schedule = RolloutSchedule({0: 1, 3: 4, 10: 12, 20: [24, 12]})
+    assert [schedule.steps_for(e) for e in (0, 2, 3, 9, 10, 19, 20, 50)] == [
+        (0, 1), (0, 1), (0, 4), (0, 4), (0, 12), (0, 12), (24, 12), (24, 12)]
+
+
+def test_push_forward_starts_from_the_models_own_state(data_and_cfg):
+    """n_free gradient-free steps, then windows of the remaining steps from the predicted state."""
+    data, cfg = data_and_cfg
+    a, n_free = 0.5, 3
+    module = build_module(cfg, _ScaledPersistence(a, data.n_prognostic), build_losses(cfg, data), data)
+    batch = data.windows(data.train_indices[:2], n_steps=4)
+    pushed = module.push_forward(batch, n_free)
+
+    # next = a * last state, so after k steps the newest state is a^k * the true initial state.
+    initial = batch["prior"][:, -1]
+    expected_prior = torch.stack([a ** (n_free - 1) * initial, a**n_free * initial], dim=1)  # n_prior = 2
+    torch.testing.assert_close(pushed["prior"], expected_prior)
+    assert not pushed["prior"].requires_grad
+    torch.testing.assert_close(pushed["target"], batch["target"][:, n_free:])
+    torch.testing.assert_close(pushed["forcing"], batch["forcing"][:, n_free:])
+    torch.testing.assert_close(pushed["initial_forcing"], batch["forcing"][:, n_free - 1])
+    assert torch.equal(pushed["target_time_index"], batch["target_time_index"][:, n_free:])
+
+    # With fewer free steps than prior states, the true states fill the rest.
+    pushed = module.push_forward(batch, 1)
+    torch.testing.assert_close(pushed["prior"], torch.stack([initial, a * initial], dim=1))
+
+
+def test_training_with_push_forward(synthetic_file, tmp_path):
+    """A [n_free, n_trained] schedule entry trains, scoring only the trained steps."""
+    cfg = make_cfg(synthetic_file, tmp_path,
+                   window=WindowConfig(n_prior=2, posterior_steps=4, rollout_steps=[2, 2], valid_rollout_steps=4))
+    data = build_data(cfg, verbose=False)
+    model = build_model(cfg, data)
+    module = build_module(cfg, model, build_losses(cfg, data), data)
+    assert module.train_steps == (2, 2) and module.valid_steps == (0, 4)
+    before = [p.detach().clone() for p in model.parameters()]
+    trainer = build_trainer(cfg)
+    trainer.fit(module, data.train_dl, data.valid_dl)
+    assert torch.isfinite(trainer.callback_metrics["train_loss"])
+    assert torch.isfinite(trainer.callback_metrics["val_loss"])
+    assert any(not torch.equal(b, p) for b, p in zip(before, model.parameters())), "weights did not change"
 
 
 def test_skill_test_and_control(data_and_cfg):

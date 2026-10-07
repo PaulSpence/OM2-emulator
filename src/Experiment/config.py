@@ -46,6 +46,22 @@ def _month(value):
         raise ValueError(f"Expected a 'YYYY-MM' date, got {value!r}") from err
 
 
+def rollout_spec(steps, name="rollout_steps"):
+    """
+    A rollout length as (n_free, n_trained): n -> (0, n); [n_free, n_trained]
+    -> (n_free, n_trained). See WindowConfig.rollout_steps.
+    """
+    if isinstance(steps, (list, tuple)):
+        if len(steps) != 2:
+            raise ValueError(f"{name} = {steps}: use n or [n_free, n_trained]")
+        n_free, n_trained = steps
+    else:
+        n_free, n_trained = 0, steps
+    if not (isinstance(n_free, int) and isinstance(n_trained, int)) or n_free < 0 or n_trained < 1:
+        raise ValueError(f"{name} = {steps}: need integers n_free >= 0 and n_trained >= 1")
+    return n_free, n_trained
+
+
 def _check_range(name, date_range):
     start, end = (_month(d) for d in date_range)
     if end < start:
@@ -105,6 +121,9 @@ class TimeConfig:
     # inside it, including the prior states and targets of every sample.
     time_axis: tuple = ("1970-01", "2018-12")
     # Initial months of the training and validation samples (inclusive).
+    # Training windows must also END inside `train` (targets <= train[1]), so
+    # training never sees the validation or test months; initial months too
+    # late for a full posterior_steps window are dropped.
     train: tuple = ("1970-02", "2004-01")
     valid: tuple = ("2004-02", "2005-01")
     # Skill test: a single free-running rollout seeded from the truth at
@@ -124,13 +143,22 @@ class WindowConfig:
     # Targets available per sample (the posterior window). Rollouts can use up
     # to this many steps.
     posterior_steps: int = 12
-    # Autoregressive steps per training sample.
-    rollout_steps: int = 12
-    # Optional curriculum: {first_epoch: rollout_steps}, e.g. {0: 1, 20: 4, 50: 12}.
-    # Training cost scales linearly with rollout length. None = always rollout_steps.
+    # Autoregressive steps per training sample: n (all trained), or
+    # [n_free, n_trained] ("pushforward", Brandstetter, Worrall & Welling 2022,
+    # ICLR, "Message Passing Neural PDE Solvers"): n_free steps run WITHOUT
+    # gradients from the true initial state, then the loss is taken over the
+    # next n_trained steps. The model is trained on its own drifted states at
+    # leads n_free+1 .. n_free+n_trained (where long-rollout damping and noise
+    # show up), for the cost of n_free forward passes with no stored
+    # activations and no backward pass. n_free + n_trained <= posterior_steps.
+    rollout_steps: int | list = 12
+    # Optional curriculum: {first_epoch: rollout_steps}, each entry as above,
+    # e.g. {0: 1, 5: 4, 10: 12, 15: [24, 12]}. Training cost scales linearly
+    # with the trained steps. None = always rollout_steps.
     rollout_schedule: dict | None = None
-    # Steps used for validation. None = rollout_steps. Keep it fixed so val_loss
-    # stays comparable across epochs when a schedule is used.
+    # Steps used for validation (all scored). None = all steps of rollout_steps.
+    # Keep it fixed so val_loss stays comparable across epochs when a schedule
+    # is used.
     valid_rollout_steps: int | None = None
 
 
@@ -174,6 +202,8 @@ class LossConfig:
     # Optional relative emphasis per rollout step, applied to every term and
     # rescaled to mean 1 (so it changes the balance across lead times, not the
     # overall size), e.g. [1] * 6 + [2] * 6. Length must be posterior_steps.
+    # Per-step entries (here and in `terms`) index the SCORED steps: with a
+    # [n_free, n_trained] rollout, entry 0 is the first trained step.
     step_weights: list | None = None
     # The budgets available as "<budget>_closure" terms: {budget: ClosureConfig}.
     closures: dict = field(default_factory=_default_closures)
@@ -312,16 +342,17 @@ class ExperimentConfig:
 
         if w.n_prior < 1:
             raise ValueError("window.n_prior must be >= 1")
-        if not 1 <= w.rollout_steps <= w.posterior_steps:
-            raise ValueError("window.rollout_steps must be between 1 and posterior_steps")
+        n_free, n_trained = rollout_spec(w.rollout_steps, "window.rollout_steps")
+        if n_free + n_trained > w.posterior_steps:
+            raise ValueError("window.rollout_steps must total at most posterior_steps")
         if w.valid_rollout_steps is not None and not 1 <= w.valid_rollout_steps <= w.posterior_steps:
             raise ValueError("window.valid_rollout_steps must be between 1 and posterior_steps")
         if w.rollout_schedule is not None:
             if 0 not in w.rollout_schedule:
                 raise ValueError("window.rollout_schedule must define epoch 0")
             for epoch, steps in w.rollout_schedule.items():
-                if not 1 <= steps <= w.posterior_steps:
-                    raise ValueError(f"rollout_schedule[{epoch}] = {steps} is outside 1..posterior_steps")
+                if sum(rollout_spec(steps, f"rollout_schedule[{epoch}]")) > w.posterior_steps:
+                    raise ValueError(f"rollout_schedule[{epoch}] = {steps} totals more than posterior_steps")
 
         if "global_closure" in lo.terms:
             raise ValueError("loss.terms['global_closure'] is now 'heat_closure' (see loss.closures)")

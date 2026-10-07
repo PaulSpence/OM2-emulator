@@ -19,6 +19,7 @@ from lightning.pytorch.loggers import CSVLogger
 
 from Emulator import total_rollout_loss
 
+from .config import rollout_spec
 from .data import gather_windows
 from .losses import closure_std_fields
 
@@ -101,6 +102,8 @@ class EmulatorModule(L.LightningModule):
     host-to-device copy. A ready-made window dict (gather_windows' output) is
     accepted too. The loss is Emulator.total_rollout_loss over the configured
     loss terms, which feeds every prediction back in as the newest prior state.
+    A [n_free, n_trained] rollout first runs n_free steps without gradients
+    (push_forward) and scores only the n_trained steps after them.
     """
 
     def __init__(self, model, losses, data, cfg):
@@ -119,8 +122,9 @@ class EmulatorModule(L.LightningModule):
         self.history = []
         w, tr = cfg.window, cfg.train
         self.n_prior = w.n_prior
-        self.train_steps = w.rollout_steps  # updated by RolloutSchedule, if used
-        self.valid_steps = w.valid_rollout_steps or w.rollout_steps
+        # (n_free, n_trained); train_steps is updated by RolloutSchedule, if used.
+        self.train_steps = rollout_spec(w.rollout_steps)
+        self.valid_steps = (0, w.valid_rollout_steps or sum(self.train_steps))
         self.dt_seconds = cfg.loss.seconds_per_step
         self.lr, self.weight_decay = tr.lr, tr.weight_decay
         self.lr_scheduler, self.max_epochs = tr.lr_scheduler, tr.max_epochs
@@ -150,9 +154,34 @@ class EmulatorModule(L.LightningModule):
         """Rollout windows for initial months t0, cut on the module's device."""
         return gather_windows(self.prognostic_z, self.forcing_z, t0, self.n_prior, n_steps)
 
-    def _step(self, batch, n_steps, stage):
+    def push_forward(self, batch, n_free):
+        """
+        Run the first n_free steps of the windows WITHOUT gradients (see
+        WindowConfig.rollout_steps) and return the windows of the remaining
+        steps, starting from the model's own state: prior = the last n_prior
+        states of the free run (true states while n_free < n_prior).
+        """
+        # (B, n_prior, P, H, W) -> (B, n_prior * P, H, W), oldest state first
+        prior = batch["prior"].flatten(1, 2)
+        with torch.no_grad():
+            for k in range(n_free):
+                pred = self._run_model(prior, batch["forcing"][:, k], self.mask)
+                prior = torch.cat([prior[:, self.n_prognostic:], pred.to(prior.dtype)], dim=1)
+        return {
+            "prior": prior.unflatten(1, (self.n_prior, self.n_prognostic)),
+            "target": batch["target"][:, n_free:],
+            "forcing": batch["forcing"][:, n_free:],
+            # Forcing in the month of the new initial state, for the closure terms.
+            "initial_forcing": batch["forcing"][:, n_free - 1] if n_free else batch["initial_forcing"],
+            "target_time_index": batch["target_time_index"][:, n_free:],
+        }
+
+    def _step(self, batch, steps, stage):
+        n_free, n_steps = steps
         if not isinstance(batch, dict):
-            batch = self.windows(batch, n_steps)
+            batch = self.windows(batch, n_free + n_steps)
+        if n_free:
+            batch = self.push_forward(batch, n_free)
         loss = total_rollout_loss(
             model=self._run_model,
             # (B, n_prior, P, H, W) -> (B, n_prior * P, H, W), oldest state first
@@ -213,18 +242,24 @@ class EmulatorModule(L.LightningModule):
 
 
 class RolloutSchedule(Callback):
-    """Set the training rollout length from {first_epoch: steps} at the start of every epoch."""
+    """
+    Set the training rollout from {first_epoch: steps} at the start of every
+    epoch; steps is n or [n_free, n_trained] (WindowConfig.rollout_steps).
+    """
 
     def __init__(self, schedule):
-        self.schedule = dict(sorted(schedule.items()))
+        self.schedule = {int(e): rollout_spec(s) for e, s in sorted(schedule.items(), key=lambda x: int(x[0]))}
 
     def steps_for(self, epoch):
+        """(n_free, n_trained) for this epoch."""
         return self.schedule[max(e for e in self.schedule if e <= epoch)]
 
     def on_train_epoch_start(self, trainer, pl_module):
         steps = self.steps_for(trainer.current_epoch)
         if steps != pl_module.train_steps:
-            print(f"Epoch {trainer.current_epoch}: training rollout length -> {steps} steps")
+            n_free, n_trained = steps
+            free = f"{n_free} free-running (no gradient) + " if n_free else ""
+            print(f"Epoch {trainer.current_epoch}: training rollout -> {free}{n_trained} trained steps")
         pl_module.train_steps = steps
 
 

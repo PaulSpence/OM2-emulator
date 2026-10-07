@@ -346,6 +346,13 @@ def build_data(cfg, rebuild=False, verbose=True):
     n_time = len(fields["months"])
     w = cfg.window
     train_indices = split_indices(month_index, cfg.time.train, w.n_prior, w.posterior_steps, n_time, "train")
+    # Training windows must end inside the training period: otherwise the last
+    # samples' targets (posterior_steps months ahead) are validation or test months.
+    train_end = month_index[str(pd.Period(cfg.time.train[1], freq="M"))]
+    train_indices = train_indices[train_indices + w.posterior_steps <= train_end]
+    if len(train_indices) == 0:
+        raise ValueError(f"time.train {cfg.time.train} is too short for {w.posterior_steps}-month windows "
+                         "that end inside it")
     valid_indices = split_indices(month_index, cfg.time.valid, w.n_prior, w.posterior_steps, n_time, "valid")
 
     # Batches are initial months only; the windows are cut on the GPU (see
