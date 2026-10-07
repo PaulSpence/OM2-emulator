@@ -383,6 +383,22 @@ def test_push_forward_starts_from_the_models_own_state(data_and_cfg):
     torch.testing.assert_close(pushed["prior"], torch.stack([initial, a * initial], dim=1))
 
 
+def test_push_forward_keeps_gradients_under_autocast(data_and_cfg):
+    """
+    Autocast caches low-precision weight copies within a step; copies made in the
+    gradient-free steps must not be reused by the scored steps (the loss would
+    have no gradient). CPU autocast (bfloat16) caches the same way as CUDA fp16.
+    """
+    data, cfg = data_and_cfg
+    model = build_model(cfg, data)
+    module = build_module(cfg, model, build_losses(cfg, data), data)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        loss = module._step(data.train_indices[:2], (2, 1), "train")
+    assert loss.requires_grad
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
+
+
 def test_training_with_push_forward(synthetic_file, tmp_path):
     """A [n_free, n_trained] schedule entry trains, scoring only the trained steps."""
     cfg = make_cfg(synthetic_file, tmp_path,

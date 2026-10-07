@@ -173,6 +173,11 @@ class EmulatorModule(L.LightningModule):
             for k in range(1, n_free + 1):
                 pred = self._run_model(prior, self.forcing_z[t0 + k], self.mask)
                 prior = torch.cat([prior[:, self.n_prognostic:], pred.to(prior.dtype)], dim=1)
+        # Under mixed precision, autocast caches each weight's fp16 copy for the
+        # rest of the training step. Copies made here, without gradients, would be
+        # reused by the scored steps and cut the loss off from the weights
+        # ("element 0 of tensors does not require grad"), so drop them.
+        torch.clear_autocast_cache()
         batch = self.windows(t0 + n_free, n_steps)
         batch["prior"] = prior.unflatten(1, (self.n_prior, self.n_prognostic))
         return batch
