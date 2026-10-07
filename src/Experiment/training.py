@@ -177,7 +177,7 @@ class EmulatorModule(L.LightningModule):
         }
 
     def _step(self, batch, steps, stage):
-        n_free, n_steps = steps
+        n_free, n_steps = rollout_spec(steps)  # n or (n_free, n_trained)
         if not isinstance(batch, dict):
             batch = self.windows(batch, n_free + n_steps)
         if n_free:
