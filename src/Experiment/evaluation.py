@@ -16,6 +16,9 @@ import pandas as pd
 import torch
 import xarray as xr
 
+from Emulator import zonal_wavenumber_bands
+from Emulator.om2_loss_functions import SPECTRAL_BANDS_PER_DECADE
+
 from .losses import closure_loss, closure_std_fields
 
 
@@ -305,3 +308,81 @@ def global_rmse(pred, truth, area):
     ocean_area = area.where(pred.isel({pred.dims[0]: 0}).notnull(), 0.0)
     squared = ((pred - truth) ** 2).fillna(0.0)
     return np.sqrt((squared * ocean_area).sum(("latitude", "longitude")) / ocean_area.sum())
+
+
+def _area_mean(field, ocean_area):
+    return (field.fillna(0.0) * ocean_area).sum(("latitude", "longitude")) / ocean_area.sum()
+
+
+def skill_diagnostics(skill, variable):
+    """
+    Pattern, amplitude and error of the skill test for one variable, one value
+    per month (area-weighted over the ocean, on anomalies):
+
+      rmse_<emulator|persistence|climatology>  climatology = zero anomaly, so
+                                               its RMSE is the truth's RMS anomaly
+      acc_<emulator|persistence>   anomaly correlation (uncentred): the pattern
+                                   match whatever its amplitude
+      amplitude_<emulator|truth>   RMS anomaly: below the truth = fading
+                                   (blurring), above = noise or drift growing
+
+    Persistence keeps the seed month's anomaly. Where nothing is predictable,
+    zero anomaly beats persistence by about sqrt(2), so beating persistence
+    alone is not skill.
+    """
+    pred, truth, persist = (skill[f"{variable}_{s}_anom"] for s in ("pred", "truth", "persist"))
+    area = skill["area"].where(truth.isel(time=0).notnull(), 0.0)
+    mean = lambda x: _area_mean(x, area)
+    rms = lambda x: np.sqrt(mean(x**2))
+    acc = lambda x: mean(x * truth) / np.sqrt(mean(x**2) * mean(truth**2))
+    return xr.Dataset({
+        "rmse_emulator": rms(pred - truth),
+        "rmse_persistence": rms(persist - truth),
+        "rmse_climatology": rms(truth),
+        "acc_emulator": acc(pred),
+        "acc_persistence": acc(persist),
+        "amplitude_emulator": rms(pred),
+        "amplitude_truth": rms(truth),
+    })
+
+
+def skill_summary(skill, variables, acc_threshold=0.5):
+    """
+    One row per variable: the first lead month (1 = first prediction) at which
+    the ACC drops below acc_threshold (emulator, persistence) and the emulator's
+    RMSE exceeds persistence's / climatology's (None = never), plus the
+    emulator / truth amplitude ratio over the last 12 months.
+    """
+    def first_month(condition):
+        hits = np.flatnonzero(np.asarray(condition))
+        return int(hits[0]) + 1 if hits.size else None
+
+    rows = []
+    for variable in variables:
+        d = skill_diagnostics(skill, variable)
+        rows.append({
+            "variable": variable,
+            "acc_below_emulator": first_month(d.acc_emulator < acc_threshold),
+            "acc_below_persistence": first_month(d.acc_persistence < acc_threshold),
+            "worse_than_persistence": first_month(d.rmse_emulator > d.rmse_persistence),
+            "worse_than_climatology": first_month(d.rmse_emulator > d.rmse_climatology),
+            "amplitude_ratio_last_year": float(d.amplitude_emulator[-12:].mean() / d.amplitude_truth[-12:].mean()),
+        })
+    return pd.DataFrame(rows).set_index("variable")
+
+
+def zonal_spectrum(anomaly):
+    """
+    Time-mean zonal power spectral density of an anomaly (time, latitude,
+    longitude) against physical zonal wavenumber, on the same bands as
+    spectral_loss (Emulator.zonal_wavenumber_bands): returns (k in cycles/km,
+    PSD in units^2 km). PSD is the area-weighted mean zonal variance per unit k,
+    so it reads the same at 1 deg and 1/10 deg. Land is zero anomaly.
+    """
+    latitude = anomaly["latitude"].values
+    rows, band, power_weight, k = zonal_wavenumber_bands(latitude, anomaly.sizes["longitude"])
+    x = anomaly.fillna(0.0).values[:, rows, :]
+    power = (np.abs(np.fft.rfft(x, axis=-1)) ** 2).mean(0)[:, 1:] * power_weight
+    energy = np.bincount(band, power.ravel(), minlength=k.size) / np.cos(np.deg2rad(latitude[rows])).sum()
+    half = 0.5 / SPECTRAL_BANDS_PER_DECADE
+    return k, energy / (k * (10.0**half - 10.0**-half))

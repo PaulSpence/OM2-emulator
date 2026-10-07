@@ -795,8 +795,28 @@ def test_rollout_steps_in_memory_must_be_non_negative(synthetic_file, tmp_path):
         make_cfg(synthetic_file, tmp_path, train=TrainConfig(rollout_steps_in_memory=-1))
 
 
-def test_checkpointed_spectral_loss_matches_direct_computation():
-    """The spectral loss under checkpointing has the original value and gradient."""
+SPECTRUM_LAT = np.linspace(-70, 80, H)  # the synthetic grid's latitudes
+
+
+def _reference_band_energy(field, mask):
+    """Band energies by explicit loops over rows and harmonics (no index_add)."""
+    from Emulator import zonal_wavenumber_bands
+
+    rows, band, _, k = zonal_wavenumber_bands(SPECTRUM_LAT, field.shape[-1])
+    n_lon, n_harmonics = field.shape[-1], field.shape[-1] // 2
+    spectrum = torch.fft.rfft(field * mask, dim=-1)
+    energy = [field.new_zeros(field.shape[:-2]) for _ in range(k.size)]
+    for i, row in enumerate(rows):
+        cos_lat = np.cos(np.deg2rad(SPECTRUM_LAT[row]))
+        for n in range(1, n_harmonics + 1):
+            pair = 2.0 if n < n_lon / 2 else 1.0  # +n and -n; Nyquist is alone
+            power = spectrum[..., row, n].abs() ** 2 * (cos_lat * pair / n_lon**2)
+            energy[band[i * n_harmonics + n - 1]] = energy[band[i * n_harmonics + n - 1]] + power
+    return torch.stack(energy, dim=-1)
+
+
+def test_spectral_loss_is_log_band_energy_mse_with_checkpointing():
+    """Value and gradient (through the checkpointed path) match an explicit loop implementation."""
     from Emulator import spectral_loss
 
     g = torch.Generator().manual_seed(3)
@@ -805,18 +825,106 @@ def test_checkpointed_spectral_loss_matches_direct_computation():
     target = torch.randn(2, 3, H, W, generator=g)
 
     def reference(pred_t):
-        valid = mask.expand_as(pred_t)
-        count = valid.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0)
-        anomaly = lambda x: (x - (x * valid).sum(dim=(-2, -1), keepdim=True) / count) * valid
-        amp = lambda x: torch.fft.rfft2(anomaly(x), norm="ortho").abs()
-        return torch.nn.functional.mse_loss(torch.log1p(amp(pred_t) + 1e-6), torch.log1p(amp(target) + 1e-6))
+        p, t = _reference_band_energy(pred_t, mask), _reference_band_energy(target, mask)
+        floor = 1e-8 * t.sum(-1, keepdim=True) + 1e-20
+        return ((torch.log10(p + floor) - torch.log10(t + floor)) ** 2).mean()
 
     expected = reference(pred)
     (expected_grad,) = torch.autograd.grad(expected, pred)
-    loss = spectral_loss(weight=1.0)(pred_t=pred, target_t=target, mask=mask, rollout_step=0)
+    loss = spectral_loss(weight=1.0, latitude=SPECTRUM_LAT)(pred_t=pred, target_t=target, mask=mask, rollout_step=0)
     (grad,) = torch.autograd.grad(loss, pred)
     torch.testing.assert_close(loss, expected)
     torch.testing.assert_close(grad, expected_grad)
+
+
+def test_spectral_loss_ignores_phase_and_penalises_lost_energy():
+    """Shifting a field in longitude costs nothing; halving its amplitude costs (log10 1/4)^2 in every band."""
+    from Emulator import spectral_loss
+
+    loss_fn = spectral_loss(weight=1.0, latitude=SPECTRUM_LAT)
+    mask = torch.ones(H, W)
+    target = torch.randn(2, 1, H, W, generator=torch.Generator().manual_seed(4))
+    shifted = torch.roll(target, shifts=7, dims=-1)  # longitude is periodic
+    assert loss_fn(pred_t=shifted, target_t=target, mask=mask, rollout_step=0) < 1e-10
+    torch.testing.assert_close(
+        loss_fn(pred_t=0.5 * target, target_t=target, mask=mask, rollout_step=0),
+        torch.tensor(np.log10(0.25) ** 2, dtype=torch.float32),
+    )
+
+
+def test_spectral_loss_runs_in_half_precision_on_any_grid_size():
+    """Half-precision inputs on a non-power-of-two grid (cuFFT half needs powers of two): computed in float32."""
+    from Emulator import spectral_loss
+
+    pred = torch.randn(1, 2, H, W).half()
+    loss = spectral_loss(weight=1.0, latitude=SPECTRUM_LAT)(pred_t=pred, target_t=pred.float() * 2, mask=torch.ones(H, W),
+                                                             rollout_step=0)
+    assert loss.dtype == torch.float32 and torch.isfinite(loss)
+
+
+def test_wavenumber_bands_are_physical_across_resolutions():
+    """Rows south of the tripole only, and the same bands (same k) at 1 deg and 1/4 deg."""
+    from Emulator import zonal_wavenumber_bands
+
+    coarse_lat, fine_lat = np.arange(-77.5, 90, 1.0), np.arange(-77.875, 90, 0.25)
+    rows, band, weight, k_coarse = zonal_wavenumber_bands(coarse_lat, 360)
+    assert coarse_lat[rows].min() >= -65 and coarse_lat[rows].max() <= 60
+    assert band.size == rows.size * 180 and band.max() == k_coarse.size - 1
+    _, _, _, k_fine = zonal_wavenumber_bands(fine_lat, 1440)
+    # Both grids have a row at 0.125 deg of the equator, so the band edges coincide;
+    # the 1/4 deg grid adds bands at higher k.
+    torch.testing.assert_close(torch.tensor(k_fine[: k_coarse.size]), torch.tensor(k_coarse), rtol=1e-3, atol=0)
+    assert k_fine.size > k_coarse.size
+
+
+def test_training_with_spectral_loss(data_and_cfg):
+    data, cfg = data_and_cfg
+    cfg.loss.terms = {"local_mse": 1.0, "spectral": 0.5, "heat_closure": 0.1}
+    try:
+        model = build_model(cfg, data)
+        module = build_module(cfg, model, build_losses(cfg, data), data)
+        trainer = build_trainer(cfg)
+        trainer.fit(module, data.train_dl, data.valid_dl)
+    finally:
+        cfg.loss.terms = {"local_mse": 1.0, "spectral": 0.0, "heat_closure": 0.1}
+    assert torch.isfinite(trainer.callback_metrics["val_loss"])
+    assert torch.isfinite(trainer.callback_metrics["train_spectral"])
+
+
+def test_skill_diagnostics_and_spectra(synthetic_file, tmp_path):
+    from Experiment import plot_skill_diagnostics, plot_spectra, skill_diagnostics, skill_summary, zonal_spectrum
+
+    cfg = two_prognostic_cfg(synthetic_file, tmp_path)
+    data = build_data(cfg, verbose=False)
+    skill = run_skill_test(cfg, build_model(cfg, data), data)
+    name = "ocean_heat_content_2d"
+
+    d = skill_diagnostics(skill, name)
+    xr.testing.assert_allclose(d.rmse_climatology, d.amplitude_truth)  # zero anomaly: error = truth's RMS
+    assert (np.abs(d.acc_emulator) <= 1 + 1e-6).all() and (np.abs(d.acc_persistence) <= 1 + 1e-6).all()
+    truth_self = skill.assign({f"{name}_pred_anom": skill[f"{name}_truth_anom"]})
+    np.testing.assert_allclose(skill_diagnostics(truth_self, name).acc_emulator, 1.0, rtol=1e-5)
+
+    summary = skill_summary(skill, TWO_PROGNOSTIC)
+    assert list(summary.index) == TWO_PROGNOSTIC
+    assert np.isfinite(summary["amplitude_ratio_last_year"]).all()
+
+    # Parseval: PSD integrated over the bands = area-weighted mean zonal variance (zonal mean removed).
+    anomaly = skill[f"{name}_truth_anom"].fillna(0.0)
+    k, psd = zonal_spectrum(anomaly)
+    half = 0.5 / 8
+    band_rows = (anomaly.latitude >= -65) & (anomaly.latitude <= 60)
+    a = anomaly.where(band_rows, drop=True)
+    zonal_var = ((a - a.mean("longitude")) ** 2).mean("longitude").mean("time")
+    cos_lat = np.cos(np.deg2rad(a.latitude))
+    expected = float((zonal_var * cos_lat).sum() / cos_lat.sum())
+    np.testing.assert_allclose((psd * k * (10**half - 10**-half)).sum(), expected, rtol=1e-4)
+
+    for fig in (plot_skill_diagnostics(skill, TWO_PROGNOSTIC), plot_spectra(skill, TWO_PROGNOSTIC)):
+        plotted = [ax for ax in fig.axes if ax.lines]
+        assert len(plotted) == 3 * len(TWO_PROGNOSTIC)
+        assert all(np.isfinite(line.get_ydata()).all() for ax in plotted for line in ax.lines)
+        plt.close(fig)
 
 
 # =============================================================================

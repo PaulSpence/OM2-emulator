@@ -161,7 +161,9 @@ class LossConfig:
     # Loss terms and their weights, summed at every rollout step and averaged
     # over the steps. A weight of 0 removes the term entirely.
     #   local_mse      -- ocean-masked MSE in z-score space (primary fit)
-    #   spectral       -- MSE of log spatial amplitude spectra (penalises over-smoothing)
+    #   spectral       -- squared log10 difference in energy per band of physical zonal
+    #                     wavenumber: penalises lost large-scale energy (blurring) and
+    #                     excess small-scale energy (noise growth), phase-free
     #   <budget>_closure -- global budget closure on physical anomalies, one
     #                     per entry in `closures` (heat_closure, freshwater_closure);
     #                     see issue #43: the true data score ~0.5 on heat_closure

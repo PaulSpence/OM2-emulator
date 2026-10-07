@@ -17,6 +17,7 @@ from .om2_loss_functions import (
     spectral_loss,
     step_weight,
     total_rollout_loss,
+    zonal_wavenumber_bands,
 )
 
 __all__ = [
@@ -36,4 +37,5 @@ __all__ = [
     "SpatialResidualHead",
     "total_rollout_loss",
     "UNet",
+    "zonal_wavenumber_bands",
 ]

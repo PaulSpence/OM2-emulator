@@ -35,6 +35,9 @@ from .evaluation import (
     persistence_rmse,
     run_control,
     run_skill_test,
+    skill_diagnostics,
+    skill_summary,
+    zonal_spectrum,
 )
 from .losses import build_losses
 from .models import ForwardEmulator, build_model, count_parameters
@@ -45,8 +48,10 @@ from .plots import (
     plot_global_rmse_all_variables,
     plot_global_timeseries,
     plot_rmse_by_epoch,
+    plot_skill_diagnostics,
     plot_skill_evaluation,
     plot_snapshots,
+    plot_spectra,
     plot_training_history,
     prognostic_variables,
 )
@@ -75,6 +80,9 @@ __all__ = [
     "persistence_rmse",
     "run_control",
     "run_skill_test",
+    "skill_diagnostics",
+    "skill_summary",
+    "zonal_spectrum",
     "build_losses",
     "ForwardEmulator",
     "build_model",
@@ -85,8 +93,10 @@ __all__ = [
     "plot_global_rmse_all_variables",
     "plot_global_timeseries",
     "plot_rmse_by_epoch",
+    "plot_skill_diagnostics",
     "plot_skill_evaluation",
     "plot_snapshots",
+    "plot_spectra",
     "plot_training_history",
     "prognostic_variables",
     "EmulatorModule",

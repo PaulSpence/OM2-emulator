@@ -6,8 +6,8 @@ context signature. A training notebook can assemble any list of losses and pass
 that list to ``total_rollout_loss`` without changing the rollout loop.
 """
 
+import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 
@@ -105,29 +105,109 @@ def local_mse_loss(weight=1.0):
     return loss_fn
 
 
-def spectral_loss(weight=1.0, eps=1.0e-6):
+EARTH_RADIUS_KM = 6371.0
+# Rows used for zonal spectra. North of ~65N the ACCESS-OM2 tripole grid's
+# nominal longitude is not a true longitude, so a row there is not a circle of
+# latitude and its FFT has no clean physical wavenumber.
+SPECTRUM_LATITUDES = (-65.0, 60.0)
+SPECTRAL_BANDS_PER_DECADE = 8
+
+
+def zonal_wavenumber_bands(latitude, n_lon, latitudes=SPECTRUM_LATITUDES,
+                           bands_per_decade=SPECTRAL_BANDS_PER_DECADE):
     """
-    Return a weighted masked log-amplitude spectral loss callable.
+    Assign every (latitude row, zonal harmonic) to a band of PHYSICAL zonal
+    wavenumber k (cycles/km), so a band means the same scale at 1 deg and
+    1/10 deg.
 
-    The spectrum is computed under gradient checkpointing: otherwise it keeps
-    several full-size tensors (masked field, anomaly, complex FFT, amplitude)
-    per rollout step for the backward pass, and they are cheap to recompute.
-    The value and gradients are unchanged.
+    A row at latitude phi is a circle of length L = 2*pi*R*cos(phi), so zonal
+    harmonic n (n = 1 .. n_lon // 2; the zonal mean n = 0 is excluded) has
+    k = n / L. Bands are log-spaced from the smallest to the largest k present;
+    bands no (row, harmonic) falls in are dropped.
+
+    Returns (rows, band, power_weight, k_band):
+      rows          latitude row indices used;
+      band          the band of each (row, harmonic), flattened row-major;
+      power_weight  (rows, harmonics): multiplies |rfft|^2 to give each
+                    (row, harmonic)'s share of the zonal variance, weighted by
+                    cos(latitude) (the row's share of the area). Harmonics
+                    below Nyquist count twice: rfft keeps one of each +/-n pair;
+      k_band        each band's central wavenumber (cycles/km); band edges are
+                    a factor 10**(1/bands_per_decade) apart.
     """
+    latitude = np.asarray(latitude, dtype=float)
+    rows = np.flatnonzero((latitude >= latitudes[0]) & (latitude <= latitudes[1]))
+    if rows.size == 0:
+        raise ValueError(f"No latitude rows within {latitudes} for the zonal spectrum")
+    cos_lat = np.cos(np.deg2rad(latitude[rows]))
+    harmonics = np.arange(1, n_lon // 2 + 1)
+    log_k = np.log10(harmonics[None, :] / (2 * np.pi * EARTH_RADIUS_KM * cos_lat[:, None]))
+    band = np.floor((log_k - log_k.min()) * bands_per_decade).astype(int)
+    used, band = np.unique(band.ravel(), return_inverse=True)
+    k_band = 10.0 ** (log_k.min() + (used + 0.5) / bands_per_decade)
+    one_sided = np.where(harmonics < n_lon / 2, 2.0, 1.0)
+    power_weight = cos_lat[:, None] * one_sided[None, :] / n_lon**2
+    return rows, band, power_weight, k_band
 
-    def log_amplitude_mse(pred_t, target_t, valid_mask):
-        ocean_count = valid_mask.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0)
 
-        pred_mean = (pred_t * valid_mask).sum(dim=(-2, -1), keepdim=True) / ocean_count
-        target_mean = (target_t * valid_mask).sum(dim=(-2, -1), keepdim=True) / ocean_count
+def spectral_loss(weight=1.0, *, latitude):
+    """
+    Return a weighted spectral loss: the mean squared difference in log10
+    ENERGY per physical zonal-wavenumber band, per sample and variable.
 
-        pred_anom = squeeze_field_axes((pred_t - pred_mean) * valid_mask)
-        target_anom = squeeze_field_axes((target_t - target_mean) * valid_mask)
+    For every latitude row in SPECTRUM_LATITUDES the ocean-masked field
+    (land = 0) is Fourier transformed along longitude, which is periodic. The
+    power of each harmonic is summed into log-spaced bands of physical zonal
+    wavenumber (zonal_wavenumber_bands), weighting rows by cos(latitude) so the
+    band energies add up to the area-weighted zonal variance. The loss compares
+    log energies band by band.
 
-        pred_amp = torch.fft.rfft2(pred_anom, norm="ortho").abs()
-        target_amp = torch.fft.rfft2(target_anom, norm="ortho").abs()
+    Why this form. The skill-test spectra showed two failures over long
+    rollouts: large scales losing energy (the MSE fit damps anomalies, i.e.
+    blurring) and small scales gaining it (grid-scale noise growing). A loss on
+    band energies penalises both, in either direction. It does not ask for the
+    right phase, so an unpredictable eddy in the wrong place is not penalised
+    as if it were a wrong large-scale pattern, and it does not suppress small
+    scales that are really there -- the point at 1/10 deg. Logs make every band
+    count, not just the energetic large scales. (The previous version compared
+    the amplitude of every individual 2-D Fourier mode: noisy, and its FFT ran
+    across the non-periodic north/south edges.)
 
-        return F.mse_loss(torch.log1p(pred_amp + eps), torch.log1p(target_amp + eps))
+    ``latitude``: the grid's 1-D nominal latitude (degrees), which sets each
+    row's length and so its physical wavenumbers.
+
+    The spectrum is computed in float32 (half-precision FFTs need power-of-two
+    sizes) under gradient checkpointing, which recomputes it in the backward
+    pass instead of storing the FFTs; the value and gradients are unchanged.
+    """
+    geometry = {}
+
+    def bands_for(field):
+        key = (field.shape[-1], field.device)
+        if key not in geometry:
+            rows, band, power_weight, k_band = zonal_wavenumber_bands(latitude, field.shape[-1])
+            geometry[key] = (
+                torch.as_tensor(rows, device=field.device),
+                torch.as_tensor(band, device=field.device),
+                torch.as_tensor(power_weight, device=field.device, dtype=torch.float32),
+                k_band.size,
+            )
+        return geometry[key]
+
+    def band_energy(field, valid_mask):
+        rows, band, power_weight, n_bands = bands_for(field)
+        x = (field.float() * valid_mask.float())[..., rows, :]                  # (B, P, R, W)
+        power = torch.fft.rfft(x, dim=-1).abs().square()[..., 1:] * power_weight  # drop the zonal mean
+        energy = power.new_zeros(*power.shape[:-2], n_bands)
+        return energy.index_add(-1, band, power.flatten(-2))               # (B, P, n_bands)
+
+    def log_band_energy_mse(pred_t, target_t, valid_mask):
+        pred_energy = band_energy(pred_t, valid_mask)
+        target_energy = band_energy(target_t, valid_mask)
+        # Floor relative to each sample's total energy, so a band with no ocean
+        # (or a zero field) never gives log(0).
+        floor = 1.0e-8 * target_energy.sum(-1, keepdim=True) + 1.0e-20
+        return (torch.log10(pred_energy + floor) - torch.log10(target_energy + floor)).square().mean()
 
     def loss_fn(*, pred_t, target_t, mask, rollout_step=None, **_):
         current_weight = step_weight(weight, rollout_step, pred_t)
@@ -136,9 +216,9 @@ def spectral_loss(weight=1.0, eps=1.0e-6):
 
         valid_mask = expand_ocean_mask(mask, pred_t)
         if torch.is_grad_enabled() and pred_t.requires_grad:
-            loss = checkpoint(log_amplitude_mse, pred_t, target_t, valid_mask, use_reentrant=False)
+            loss = checkpoint(log_band_energy_mse, pred_t, target_t, valid_mask, use_reentrant=False)
         else:
-            loss = log_amplitude_mse(pred_t, target_t, valid_mask)
+            loss = log_band_energy_mse(pred_t, target_t, valid_mask)
         return current_weight * loss
 
     return loss_fn

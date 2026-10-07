@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from .evaluation import global_integral, global_rmse
+from .evaluation import global_integral, global_rmse, skill_diagnostics, zonal_spectrum
 
 
 def _default_variable(ds):
@@ -141,6 +141,76 @@ def plot_global_rmse_all_variables(skill, variables=None):
         ax.set_title(f"Global area-weighted RMSE of {variable}")
         ax.set_ylabel(f"RMSE ({skill[f'{variable}_pred'].attrs.get('units', '')})")
         ax.grid(alpha=0.3)
+    return fig
+
+
+_DIAGNOSTIC_STYLE = {
+    "emulator": dict(color="firebrick", lw=2, label="Emulator"),
+    "truth": dict(color="tab:orange", lw=2, label="Truth"),
+    "persistence": dict(color="0.4", lw=1.5, ls="--", label="Persistence"),
+    "climatology": dict(color="tab:blue", lw=1.5, ls=":", label="Climatology (zero anomaly)"),
+}
+
+
+def plot_skill_diagnostics(skill, variables=None):
+    """
+    One row per variable (default: every prognostic variable): RMSE against
+    persistence and climatology, anomaly correlation, and anomaly amplitude
+    through the skill test (evaluation.skill_diagnostics).
+    """
+    variables = [variables] if isinstance(variables, str) else variables or prognostic_variables(skill)
+    fig, axes = plt.subplots(len(variables), 3, figsize=(18, 3.4 * len(variables)), sharex=True,
+                             squeeze=False, constrained_layout=True)
+    time = skill.time.values
+    for row, variable in zip(axes, variables):
+        d = skill_diagnostics(skill, variable)
+        units = skill[f"{variable}_truth_anom"].attrs.get("units", "")
+        panels = (
+            ("rmse", "RMSE", f"RMSE ({units})", ("emulator", "persistence", "climatology")),
+            ("acc", "Anomaly correlation", "ACC", ("emulator", "persistence")),
+            ("amplitude", "Anomaly amplitude (area-weighted RMS)", f"RMS anomaly ({units})", ("emulator", "truth")),
+        )
+        for ax, (metric, title, ylabel, series) in zip(row, panels):
+            for name in series:
+                ax.plot(time, d[f"{metric}_{name}"].values, **_DIAGNOSTIC_STYLE[name])
+            ax.set_title(f"{variable}: {title}")
+            ax.set_ylabel(ylabel)
+            ax.grid(alpha=0.3)
+            ax.legend(frameon=False, fontsize=8)
+        row[1].axhline(0.5, color="0.6", lw=0.8)
+        row[1].axhline(0.0, color="0.6", lw=0.8)
+    return fig
+
+
+def plot_spectra(skill, variables=None):
+    """
+    Zonal power spectra of the truth (solid) and emulator (dashed) anomalies,
+    one row per variable, over the first, middle and last year of the skill
+    test (evaluation.zonal_spectrum). Emulator above the truth at short
+    wavelengths = small-scale noise growing; below at long wavelengths =
+    large-scale anomalies fading.
+    """
+    variables = [variables] if isinstance(variables, str) else variables or prognostic_variables(skill)
+    n = skill.sizes["time"]
+    periods = {"first year": slice(0, 12), "middle year": slice(max(n // 2 - 6, 0), n // 2 + 6),
+               "last year": slice(max(n - 12, 0), n)}
+    fig, axes = plt.subplots(len(variables), len(periods), figsize=(16, 3.6 * len(variables)),
+                             squeeze=False, constrained_layout=True)
+    inverse = lambda x: 1.0 / np.maximum(x, 1e-12)
+    for row, variable in zip(axes, variables):
+        units = skill[f"{variable}_truth_anom"].attrs.get("units", "")
+        for ax, (label, period) in zip(row, periods.items()):
+            for name, ls in (("truth", "-"), ("pred", "--")):
+                k, psd = zonal_spectrum(skill[f"{variable}_{name}_anom"].isel(time=period))
+                style = _DIAGNOSTIC_STYLE["truth" if name == "truth" else "emulator"]
+                ax.loglog(k, psd, ls=ls, lw=2, color=style["color"], label=style["label"])
+            dates = skill.time.isel(time=period).dt.strftime("%Y-%m").values
+            ax.set_title(f"{variable}: {label} ({dates[0]}..{dates[-1]})", fontsize=10)
+            ax.set_xlabel("zonal wavenumber (cycles/km)")
+            ax.set_ylabel(f"PSD ({units}$^2$ km)")
+            ax.grid(alpha=0.3, which="both")
+            ax.secondary_xaxis("top", functions=(inverse, inverse)).set_xlabel("wavelength (km)")
+            ax.legend(frameon=False, fontsize=8)
     return fig
 
 
