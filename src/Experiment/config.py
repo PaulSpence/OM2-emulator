@@ -79,6 +79,16 @@ class DataConfig:
     forcing: list = field(
         default_factory=lambda: ["total_surface_heat_flx", "tau_x", "tau_y"]
     )
+    # Land boundary condition per variable, applied to the model's input
+    # channels (see "Land boundary conditions" in src/Emulator/om2_model_utils.py
+    # for why). Variables not listed are Neumann: land takes the nearest ocean
+    # value (no flux across the coast), right for tracers such as heat and
+    # freshwater content and neutral for the rest. Set velocity components to
+    # "dirichlet" (land held at z = 0, i.e. no normal flow), e.g.
+    #   {"u": "dirichlet", "v": "dirichlet"}
+    # or give a value in z-score units: {"u": ["dirichlet", 0.0]}.
+    # Hidden layers always use the Neumann fill.
+    boundary_conditions: dict = field(default_factory=dict)
     # Land mask: cells where this variable is NaN at the first time are land.
     mask_variable: str = "total_surface_heat_flx"
     area_variable: str = "area_t"
@@ -274,6 +284,10 @@ class ExperimentConfig:
                 f"Unknown normalisation strategy {d.normalisation.strategy!r}; "
                 f"use one of {KNOWN_NORMALISATION_STRATEGIES}"
             )
+        for name, condition in d.boundary_conditions.items():
+            if name not in (*d.prognostic, *d.forcing):
+                raise ValueError(f"data.boundary_conditions: {name!r} is not a prognostic or forcing variable")
+            _dirichlet_value(name, condition)  # raises on an invalid condition
         if d.mask_variable not in (*d.prognostic, *d.forcing):
             raise ValueError(f"mask_variable {d.mask_variable!r} must be a prognostic or forcing variable")
 
@@ -390,6 +404,20 @@ class ExperimentConfig:
     def data_hash(self, file_stamp=""):
         payload = json.dumps(self.data_contract(), sort_keys=True, default=str) + file_stamp
         return hashlib.sha1(payload.encode()).hexdigest()[:12]
+
+
+def _dirichlet_value(name, condition):
+    """The Dirichlet value (z-score units) for a boundary condition, or None for Neumann."""
+    if condition == "neumann":
+        return None
+    if condition == "dirichlet":
+        return 0.0
+    if isinstance(condition, (list, tuple)) and len(condition) == 2 and condition[0] == "dirichlet":
+        return float(condition[1])
+    raise ValueError(
+        f"data.boundary_conditions[{name!r}] = {condition!r}: use 'neumann', 'dirichlet' "
+        "or ['dirichlet', value]"
+    )
 
 
 def _is_active(weight):

@@ -15,15 +15,19 @@ import torch.nn as nn
 
 from Emulator import LatentResidualTuner, SpatialResidualHead, UNet
 
-# Backbones by name: (in_channels, out_channels, latent_processor, model config) -> nn.Module
-# mapping (B, in, H, W) and a (B, 1, H, W) mask to (B, out, H, W).
+from .config import _dirichlet_value
+
+# Backbones by name: (in_channels, out_channels, latent_processor, model config,
+# Dirichlet input channels) -> nn.Module mapping (B, in, H, W) and a (B, 1, H, W)
+# mask to (B, out, H, W).
 ARCHITECTURES = {
-    "unet": lambda in_ch, out_ch, latent_processor, m: UNet(
+    "unet": lambda in_ch, out_ch, latent_processor, m, dirichlet: UNet(
         input_channel_count=in_ch,
         output_channel_count=out_ch,
         latent_processor=latent_processor,
         padding_mode=m.padding_mode,
         width_multiplier=m.width_multiplier,
+        dirichlet=dirichlet,
     ),
 }
 
@@ -79,6 +83,29 @@ class ForwardEmulator(nn.Module):
         return pred.float()
 
 
+def dirichlet_channels(cfg):
+    """
+    {input channel: z-score value} for the variables with a Dirichlet land
+    condition in cfg.data.boundary_conditions. Input channels are the prior
+    states (n_prior time levels x prognostic variables, oldest first) followed
+    by the forcing variables.
+    """
+    d = cfg.data
+    n_prior, n_prognostic = cfg.window.n_prior, len(d.prognostic)
+    channels = {}
+    for name, condition in d.boundary_conditions.items():
+        value = _dirichlet_value(name, condition)
+        if value is None:
+            continue
+        if name in d.prognostic:
+            p = d.prognostic.index(name)
+            for level in range(n_prior):
+                channels[level * n_prognostic + p] = value
+        else:
+            channels[n_prior * n_prognostic + d.forcing.index(name)] = value
+    return channels
+
+
 def build_model(cfg, data):
     """Build the ForwardEmulator described by cfg.model for the variables in data."""
     # Seed everything first so the initial weights (and later the shuffling of
@@ -90,6 +117,7 @@ def build_model(cfg, data):
     m, w = cfg.model, cfg.window
     n_prognostic, n_forcing = data.n_prognostic, data.n_forcing
     in_channels = w.n_prior * n_prognostic + n_forcing
+    dirichlet = dirichlet_channels(cfg)
 
     latent_processor = None
     if m.latent_processor == "latent_residual":
@@ -111,7 +139,7 @@ def build_model(cfg, data):
             padding_mode=m.padding_mode,
         )
 
-    backbone = ARCHITECTURES[m.arch](in_channels, n_prognostic, latent_processor, m)
+    backbone = ARCHITECTURES[m.arch](in_channels, n_prognostic, latent_processor, m, dirichlet)
     model = ForwardEmulator(backbone, w.n_prior, n_prognostic, n_forcing, output_processor, m.channels_last)
     if m.channels_last:
         model = model.to(memory_format=torch.channels_last)

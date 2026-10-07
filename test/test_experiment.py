@@ -585,39 +585,86 @@ def test_zero_backbone_output_persists_last_state(data_and_cfg):
 # checkpointing, channels_last, compile
 # =============================================================================
 
-def _reference_partial_conv(layer, x, mask):
-    """The original PartialConv2d forward (mask, convolve, where(renormalise, 0)), with its padding."""
-    x, mask = layer._pad(x), layer._pad(mask)
-    out = layer.conv(x * mask)
-    mask_sum = layer.mask_conv(mask)
-    out = torch.where(mask_sum > 0, out * (layer.kernel_area / (mask_sum + layer.eps)), torch.zeros_like(out))
-    return out, (mask_sum > 0).float()
-
-
 @pytest.mark.parametrize("kernel_size,stride,padding", [(3, 1, 1), (4, 2, 1), (7, 1, 3)])
-def test_partial_conv_matches_original(kernel_size, stride, padding):
+def test_mask_aware_conv_fills_land_then_convolves(kernel_size, stride, padding):
+    """No renormalisation: the output is an ordinary convolution of the land-filled, padded input."""
     from Emulator import PartialConv2d
+    from Emulator.om2_model_utils import fill_land
 
     torch.manual_seed(0)
     layer = PartialConv2d(5, 6, kernel_size, stride, padding, padding_mode="zeros")
     x = torch.randn(3, 5, H, W)
     mask = (torch.rand(1, 1, H, W) > 0.3).float()
-    expected, expected_mask = _reference_partial_conv(layer, x, mask.expand(3, 1, H, W))
-    for m in (mask, mask.expand(3, 1, H, W)):  # shared (1, 1, H, W) or per-sample mask
+    expected = layer.conv(layer._pad(fill_land(x, mask)))
+    for m in (mask, mask.expand(3, 1, H, W)):  # shared (1, 1, H, W) or per-sample copies of one mask
         out, new_mask = layer(x, m)
         torch.testing.assert_close(out, expected)
-        torch.testing.assert_close(new_mask.expand_as(expected_mask), expected_mask)
+    if stride == 1:
+        assert new_mask is m  # land is refilled at every layer, not dilated
+    else:
+        # A coarse cell is ocean if any fine cell in it is ocean.
+        torch.testing.assert_close(new_mask[:1], torch.nn.functional.adaptive_max_pool2d(mask, out.shape[-2:]))
 
 
-def test_conv_stack_grows_the_mask_like_a_7x7():
-    from Emulator import PartialConv2d, PartialConvStack
+def test_output_ignores_input_values_on_land():
+    """Land inputs are overwritten (Neumann or Dirichlet) before every layer, so they cannot affect the output."""
+    from Emulator import UNet
 
-    mask = (torch.rand(1, 1, H, W, generator=torch.Generator().manual_seed(1)) > 0.85).float()
-    _, mask7 = PartialConv2d(2, 2, kernel_size=7, padding=3, padding_mode="zeros")(torch.randn(1, 2, H, W), mask)
-    stack = PartialConvStack(2, 3, hidden_channels=4, padding_mode="zeros")
-    out, mask_stack = stack(torch.randn(2, 2, H, W), mask)
-    assert out.shape == (2, 3, H, W)
-    torch.testing.assert_close(mask_stack, mask7)
+    torch.manual_seed(0)
+    unet = UNet(input_channel_count=3, output_channel_count=2, padding_mode="zeros", dirichlet={1: 0.5}).eval()
+    mask = (torch.rand(1, 1, H, W) > 0.3).float()
+    x = torch.randn(2, 3, H, W)
+    noise_on_land = torch.randn_like(x) * 100 * (1 - mask)
+    with torch.no_grad():
+        torch.testing.assert_close(unet(x + noise_on_land, mask), unet(x, mask))
+
+
+def test_nearest_ocean_index_wraps_in_longitude():
+    from Emulator.om2_model_utils import nearest_ocean_index
+
+    mask = torch.zeros(4, 10)
+    mask[2, 9] = 1.0  # one ocean cell, in the last column
+    mask[0, 5] = 1.0
+    index = nearest_ocean_index(mask).reshape(4, 10)
+    assert index[2, 9] == 2 * 10 + 9 and index[0, 5] == 5        # ocean cells map to themselves
+    assert index[2, 0] == 2 * 10 + 9                             # nearest across the seam, one cell away
+    assert index[0, 4] == 5                                      # nearest within the row
+
+
+def test_fill_land_neumann_and_dirichlet():
+    from Emulator.om2_model_utils import fill_land
+
+    mask = torch.tensor([[1.0, 0.0, 0.0, 1.0, 1.0]])  # (1, 5): land at columns 1-2
+    x = torch.tensor([[[[1.0, -7.0, -7.0, 4.0, 5.0]], [[2.0, -7.0, -7.0, 6.0, 8.0]]]])  # (1, 2, 1, 5)
+    out = fill_land(x, mask, dirichlet={1: 0.25})
+    torch.testing.assert_close(out[0, 0, 0], torch.tensor([1.0, 1.0, 4.0, 4.0, 5.0]))    # Neumann: nearest ocean value
+    torch.testing.assert_close(out[0, 1, 0], torch.tensor([2.0, 0.25, 0.25, 6.0, 8.0]))  # Dirichlet: fixed on land
+    torch.testing.assert_close(out[..., [0, 3, 4]], x[..., [0, 3, 4]])                  # ocean untouched
+
+
+def test_boundary_conditions_map_to_input_channels(synthetic_file, tmp_path):
+    """Dirichlet variables mark every input channel that carries them: each prior level, or the forcing slot."""
+    from Experiment.models import dirichlet_channels
+
+    cfg = two_prognostic_cfg(synthetic_file, tmp_path)  # prognostic [OHC, tau_x], forcing [heat flux, tau_y], n_prior 2
+    cfg.data.boundary_conditions = {"tau_x": "dirichlet", "tau_y": ["dirichlet", 0.5], "ocean_heat_content_2d": "neumann"}
+    cfg.validate()
+    expected = {1: 0.0, 3: 0.0, 5: 0.5}  # tau_x at prior levels 0 and 1; tau_y is forcing channel 1 after 4 prior channels
+    assert dirichlet_channels(cfg) == expected
+    data = build_data(cfg, verbose=False)
+    assert build_model(cfg, data).backbone.enc1.dirichlet == expected
+    assert build_model(cfg, data).backbone.dec2.dirichlet == {}  # hidden layers are always Neumann
+
+
+@pytest.mark.parametrize("conditions,message", [
+    ({"not_a_variable": "dirichlet"}, "not a prognostic or forcing variable"),
+    ({"tau_x": "robin"}, "use 'neumann', 'dirichlet'"),
+])
+def test_invalid_boundary_conditions_are_rejected(synthetic_file, tmp_path, conditions, message):
+    cfg = make_cfg(synthetic_file, tmp_path)
+    cfg.data.boundary_conditions = conditions
+    with pytest.raises(ValueError, match=message):
+        cfg.validate()
 
 
 def test_unet_has_no_large_kernels(data_and_cfg):
@@ -835,12 +882,13 @@ def test_partial_conv_respects_the_grid_symmetry(kernel_size, stride, padding):
     torch.manual_seed(0)
     layer = PartialConv2d(3, 4, kernel_size, stride, padding, padding_mode="zeros")
     x = torch.randn(2, 3, H, W)
-    mask = (torch.rand(1, 1, H, W) > 0.3).float()
+    # All ocean: this tests the grid topology; ties in the nearest-ocean land
+    # fill are broken by scan order, which a roll changes.
+    mask = torch.ones(1, 1, H, W)
     shift = W // 2
     out, new_mask = layer(x, mask)
     out_rolled, mask_rolled = layer(torch.roll(x, shift, dims=-1), torch.roll(mask, shift, dims=-1))
     torch.testing.assert_close(out_rolled, torch.roll(out, shift // stride, dims=-1))
-    torch.testing.assert_close(mask_rolled, torch.roll(new_mask, shift // stride, dims=-1))
 
 
 def test_periodic_upsampling_matches_interpolating_a_tiled_field():
@@ -860,8 +908,91 @@ def test_unet_respects_the_grid_symmetry():
     h, w = 16, 32  # width divisible by 8 so the half-width roll is exact at every UNet level
     unet = UNet(input_channel_count=3, output_channel_count=2, padding_mode="zeros").eval()
     x = torch.randn(1, 3, h, w)
-    mask = (torch.rand(1, 1, h, w) > 0.3).float()
+    mask = torch.ones(1, 1, h, w)  # all ocean: see test_partial_conv_respects_the_grid_symmetry
     with torch.no_grad():
         out = unet(x, mask)
         out_rolled = unet(torch.roll(x, w // 2, dims=-1), torch.roll(mask, w // 2, dims=-1))
     torch.testing.assert_close(out_rolled, torch.roll(out, w // 2, dims=-1), rtol=1e-4, atol=1e-5)
+
+
+# =============================================================================
+# Persistence baseline
+# =============================================================================
+
+def test_persistence_rmse_matches_direct_computation(data_and_cfg):
+    from Experiment import persistence_rmse
+
+    data, cfg = data_and_cfg
+    f = data.fields
+    t0s, n_steps = data.valid_indices.tolist(), cfg.window.posterior_steps
+    weight = (f["area"].double() * f["mask"].double()).numpy()
+    weight /= weight.sum()
+    squared, count = np.zeros(data.n_prognostic), 0
+    for t0 in t0s:
+        anomaly0 = (f["prognostic"][t0] * f["prognostic_std"][t0]).double().numpy()
+        for t in range(t0 + 1, t0 + n_steps + 1):
+            std = f["prognostic_std"][t].double().numpy()
+            z = np.where(std > 0, anomaly0 / np.where(std > 0, std, 1.0), 0.0)
+            squared += (((z - f["prognostic"][t].double().numpy()) ** 2) * weight).sum(axis=(-2, -1))
+            count += 1
+    expected = np.sqrt(squared / count)
+    result = persistence_rmse(cfg, data, n_steps=n_steps)
+    np.testing.assert_allclose([result[n] for n in f["prognostic_names"]], expected, rtol=1e-5)
+
+
+def test_skill_test_includes_persistence(data_and_cfg):
+    data, cfg = data_and_cfg
+    skill = run_skill_test(cfg, build_model(cfg, data), data)
+    name = "ocean_heat_content_2d"
+    persist = skill[f"{name}_persist_anom"].values
+    np.testing.assert_allclose(persist, np.broadcast_to(persist[0], persist.shape))  # held fixed
+    t0 = data.index_of(cfg.time.test[0])
+    ocean = data.fields["mask"].numpy() > 0
+    seed_anomaly = (data.fields["prognostic"][t0, 0] * data.fields["prognostic_std"][t0, 0]).numpy()
+    np.testing.assert_allclose(persist[0][ocean], seed_anomaly[ocean], rtol=1e-5)
+
+    fig = plot_global_rmse_all_variables(skill, [name])
+    assert len(fig.axes[0].lines) == 2  # emulator and persistence
+    plt.close(fig)
+
+
+def test_rmse_by_epoch_draws_baseline():
+    history = pd.DataFrame([{"epoch": e, "stage": s, "variable": "v", "rmse": 1.0 / (e + 1)}
+                            for e in range(3) for s in ("train", "val")])
+    fig = plot_rmse_by_epoch(history, ["v"], baseline={"v": 0.5})
+    assert len(fig.axes[0].lines) == 3
+    plt.close(fig)
+
+
+# =============================================================================
+# Cached land levels and channels_last fill
+# =============================================================================
+
+def test_unet_caches_land_levels_until_the_mask_changes():
+    from Emulator import UNet
+
+    torch.manual_seed(0)
+    unet = UNet(input_channel_count=3, output_channel_count=2, padding_mode="zeros").eval()
+    mask = (torch.rand(H, W) > 0.3).float()
+    x = torch.randn(2, 3, H, W)
+    with torch.no_grad():
+        out = unet(x, mask[None, None])
+        assert unet.land_levels(mask[None, None]) is unet.land_levels(mask)  # one entry for the mask and its views
+        mask[0, :5] = 1 - mask[0, :5]  # in-place edit: the cached levels must be recomputed
+        edited = unet(x, mask[None, None])
+        unet._land_cache.clear()
+        torch.testing.assert_close(edited, unet(x, mask[None, None]))
+    assert not torch.equal(out, edited)
+    assert [m.shape[-2:] for m, _ in unet.land_levels(mask)] == [(H, W), (H // 2, W // 2), (H // 4, W // 4)]
+
+
+def test_fill_land_keeps_channels_last():
+    from Emulator.om2_model_utils import fill_land
+
+    torch.manual_seed(0)
+    mask = (torch.rand(1, 1, H, W) > 0.3).float()
+    x = torch.randn(2, 5, H, W)
+    x_cl = x.contiguous(memory_format=torch.channels_last)
+    out_cl = fill_land(x_cl, mask, dirichlet={2: 0.5})
+    assert out_cl.is_contiguous(memory_format=torch.channels_last)
+    torch.testing.assert_close(out_cl, fill_land(x, mask, dirichlet={2: 0.5}))

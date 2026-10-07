@@ -32,6 +32,7 @@ from .evaluation import (
     global_integral,
     global_rmse,
     leading_growth_mode,
+    persistence_rmse,
     run_control,
     run_skill_test,
 )
@@ -71,6 +72,7 @@ __all__ = [
     "global_integral",
     "global_rmse",
     "leading_growth_mode",
+    "persistence_rmse",
     "run_control",
     "run_skill_test",
     "build_losses",

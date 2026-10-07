@@ -146,7 +146,9 @@ def _as_dataset(arrays, time_coord, data, time_dim="time"):
 def run_skill_test(cfg, model, data):
     """
     Seed from the truth at time.test[0], then free-run with the real forcing
-    through time.test[1] + 1 month. Returns a Dataset of predictions and truth.
+    through time.test[1] + 1 month. Returns a Dataset of predictions, truth and
+    the persistence baseline (<var>_persist, <var>_persist_anom: the seed
+    month's physical anomaly held fixed).
     """
     f, n_prior = data.fields, cfg.window.n_prior
     t0 = data.index_of(cfg.time.test[0])
@@ -161,9 +163,13 @@ def run_skill_test(cfg, model, data):
     z_true = f["prognostic"][targets]
     pred_anom, pred = _to_physical(z_pred, targets, data)
     true_anom, true = _to_physical(z_true, targets, data)
+    persist_anom = (f["prognostic"][t0] * f["prognostic_std"][t0]).expand_as(true_anom)
+    persist = persist_anom + f["prognostic_mean"][targets]
     time = pd.to_datetime([data.months[i] for i in targets.tolist()])
     ds = _as_dataset(
-        {"pred": pred, "truth": true, "pred_anom": pred_anom, "truth_anom": true_anom}, time, data
+        {"pred": pred, "truth": true, "pred_anom": pred_anom, "truth_anom": true_anom,
+         "persist": persist, "persist_anom": persist_anom},
+        time, data,
     )
     ds.attrs["description"] = f"Skill test seeded at {cfg.time.test[0]}, {len(targets)} months"
     print(f"Skill test: seeded at {cfg.time.test[0]}, predicted {data.months[t0 + 1]}..{data.months[t_last]} ({len(targets)} months)")
@@ -197,6 +203,37 @@ def run_control(cfg, model, data):
     )
     print(f"Control run: {len(targets)} steps ({cfg.time.control_repeats} repeats of {len(window)} months)")
     return ds
+
+
+# =============================================================================
+# Persistence baseline
+# =============================================================================
+
+def persistence_rmse(cfg, data, initial_indices=None, n_steps=None):
+    """
+    Per-variable RMSE of the persistence forecast over rollout windows, in the
+    same units as the per-epoch validation RMSE (normalised, area-weighted over
+    the ocean, averaged over windows and lead times, square-rooted).
+
+    Persistence holds the initial month's PHYSICAL anomaly fixed; in z-score
+    units that is z(t0) * std(t0) / std(t). Defaults: the validation windows
+    and the validation rollout length. Returns {variable: rmse}.
+    """
+    f = data.fields
+    indices = data.valid_indices if initial_indices is None else torch.as_tensor(initial_indices)
+    n_steps = n_steps or cfg.window.valid_rollout_steps or cfg.window.rollout_steps
+    weight = f["area"].float() * f["mask"].float()
+    weight = weight / weight.sum()
+    squared = torch.zeros(len(f["prognostic_names"]), dtype=torch.float64)
+    count = 0
+    for t0 in indices.tolist():
+        anomaly0 = f["prognostic"][t0] * f["prognostic_std"][t0]
+        for t in range(t0 + 1, t0 + n_steps + 1):
+            std = f["prognostic_std"][t]
+            z_persist = torch.where(std > 0, anomaly0 / std.clamp_min(1e-30), torch.zeros_like(std))
+            squared += (((z_persist - f["prognostic"][t]) ** 2) * weight).sum(dim=(-2, -1)).double()
+            count += 1
+    return dict(zip(f["prognostic_names"], torch.sqrt(squared / count).tolist()))
 
 
 # =============================================================================

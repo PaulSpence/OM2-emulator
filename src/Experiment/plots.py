@@ -124,24 +124,33 @@ def plot_skill_evaluation(skill, variable, periods, anomaly_scale=None, differen
 
 
 def plot_global_rmse_all_variables(skill, variables=None):
-    """Area-weighted RMSE of the full field through the skill test, one panel per variable."""
+    """
+    Area-weighted RMSE of the full field through the skill test, one panel per
+    variable, with the persistence baseline if the Dataset has it.
+    """
     variables = variables or prognostic_variables(skill)
     fig, axes = plt.subplots(len(variables), 1, figsize=(11, 3.2 * len(variables)), sharex=True,
                              squeeze=False, constrained_layout=True)
     for ax, variable in zip(axes[:, 0], variables):
         rmse = global_rmse(skill[f"{variable}_pred"], skill[f"{variable}_truth"], skill["area"])
-        ax.plot(skill.time.values, rmse.values, color="firebrick", lw=2)
+        ax.plot(skill.time.values, rmse.values, color="firebrick", lw=2, label="Emulator")
+        if f"{variable}_persist" in skill:
+            persist = global_rmse(skill[f"{variable}_persist"], skill[f"{variable}_truth"], skill["area"])
+            ax.plot(skill.time.values, persist.values, color="0.4", lw=1.5, ls="--", label="Persistence")
+            ax.legend(frameon=False)
         ax.set_title(f"Global area-weighted RMSE of {variable}")
         ax.set_ylabel(f"RMSE ({skill[f'{variable}_pred'].attrs.get('units', '')})")
         ax.grid(alpha=0.3)
     return fig
 
 
-def plot_rmse_by_epoch(history, variables=None):
+def plot_rmse_by_epoch(history, variables=None, baseline=None):
     """
     Train and validation RMSE (normalised units) per epoch, one panel per
     variable. history is EmulatorModule.rmse_history, or a run_dir whose
-    metrics.csv has the {stage}_rmse_{variable} columns.
+    metrics.csv has the {stage}_rmse_{variable} columns. baseline is an
+    optional {variable: rmse} drawn as a horizontal line, e.g. the validation
+    persistence RMSE from evaluation.persistence_rmse.
     """
     if not isinstance(history, pd.DataFrame):
         metrics = pd.read_csv(Path(history) / "metrics.csv")
@@ -163,6 +172,8 @@ def plot_rmse_by_epoch(history, variables=None):
             rows = history[(history["variable"] == variable) & (history["stage"] == stage)]
             if not rows.empty:
                 ax.plot(rows["epoch"], rows["rmse"], label=label, lw=2)
+        if baseline and variable in baseline:
+            ax.axhline(baseline[variable], color="0.4", ls="--", lw=1.5, label="Validation persistence")
         ax.set_yscale("log")
         ax.set_title(f"{variable}: area-weighted RMSE per epoch")
         ax.set_ylabel("RMSE (normalised)")
