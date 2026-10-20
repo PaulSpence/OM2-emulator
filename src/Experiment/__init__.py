@@ -29,6 +29,7 @@ from .config import (
 from .data import ExperimentData, InitialMonthDataset, build_data, compute_normalisation, gather_windows
 from .evaluation import (
     check_known_closure,
+    climatology_rmse,
     global_integral,
     global_rmse,
     leading_growth_mode,
@@ -74,6 +75,7 @@ __all__ = [
     "gather_windows",
     "compute_normalisation",
     "check_known_closure",
+    "climatology_rmse",
     "global_integral",
     "global_rmse",
     "leading_growth_mode",

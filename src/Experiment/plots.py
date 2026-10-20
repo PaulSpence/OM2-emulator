@@ -11,6 +11,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import xarray as xr
 
 from .evaluation import global_integral, global_rmse, skill_diagnostics, zonal_spectrum
 
@@ -123,33 +124,39 @@ def plot_skill_evaluation(skill, variable, periods, anomaly_scale=None, differen
     return fig
 
 
-def plot_global_rmse_all_variables(skill, variables=None):
-    """
-    Area-weighted RMSE of the full field through the skill test, one panel per
-    variable, with the persistence baseline if the Dataset has it.
-    """
-    variables = variables or prognostic_variables(skill)
-    fig, axes = plt.subplots(len(variables), 1, figsize=(11, 3.2 * len(variables)), sharex=True,
-                             squeeze=False, constrained_layout=True)
-    for ax, variable in zip(axes[:, 0], variables):
-        rmse = global_rmse(skill[f"{variable}_pred"], skill[f"{variable}_truth"], skill["area"])
-        ax.plot(skill.time.values, rmse.values, color="firebrick", lw=2, label="Emulator")
-        if f"{variable}_persist" in skill:
-            persist = global_rmse(skill[f"{variable}_persist"], skill[f"{variable}_truth"], skill["area"])
-            ax.plot(skill.time.values, persist.values, color="0.4", lw=1.5, ls="--", label="Persistence")
-            ax.legend(frameon=False)
-        ax.set_title(f"Global area-weighted RMSE of {variable}")
-        ax.set_ylabel(f"RMSE ({skill[f'{variable}_pred'].attrs.get('units', '')})")
-        ax.grid(alpha=0.3)
-    return fig
-
-
 _DIAGNOSTIC_STYLE = {
     "emulator": dict(color="firebrick", lw=2, label="Emulator"),
     "truth": dict(color="tab:orange", lw=2, label="Truth"),
     "persistence": dict(color="0.4", lw=1.5, ls="--", label="Persistence"),
     "climatology": dict(color="tab:blue", lw=1.5, ls=":", label="Climatology (zero anomaly)"),
 }
+
+
+def plot_global_rmse_all_variables(skill, variables=None):
+    """
+    Area-weighted RMSE of the full field through the skill test, one panel per
+    variable, with the climatology baseline (zero anomaly: its RMSE is the
+    truth's RMS anomaly) and the persistence baseline if the Dataset has it.
+    """
+    variables = variables or prognostic_variables(skill)
+    fig, axes = plt.subplots(len(variables), 1, figsize=(11, 3.2 * len(variables)), sharex=True,
+                             squeeze=False, constrained_layout=True)
+    for ax, variable in zip(axes[:, 0], variables):
+        rmse = global_rmse(skill[f"{variable}_pred"], skill[f"{variable}_truth"], skill["area"])
+        ax.plot(skill.time.values, rmse.values, **_DIAGNOSTIC_STYLE["emulator"])
+        if f"{variable}_persist" in skill:
+            persist = global_rmse(skill[f"{variable}_persist"], skill[f"{variable}_truth"], skill["area"])
+            ax.plot(skill.time.values, persist.values, **_DIAGNOSTIC_STYLE["persistence"])
+        truth_anom = skill[f"{variable}_truth_anom"]
+        climatology = global_rmse(truth_anom, xr.zeros_like(truth_anom), skill["area"])
+        ax.plot(skill.time.values, climatology.values, **_DIAGNOSTIC_STYLE["climatology"])
+        ax.legend(frameon=False)
+        ax.set_title(f"Global area-weighted RMSE of {variable}")
+        ax.set_ylabel(f"RMSE ({skill[f'{variable}_pred'].attrs.get('units', '')})")
+        ax.grid(alpha=0.3)
+    return fig
+
+
 
 
 def plot_skill_diagnostics(skill, variables=None):
@@ -214,13 +221,14 @@ def plot_spectra(skill, variables=None):
     return fig
 
 
-def plot_rmse_by_epoch(history, variables=None, baseline=None):
+def plot_rmse_by_epoch(history, variables=None, baselines=None):
     """
     Train and validation RMSE (normalised units) per epoch, one panel per
     variable. history is EmulatorModule.rmse_history, or a run_dir whose
-    metrics.csv has the {stage}_rmse_{variable} columns. baseline is an
-    optional {variable: rmse} drawn as a horizontal line, e.g. the validation
-    persistence RMSE from evaluation.persistence_rmse.
+    metrics.csv has the {stage}_rmse_{variable} columns. baselines is an
+    optional {label: {variable: rmse}}, each drawn as a horizontal line, e.g.
+    {"Validation persistence (z held fixed)": evaluation.persistence_rmse(...),
+     "Validation climatology (zero anomaly)": evaluation.climatology_rmse(...)}.
     """
     if not isinstance(history, pd.DataFrame):
         metrics = pd.read_csv(Path(history) / "metrics.csv")
@@ -242,8 +250,9 @@ def plot_rmse_by_epoch(history, variables=None, baseline=None):
             rows = history[(history["variable"] == variable) & (history["stage"] == stage)]
             if not rows.empty:
                 ax.plot(rows["epoch"], rows["rmse"], label=label, lw=2)
-        if baseline and variable in baseline:
-            ax.axhline(baseline[variable], color="0.4", ls="--", lw=1.5, label="Validation persistence (z held fixed)")
+        for (label, values), ls, color in zip((baselines or {}).items(), ("--", ":", "-."), ("0.4", "tab:blue", "0.6")):
+            if variable in values:
+                ax.axhline(values[variable], color=color, ls=ls, lw=1.5, label=label)
         ax.set_yscale("log")
         ax.set_title(f"{variable}: area-weighted RMSE per epoch")
         ax.set_ylabel("RMSE (normalised)")

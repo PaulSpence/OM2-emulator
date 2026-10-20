@@ -1127,15 +1127,36 @@ def test_skill_test_includes_persistence(data_and_cfg):
     np.testing.assert_allclose(persist[0][ocean], seed_anomaly[ocean], rtol=1e-5)
 
     fig = plot_global_rmse_all_variables(skill, [name])
-    assert len(fig.axes[0].lines) == 2  # emulator and persistence
+    lines = {line.get_label(): line for line in fig.axes[0].lines}
+    assert set(lines) == {"Emulator", "Persistence", "Climatology (zero anomaly)"}
+    # Zero anomaly: the error is the truth's area-weighted RMS anomaly.
+    truth_anom = skill[f"{name}_truth_anom"]
+    area = skill["area"].where(truth_anom.isel(time=0).notnull(), 0.0)
+    expected = np.sqrt((truth_anom.fillna(0.0) ** 2 * area).sum(("latitude", "longitude")) / area.sum())
+    np.testing.assert_allclose(lines["Climatology (zero anomaly)"].get_ydata(), expected.values, rtol=1e-5)
     plt.close(fig)
 
 
-def test_rmse_by_epoch_draws_baseline():
+def test_climatology_rmse_matches_direct_computation(data_and_cfg):
+    from Experiment import climatology_rmse
+
+    data, cfg = data_and_cfg
+    f = data.fields
+    t0s, n_steps = data.valid_indices.tolist(), cfg.window.posterior_steps
+    weight = (f["area"].double() * f["mask"].double()).numpy()
+    weight /= weight.sum()
+    targets = [f["prognostic"][t].double().numpy() for t0 in t0s for t in range(t0 + 1, t0 + n_steps + 1)]
+    expected = np.sqrt(np.mean([((z**2) * weight).sum(axis=(-2, -1)) for z in targets], axis=0))
+    result = climatology_rmse(cfg, data, n_steps=n_steps)
+    np.testing.assert_allclose([result[n] for n in f["prognostic_names"]], expected, rtol=1e-5)
+
+
+def test_rmse_by_epoch_draws_baselines():
     history = pd.DataFrame([{"epoch": e, "stage": s, "variable": "v", "rmse": 1.0 / (e + 1)}
                             for e in range(3) for s in ("train", "val")])
-    fig = plot_rmse_by_epoch(history, ["v"], baseline={"v": 0.5})
-    assert len(fig.axes[0].lines) == 3
+    fig = plot_rmse_by_epoch(history, ["v"], baselines={"Persistence": {"v": 0.5}, "Climatology": {"v": 0.4}})
+    labels = [line.get_label() for line in fig.axes[0].lines]
+    assert labels == ["Training", "Validation", "Persistence", "Climatology"]
     plt.close(fig)
 
 

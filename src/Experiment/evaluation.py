@@ -243,6 +243,28 @@ def persistence_rmse(cfg, data, initial_indices=None, n_steps=None):
     return dict(zip(f["prognostic_names"], torch.sqrt(squared / count).tolist()))
 
 
+def climatology_rmse(cfg, data, initial_indices=None, n_steps=None):
+    """
+    Per-variable RMSE of the climatology forecast (zero anomaly, z = 0) over
+    rollout windows, in the units of persistence_rmse: the RMS of the target
+    z-scores. Where nothing is predictable it beats persistence by ~sqrt(2),
+    so it is the stricter baseline at long leads. Same defaults as
+    persistence_rmse. Returns {variable: rmse}.
+    """
+    f = data.fields
+    indices = data.valid_indices if initial_indices is None else torch.as_tensor(initial_indices)
+    n_steps = n_steps or cfg.window.valid_rollout_steps or sum(rollout_spec(cfg.window.rollout_steps))
+    weight = f["area"].float() * f["mask"].float()
+    weight = weight / weight.sum()
+    squared = torch.zeros(len(f["prognostic_names"]), dtype=torch.float64)
+    count = 0
+    for t0 in indices.tolist():
+        for t in range(t0 + 1, t0 + n_steps + 1):
+            squared += ((f["prognostic"][t] ** 2) * weight).sum(dim=(-2, -1)).double()
+            count += 1
+    return dict(zip(f["prognostic_names"], torch.sqrt(squared / count).tolist()))
+
+
 # =============================================================================
 # Stability diagnostic
 # =============================================================================
