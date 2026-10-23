@@ -363,6 +363,7 @@ def test_push_forward_starts_from_the_models_own_state(data_and_cfg):
     data, cfg = data_and_cfg
     a, n_free, n_steps = 0.5, 3, 1
     module = build_module(cfg, _ScaledPersistence(a, data.n_prognostic), build_losses(cfg, data), data)
+    module.constraint = None  # the exact a^k states below; the constraint has its own tests
     t0 = data.train_indices[:2]
     full = data.windows(t0, n_steps=n_free + n_steps)
     pushed = module.push_forward(t0, n_free, n_steps)
