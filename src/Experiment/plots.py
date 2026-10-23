@@ -230,7 +230,9 @@ def plot_meridional_transports(transports):
     Implied meridional transports through the skill test (evaluation.
     meridional_transports), one row per budget (heat = MHT, freshwater = MFWT):
 
-      1. time-mean northward transport, ACCESS-OM2 vs emulator;
+      1. time-mean northward transport, ACCESS-OM2 vs emulator, both implied
+         from content tendency and surface flux (the emulator's best possible
+         target: the same budget it is trained on);
       2. time-mean storage term (cumulative content tendency): the only part
          the emulator changes, since both use the same surface flux;
       3. month-to-month: the truth's standard deviation over time and the RMS
@@ -248,11 +250,11 @@ def plot_meridional_transports(transports):
         lat = t.latitude.values
         truth, pred = t.truth_transport / scale, t.pred_transport / scale
         panels = (
-            (row[0], f"{label}: time mean", ((truth.mean("time"), "ACCESS-OM2"), (pred.mean("time"), "Emulator"))),
+            (row[0], f"{label}: time mean", ((truth.mean("time"), "ACCESS-OM2 (implied)"), (pred.mean("time"), "Emulator"))),
             (row[1], f"{label}: storage term, time mean",
-             ((t.truth_storage.mean("time") / scale, "ACCESS-OM2"), (t.pred_storage.mean("time") / scale, "Emulator"))),
+             ((t.truth_storage.mean("time") / scale, "ACCESS-OM2 (implied)"), (t.pred_storage.mean("time") / scale, "Emulator"))),
             (row[2], f"{label}: month-to-month",
-             ((truth.std("time"), "ACCESS-OM2 std over time"),
+             ((truth.std("time"), "ACCESS-OM2 (implied) std over time"),
               (np.sqrt(((pred - truth) ** 2).mean("time")), "RMS emulator minus truth"))),
         )
         for ax, title, series in panels:
