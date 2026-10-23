@@ -249,3 +249,99 @@ def test_closure_loss_requires_initial_forcing(loss_functions):
     del ctx["initial_forcing"]
     with pytest.raises(ValueError, match="initial_forcing"):
         closure(**ctx)
+
+
+def _two_budget_batch(n_steps=6, batch=3, h=6, w=8, n_time=40, seed=1):
+    """
+    Heat and freshwater budgets that each close exactly, with their own std
+    fields: prediction channels (OHC, FWC), forcing channels (heat flux,
+    freshwater flux, junk).
+    """
+    g = torch.Generator().manual_seed(seed)
+    dt = 2.6e6
+    area = torch.rand(h, w, generator=g, dtype=torch.float64) * 1e10
+    mask = (torch.rand(h, w, generator=g, dtype=torch.float64) > 0.2).double()
+    i0 = torch.tensor([3, 10, 20])[:batch]
+    targets = i0[:, None] + torch.arange(1, n_steps + 1)[None]
+    months = torch.cat([i0[:, None], targets], dim=1)
+
+    def budget(content_size, flux_size):
+        content_std = torch.rand(n_time, h, w, generator=g, dtype=torch.float64) * content_size + 0.1 * content_size
+        flux_std = torch.rand(n_time, h, w, generator=g, dtype=torch.float64) * flux_size + 0.1 * flux_size
+        flux = torch.randn(batch, n_steps + 1, h, w, generator=g, dtype=torch.float64) * flux_size
+        content = torch.zeros(batch, n_steps + 1, h, w, dtype=torch.float64)
+        content[:, 0] = torch.randn(batch, h, w, generator=g, dtype=torch.float64) * content_size
+        for j in range(n_steps):
+            content[:, j + 1] = content[:, j] + 0.5 * (flux[:, j] + flux[:, j + 1]) * dt
+        return content / content_std[months], flux / flux_std[months], (content_std, flux_std)
+
+    heat_z, heat_flux_z, heat_std = budget(1e9, 30.0)        # J/m^2, W/m^2
+    fw_z, fw_flux_z, fw_std = budget(10.0, 1e-5)             # kg/m^2, kg/m^2/s
+    state = torch.stack([heat_z, fw_z], dim=2)               # (B, n_steps + 1, 2, H, W)
+    junk = torch.randn(batch, n_steps + 1, h, w, generator=g, dtype=torch.float64) * 1e3
+    forcing = torch.stack([heat_flux_z, fw_flux_z, junk], dim=2)  # (B, n_steps + 1, 3, H, W)
+
+    def context(step, closure_std=None):
+        return dict(
+            initial_state_norm=state[:, 0],
+            pred_t=state[:, step + 1],
+            forcing_history=forcing[:, 1 : step + 2],
+            initial_forcing=forcing[:, 0],
+            initial_time_index=i0,
+            target_time_index=targets[:, step],
+            forcing_time_indices=targets[:, : step + 1],
+            area=area,
+            mask=mask,
+            closure_std={"heat": heat_std, "freshwater": fw_std} if closure_std is None else closure_std,
+            dt_seconds=dt,
+            rollout_step=step,
+        )
+
+    return context, heat_std, fw_std
+
+
+def test_heat_and_freshwater_closures_are_zero_when_budgets_close(loss_functions):
+    context, _, _ = _two_budget_batch()
+    heat = loss_functions.heat_closure_loss(ohc_channel_index=0, heat_flux_channel_index=0, min_scale=1.0)
+    freshwater = loss_functions.freshwater_closure_loss(
+        freshwater_content_channel_index=1, freshwater_flux_channel_index=1, min_scale=1.0
+    )
+    for step in range(6):
+        assert heat(**context(step)).item() < 1e-20, f"heat closure non-zero at lead {step + 1}"
+        assert freshwater(**context(step)).item() < 1e-20, f"freshwater closure non-zero at lead {step + 1}"
+
+
+def test_budget_closures_use_their_own_channels_and_std(loss_functions):
+    context, heat_std, fw_std = _two_budget_batch()
+    # Freshwater content against the heat flux channel does not close.
+    crossed = loss_functions.budget_closure_loss(
+        budget="freshwater", content_channel_index=1, flux_channel_index=0, min_scale=1.0
+    )
+    assert crossed(**context(2)).item() > 1e-6
+    # Freshwater channels with the heat budget's std fields do not close either.
+    swapped = loss_functions.freshwater_closure_loss(
+        freshwater_content_channel_index=1, freshwater_flux_channel_index=1, min_scale=1.0
+    )
+    assert swapped(**context(2, closure_std={"freshwater": heat_std})).item() > 1e-6
+
+
+def test_budget_closure_requires_its_std(loss_functions):
+    context, heat_std, _ = _two_budget_batch()
+    freshwater = loss_functions.freshwater_closure_loss(freshwater_content_channel_index=1,
+                                                        freshwater_flux_channel_index=1)
+    with pytest.raises(ValueError, match="closure_std\\['freshwater'\\]"):
+        freshwater(**context(0, closure_std={"heat": heat_std}))
+
+
+def test_global_closure_loss_matches_heat_closure_loss(loss_functions):
+    """The original heat-only API (ohc_std / forcing_std, initial_ohc_norm) gives the same value."""
+    context, heat_std, _ = _two_budget_batch()
+    heat = loss_functions.heat_closure_loss(ohc_channel_index=0, heat_flux_channel_index=0)
+    legacy = loss_functions.global_closure_loss(ohc_channel_index=0, heat_flux_channel_index=0)
+    for step in range(6):
+        ctx = context(step)
+        # Perturb the prediction so the loss is not trivially zero.
+        ctx["pred_t"] = ctx["pred_t"] * 1.1
+        legacy_ctx = dict(ctx, ohc_std=heat_std[0], forcing_std=heat_std[1], closure_std=None)
+        legacy_ctx["initial_ohc_norm"] = legacy_ctx.pop("initial_state_norm")
+        assert torch.allclose(heat(**ctx), legacy(**legacy_ctx))

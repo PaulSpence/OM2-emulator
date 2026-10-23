@@ -1,0 +1,1212 @@
+"""
+Tests for the config-driven experiment package (src/Experiment).
+
+Everything runs on a small synthetic NetCDF file shaped like the emulator
+dataset, so the suite needs no /g/data access and no GPU.
+"""
+
+import importlib.util
+import sys
+import types
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd
+import pytest
+import torch
+import xarray as xr
+
+from conftest import REPO_ROOT
+
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from Experiment import (  # noqa: E402
+    ClosureConfig,
+    DataConfig,
+    EvalConfig,
+    ExperimentConfig,
+    LossConfig,
+    ModelConfig,
+    NormalisationConfig,
+    TimeConfig,
+    TrainConfig,
+    WindowConfig,
+    build_data,
+    build_losses,
+    build_model,
+    build_module,
+    build_trainer,
+    check_known_closure,
+    compute_normalisation,
+    plot_global_rmse_all_variables,
+    plot_rmse_by_epoch,
+    plot_skill_evaluation,
+    run_control,
+    run_skill_test,
+)
+from Experiment.training import PerVariableError, RolloutSchedule  # noqa: E402
+
+PROGNOSTIC = ["ocean_heat_content_2d"]
+FORCING = ["total_surface_heat_flx", "tau_x", "tau_y"]
+H, W = 16, 20
+
+
+# =============================================================================
+# Fixtures
+# =============================================================================
+
+@pytest.fixture(scope="module")
+def synthetic_file(tmp_path_factory):
+    """72 months (2000-01 .. 2005-12) on a 16 x 20 grid with land, like the real file."""
+    rng = np.random.default_rng(0)
+    n_time = 72
+    times = pd.date_range("2000-01-01", periods=n_time, freq="MS") + pd.Timedelta(days=14)
+    land = rng.random((H, W)) < 0.25
+    month = times.month.values - 1
+    seasonal = lambda amp: amp * np.sin(2 * np.pi * month / 12)[:, None, None]
+
+    def field(mean, amp, noise):
+        x = mean + seasonal(amp) + rng.normal(0, noise, (n_time, H, W))
+        x[:, land] = np.nan
+        return x.astype(np.float32)
+
+    dims = ("time", "yt_ocean", "xt_ocean")
+    ds = xr.Dataset(
+        {
+            "ocean_heat_content_2d": (dims, field(5e10, 2e9, 5e8), {"units": "J/m2", "description": "cp * ((temp - 273.15) * rho_dzt)"}),
+            "total_surface_heat_flx": (dims, field(0.0, 80.0, 20.0), {"units": "W/m2"}),
+            "ocean_freshwater_content_2d": (dims, field(-3e3, 50.0, 10.0), {"units": "kg m-2"}),
+            "ocean_freshwater_flux": (dims, field(0.0, 2e-5, 5e-6), {"units": "kg m-2 s-1"}),
+            "tau_x": (dims, field(0.0, 0.05, 0.02)),
+            "tau_y": (dims, field(0.0, 0.03, 0.02)),
+            "area_t": (dims, np.repeat(rng.uniform(1e9, 1e10, (1, H, W)), n_time, 0).astype(np.float32)),
+        },
+        coords={"time": times, "yt_ocean": np.linspace(-70, 80, H), "xt_ocean": np.linspace(-280, 79, W)},
+    )
+    path = tmp_path_factory.mktemp("data") / "synthetic_emulator.nc"
+    ds.to_netcdf(path)
+    return path
+
+
+def make_cfg(path, tmp_path, **overrides):
+    """A small, fast config on the synthetic file (overrides replace whole sections)."""
+    sections = dict(
+        data=DataConfig(
+            path=str(path),
+            prognostic=list(PROGNOSTIC),
+            forcing=list(FORCING),
+            normalisation=NormalisationConfig(fit_period=("2000-01", "2003-12")),
+            cache_dir=str(tmp_path / "cache"),
+        ),
+        time=TimeConfig(
+            time_axis=("2000-01", "2005-12"),
+            train=("2000-02", "2003-06"),
+            valid=("2003-07", "2003-12"),
+            test=("2004-01", "2005-10"),
+            control=("2002-01", "2002-12"),
+            control_repeats=2,
+        ),
+        window=WindowConfig(n_prior=2, posterior_steps=4, rollout_steps=4),
+        loss=LossConfig(terms={"local_mse": 1.0, "spectral": 0.0, "heat_closure": 0.1}),
+        model=ModelConfig(padding_mode="zeros"),
+        train=TrainConfig(batch_size=8, max_epochs=1, gpu_check=False),
+        eval=EvalConfig(snapshot_periods=["2004-06"]),
+    )
+    sections.update(overrides)
+    return ExperimentConfig(**sections)
+
+
+@pytest.fixture(scope="module")
+def data_and_cfg(synthetic_file, tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("run")
+    cfg = make_cfg(synthetic_file, tmp)
+    return build_data(cfg, verbose=False), cfg
+
+
+# =============================================================================
+# Normalisation matches the original PET-based build_normalisation
+# =============================================================================
+
+def _load_original_build_normalisation():
+    """src/Data/om2_normalisation_strategies.py with PyEarthTools replaced by a stub."""
+    stub = types.ModuleType("pyearthtools.pipeline")
+    stub.operations = types.SimpleNamespace(
+        xarray=types.SimpleNamespace(
+            normalisation=types.SimpleNamespace(
+                Evaluated=lambda **kw: types.SimpleNamespace(_initialisation={"mean": kw["mean"], "deviation": kw["deviation"]})
+            )
+        )
+    )
+    saved = {k: sys.modules.get(k) for k in ("pyearthtools", "pyearthtools.pipeline")}
+    sys.modules["pyearthtools"] = types.ModuleType("pyearthtools")
+    sys.modules["pyearthtools.pipeline"] = stub
+    try:
+        path = REPO_ROOT / "src" / "Data" / "om2_normalisation_strategies.py"
+        spec = importlib.util.spec_from_file_location("original_normalisation", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+    return module.build_normalisation
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    ["Spatial_climatology", "Spatial_climatology_global_variance", "Spatial_in_time", "Global_in_time"],
+)
+def test_normalisation_matches_original(synthetic_file, strategy):
+    build_normalisation = _load_original_build_normalisation()
+    variables = [*PROGNOSTIC, *FORCING]  # heat flux at index 1 = the original's land-mask variable
+    with pytest.warns(UserWarning):
+        mask_old, norm = build_normalisation(
+            str(synthetic_file), strategy, variables,
+            time_window=dict(start="2000-01", end="2005-12", freq="1MS"), train_end="2003-12", mask=True,
+        )
+    months = pd.date_range("2000-01", "2005-12", freq="MS")
+    with xr.open_dataset(synthetic_file) as ds:
+        mean, std, mask = compute_normalisation(
+            ds.sel(time=months, method="nearest"), variables, strategy, ("2000-01", "2003-12"),
+            "total_surface_heat_flx", "area_t",
+        )
+    np.testing.assert_array_equal(mask.values, mask_old.values)
+    for v in variables:
+        xr.testing.assert_allclose(mean[v], norm._initialisation["mean"][v])
+        xr.testing.assert_allclose(std[v], norm._initialisation["deviation"][v])
+
+
+# =============================================================================
+# Data: fields, windows, cache
+# =============================================================================
+
+def test_windows_match_direct_normalisation(data_and_cfg, synthetic_file):
+    data, cfg = data_and_cfg
+    months = pd.date_range("2000-01", "2005-12", freq="MS")
+    variables = [*PROGNOSTIC, *FORCING]
+    with xr.open_dataset(synthetic_file) as raw:
+        ds = raw.sel(time=months, method="nearest")
+        mean, std, _ = compute_normalisation(ds, variables, "Spatial_climatology", ("2000-01", "2003-12"), "total_surface_heat_flx", "area_t")
+        z = {
+            v: ((ds[v].rename(yt_ocean="latitude", xt_ocean="longitude") - mean[v]) / std[v]).fillna(0.0).values
+            for v in variables
+        }
+
+    sample = {k: v[0] for k, v in data.windows(data.train_indices[5:6]).items()}
+    t0 = int(data.train_indices[5])
+    assert data.months[t0] == "2000-07"  # train starts 2000-02, sample 5 -> 2000-07
+    np.testing.assert_allclose(sample["prior"][:, 0].numpy(), z["ocean_heat_content_2d"][t0 - 1 : t0 + 1], rtol=1e-6)
+    np.testing.assert_allclose(sample["target"][:, 0].numpy(), z["ocean_heat_content_2d"][t0 + 1 : t0 + 5], rtol=1e-6)
+    for c, v in enumerate(FORCING):
+        np.testing.assert_allclose(sample["forcing"][:, c].numpy(), z[v][t0 + 1 : t0 + 5], rtol=1e-6)
+        np.testing.assert_allclose(sample["initial_forcing"][c].numpy(), z[v][t0], rtol=1e-6)
+    assert sample["target_time_index"].tolist() == list(range(t0 + 1, t0 + 5))
+
+
+def test_split_sizes_and_bounds(data_and_cfg):
+    data, _ = data_and_cfg
+    # Initial months 2000-02 .. 2003-02: training windows (4 targets) end by 2003-06,
+    # inside the training period, so training never sees validation or test months.
+    assert len(data.train_indices) == 37
+    last_target = int(data.train_indices.max()) + 4
+    assert data.months[last_target] == "2003-06"
+    assert len(data.valid_indices) == 6   # 2003-07 .. 2003-12
+
+
+def test_cache_reused_and_invalidated(synthetic_file, tmp_path):
+    cfg = make_cfg(synthetic_file, tmp_path)
+    build_data(cfg, verbose=False)
+    build_data(cfg, verbose=False)
+    cached = sorted((tmp_path / "cache").glob("fields_*.pt"))
+    assert len(cached) == 1, "second build should reuse the cache"
+
+    heat_flux_only = make_cfg(
+        synthetic_file, tmp_path,
+        data=DataConfig(path=str(synthetic_file), forcing=["total_surface_heat_flx"],
+                        normalisation=NormalisationConfig(fit_period=("2000-01", "2003-12")),
+                        cache_dir=str(tmp_path / "cache")),
+    )
+    data = build_data(heat_flux_only, verbose=False)
+    assert data.n_forcing == 1
+    assert len(sorted((tmp_path / "cache").glob("fields_*.pt"))) == 2, "changed data settings need a new cache"
+
+
+def test_split_outside_time_axis_raises(synthetic_file, tmp_path):
+    cfg = make_cfg(synthetic_file, tmp_path, time=TimeConfig(
+        time_axis=("2000-01", "2005-12"), train=("2000-01", "2003-06"), valid=("2003-07", "2003-12"),
+        test=("2004-01", "2005-10"),
+    ))
+    with pytest.raises(ValueError, match="prior months"):
+        build_data(cfg, verbose=False)
+
+
+# =============================================================================
+# Config validation
+# =============================================================================
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (dict(window=WindowConfig(rollout_steps=13, posterior_steps=12)), "rollout_steps"),
+        (dict(loss=LossConfig(terms={"local_mse": 0.0})), "at least one loss term"),
+        (dict(loss=LossConfig(terms={"mae": 1.0})), "Unknown loss terms"),
+        (dict(model=ModelConfig(output_head="resnet")), "Unknown output_head"),
+        (dict(window=WindowConfig(rollout_schedule={5: 4})), "epoch 0"),
+        (dict(window=WindowConfig(rollout_steps=[10, 4], posterior_steps=12)), "at most posterior_steps"),
+        (dict(window=WindowConfig(rollout_schedule={0: 1, 3: [10, 4]}, posterior_steps=12)), "more than posterior"),
+        (dict(window=WindowConfig(rollout_schedule={0: [2, 0]})), "n_trained >= 1"),
+        (dict(window=WindowConfig(rollout_steps=[1, 2, 3])), "n_free, n_trained"),
+    ],
+)
+def test_config_rejects_inconsistent_settings(synthetic_file, tmp_path, overrides, message):
+    with pytest.raises(ValueError, match=message):
+        make_cfg(synthetic_file, tmp_path, **overrides)
+
+
+def test_config_rejects_variable_in_both_roles(synthetic_file, tmp_path):
+    with pytest.raises(ValueError, match="both prognostic and forcing"):
+        make_cfg(synthetic_file, tmp_path, data=DataConfig(path=str(synthetic_file), prognostic=["tau_x"], forcing=["tau_x"]))
+
+
+# =============================================================================
+# Model and losses
+# =============================================================================
+
+@pytest.mark.parametrize("output_head", [None, "spatial_residual"])
+@pytest.mark.parametrize("latent_processor", [None, "latent_residual"])
+def test_model_options_forward_backward(data_and_cfg, output_head, latent_processor):
+    data, cfg = data_and_cfg
+    cfg.model.output_head, cfg.model.latent_processor = output_head, latent_processor
+    try:
+        model = build_model(cfg, data)
+    finally:
+        cfg.model.output_head, cfg.model.latent_processor = None, None
+    prior = torch.randn(2, cfg.window.n_prior * data.n_prognostic, H, W, requires_grad=True)
+    out = model(prior, torch.randn(2, data.n_forcing, H, W), data.fields["mask"])
+    assert out.shape == (2, data.n_prognostic, H, W) and out.dtype == torch.float32
+    out.pow(2).mean().backward()
+    assert torch.isfinite(prior.grad).all()
+
+
+TWO_PROGNOSTIC = ["ocean_heat_content_2d", "tau_x"]
+
+
+def two_prognostic_cfg(synthetic_file, tmp_path, **overrides):
+    """tau_x as a second prognostic variable (tau_y stays forcing)."""
+    return make_cfg(
+        synthetic_file, tmp_path,
+        data=DataConfig(path=str(synthetic_file), prognostic=list(TWO_PROGNOSTIC),
+                        forcing=["total_surface_heat_flx", "tau_y"],
+                        normalisation=NormalisationConfig(fit_period=("2000-01", "2003-12")),
+                        cache_dir=str(tmp_path / "cache")),
+        **overrides,
+    )
+
+
+def test_two_prognostic_variables(synthetic_file, tmp_path):
+    """tau_x as a second prognostic variable: channels, rollout and closure all follow."""
+    cfg = two_prognostic_cfg(synthetic_file, tmp_path)
+    data = build_data(cfg, verbose=False)
+    module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
+    batch = data.windows(next(iter(data.train_dl)))
+    assert batch["prior"].shape[1:3] == (2, 2)
+    loss = module._step(batch, 4, "train")
+    loss.backward()
+    assert torch.isfinite(loss)
+
+
+def test_loss_step_weights(data_and_cfg):
+    data, cfg = data_and_cfg
+    cfg.loss.terms = {"local_mse": [1.0, 1.0, 2.0, 2.0], "heat_closure": 0.5}
+    cfg.loss.step_weights = [1.0, 1.0, 1.0, 3.0]
+    try:
+        terms = {t.name: t.step_weights for t in build_losses(cfg, data)}
+    finally:
+        cfg.loss.terms = {"local_mse": 1.0, "spectral": 0.0, "heat_closure": 0.1}
+        cfg.loss.step_weights = None
+    relative = [2 / 3, 2 / 3, 2 / 3, 2.0]  # step_weights / mean(step_weights)
+    assert set(terms) == {"local_mse", "heat_closure"}  # spectral (0) dropped
+    np.testing.assert_allclose(terms["local_mse"], [a * r for a, r in zip([1, 1, 2, 2], relative)])
+    np.testing.assert_allclose(terms["heat_closure"], [0.5 * r for r in relative])
+
+
+# =============================================================================
+# Training and evaluation
+# =============================================================================
+
+def test_one_epoch_trains(data_and_cfg):
+    data, cfg = data_and_cfg
+    model = build_model(cfg, data)
+    module = build_module(cfg, model, build_losses(cfg, data), data)
+    before = [p.detach().clone() for p in model.parameters()]
+    trainer = build_trainer(cfg)
+    trainer.fit(module, data.train_dl, data.valid_dl)
+    assert torch.isfinite(trainer.callback_metrics["val_loss"])
+    assert "train_heat_closure" in trainer.callback_metrics
+    assert any(not torch.equal(a, b) for a, b in zip(before, model.parameters())), "weights did not change"
+
+
+def test_rollout_schedule():
+    schedule = RolloutSchedule({0: 1, 3: 4, 10: 12, 20: [24, 12]})
+    assert [schedule.steps_for(e) for e in (0, 2, 3, 9, 10, 19, 20, 50)] == [
+        (0, 1), (0, 1), (0, 4), (0, 4), (0, 12), (0, 12), (24, 12), (24, 12)]
+
+
+def test_push_forward_starts_from_the_models_own_state(data_and_cfg):
+    """n_free gradient-free steps, then windows of the next steps from the predicted state."""
+    data, cfg = data_and_cfg
+    a, n_free, n_steps = 0.5, 3, 1
+    module = build_module(cfg, _ScaledPersistence(a, data.n_prognostic), build_losses(cfg, data), data)
+    t0 = data.train_indices[:2]
+    full = data.windows(t0, n_steps=n_free + n_steps)
+    pushed = module.push_forward(t0, n_free, n_steps)
+
+    # next = a * last state, so after k steps the newest state is a^k * the true initial state.
+    initial = full["prior"][:, -1]
+    expected_prior = torch.stack([a ** (n_free - 1) * initial, a**n_free * initial], dim=1)  # n_prior = 2
+    torch.testing.assert_close(pushed["prior"], expected_prior)
+    assert not pushed["prior"].requires_grad
+    # The scored steps are the same months as the tail of the full window.
+    torch.testing.assert_close(pushed["target"], full["target"][:, n_free:])
+    torch.testing.assert_close(pushed["forcing"], full["forcing"][:, n_free:])
+    torch.testing.assert_close(pushed["initial_forcing"], full["forcing"][:, n_free - 1])
+    assert torch.equal(pushed["target_time_index"], full["target_time_index"][:, n_free:])
+
+    # With fewer free steps than prior states, the true states fill the rest.
+    pushed = module.push_forward(t0, 1, n_steps)
+    torch.testing.assert_close(pushed["prior"], torch.stack([initial, a * initial], dim=1))
+
+
+def test_push_forward_keeps_gradients_under_autocast(data_and_cfg):
+    """
+    Autocast caches low-precision weight copies within a step; copies made in the
+    gradient-free steps must not be reused by the scored steps (the loss would
+    have no gradient). CPU autocast (bfloat16) caches the same way as CUDA fp16.
+    """
+    data, cfg = data_and_cfg
+    model = build_model(cfg, data)
+    module = build_module(cfg, model, build_losses(cfg, data), data)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        loss = module._step(data.train_indices[:2], (2, 1), "train")
+    assert loss.requires_grad
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
+
+
+def test_training_with_push_forward(synthetic_file, tmp_path):
+    """A [n_free, n_trained] schedule entry trains, scoring only the trained steps."""
+    cfg = make_cfg(synthetic_file, tmp_path,
+                   window=WindowConfig(n_prior=2, posterior_steps=4, rollout_steps=[2, 2], valid_rollout_steps=4))
+    data = build_data(cfg, verbose=False)
+    model = build_model(cfg, data)
+    module = build_module(cfg, model, build_losses(cfg, data), data)
+    assert module.train_steps == (2, 2) and module.valid_steps == (0, 4)
+    before = [p.detach().clone() for p in model.parameters()]
+    trainer = build_trainer(cfg)
+    trainer.fit(module, data.train_dl, data.valid_dl)
+    assert torch.isfinite(trainer.callback_metrics["train_loss"])
+    assert torch.isfinite(trainer.callback_metrics["val_loss"])
+    assert any(not torch.equal(b, p) for b, p in zip(before, model.parameters())), "weights did not change"
+
+
+def test_skill_test_and_control(data_and_cfg):
+    data, cfg = data_and_cfg
+    model = build_model(cfg, data)
+    skill = run_skill_test(cfg, model, data)
+    assert skill.sizes["time"] == 22  # seeded 2004-01, predicts 2004-02 .. 2005-11
+    assert str(skill.time.values[0])[:7] == "2004-02"
+    name = "ocean_heat_content_2d"
+    land = data.fields["mask"].numpy() == 0
+    assert np.isnan(skill[f"{name}_pred"].values[:, land]).all()
+    ocean = ~land
+    # truth anomaly + climatology = truth; truth matches the file
+    truth_z = data.fields["prognostic"][data.index_of("2004-02"), 0].numpy()
+    std = data.fields["prognostic_std"][data.index_of("2004-02"), 0].numpy()
+    np.testing.assert_allclose(skill[f"{name}_truth_anom"].values[0][ocean], (truth_z * std)[ocean], rtol=1e-5)
+
+    control = run_control(cfg, model, data)
+    assert control.sizes["step"] == 24
+    assert list(control.forcing_month.values[:2]) == ["2002-02", "2002-03"]
+
+
+def test_known_closure_runs(data_and_cfg):
+    data, cfg = data_and_cfg
+    results = check_known_closure(cfg, data, warn_threshold=np.inf)
+    assert set(results) == {"heat"}  # freshwater_closure is off in make_cfg
+    assert len(results["heat"]["by_lead"]) == cfg.window.posterior_steps
+    assert np.isfinite(results["heat"]["mean"])
+
+
+# =============================================================================
+# Per-variable RMSE and the multi-variable evaluation figures
+# =============================================================================
+
+def test_per_variable_error_is_area_weighted_and_adds_no_loss():
+    rng = torch.Generator().manual_seed(0)
+    area = torch.rand(H, W, generator=rng) + 0.5
+    mask = (torch.rand(H, W, generator=rng) > 0.3).float()
+    pred = torch.randn(4, 3, H, W, generator=rng)
+    target = pred.clone()
+    target[:, 1] += 2.0
+    target[:, 2] += 3.0 * (1 - mask)  # error on land only: ignored
+    metric = PerVariableError(3)
+    for _ in range(3):
+        assert metric(pred_t=pred, target_t=target, mask=mask, area=area).item() == 0.0
+    np.testing.assert_allclose(metric.pop_rmse().numpy(), [0.0, 2.0, 0.0], atol=1e-5)
+    assert metric.pop_rmse() is None  # reset after popping
+
+
+def test_rmse_history_per_variable(synthetic_file, tmp_path):
+    """Training records train/val RMSE per variable and epoch, in memory and in metrics.csv."""
+    run_dir = tmp_path / "run"
+    cfg = two_prognostic_cfg(
+        synthetic_file, tmp_path,
+        train=TrainConfig(batch_size=8, max_epochs=2, gpu_check=False, run_dir=str(run_dir)),
+    )
+    data = build_data(cfg, verbose=False)
+    module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
+    build_trainer(cfg).fit(module, data.train_dl, data.valid_dl)
+
+    history = module.rmse_history
+    assert len(history) == 2 * 2 * len(TWO_PROGNOSTIC)  # epochs x stages x variables
+    assert set(history["variable"]) == set(TWO_PROGNOSTIC)
+    assert set(history["stage"]) == {"train", "val"}
+    assert sorted(set(history["epoch"])) == [0, 1]
+    assert np.isfinite(history["rmse"]).all() and (history["rmse"] > 0).all()
+
+    metrics = pd.read_csv(run_dir / "metrics.csv")
+    for stage in ("train", "val"):
+        for name in TWO_PROGNOSTIC:
+            assert f"{stage}_rmse_{name}" in metrics
+
+    for source in (history, run_dir):
+        fig = plot_rmse_by_epoch(source, TWO_PROGNOSTIC)
+        assert len(fig.axes) == len(TWO_PROGNOSTIC)
+        assert all(len(ax.lines) == 2 for ax in fig.axes)  # training + validation
+        plt.close(fig)
+
+
+def test_evaluation_figures_for_every_variable(synthetic_file, tmp_path):
+    cfg = two_prognostic_cfg(synthetic_file, tmp_path)
+    data = build_data(cfg, verbose=False)
+    skill = run_skill_test(cfg, build_model(cfg, data), data)
+    periods = ["2004-06", "2005-01", "2005"]
+
+    for name in TWO_PROGNOSTIC:
+        fig = plot_skill_evaluation(skill, name, periods, {"ocean_heat_content_2d": 2e9}, None)
+        maps = [ax for ax in fig.axes if ax.collections and ax.get_label() != "<colorbar>"]
+        assert len(maps) == 3 * len(periods)
+        timeseries = [ax for ax in fig.axes if len(ax.lines) >= 2]
+        assert len(timeseries) == 1  # predicted, truth and persistence, full width underneath
+        labels = [line.get_label() for line in timeseries[0].lines]
+        assert labels[:3] == ["Predicted", "Truth", "Persistence"]
+        assert timeseries[0].lines[2].get_linestyle() == "--"
+        path = tmp_path / f"{name}_skill_evaluation.png"
+        fig.savefig(path)
+        assert path.stat().st_size > 0
+        plt.close(fig)
+
+    fig = plot_global_rmse_all_variables(skill, TWO_PROGNOSTIC)
+    assert len(fig.axes) == len(TWO_PROGNOSTIC)
+    assert all(np.isfinite(ax.lines[0].get_ydata()).all() for ax in fig.axes)
+    plt.close(fig)
+
+
+# =============================================================================
+# Heat and freshwater closures as independent loss terms
+# =============================================================================
+
+HEAT_AND_FRESHWATER = dict(
+    prognostic=["ocean_heat_content_2d", "ocean_freshwater_content_2d"],
+    forcing=["total_surface_heat_flx", "ocean_freshwater_flux", "tau_x"],
+)
+
+
+def closure_cfg(synthetic_file, tmp_path, terms, **data_overrides):
+    variables = {**HEAT_AND_FRESHWATER, **data_overrides}
+    return make_cfg(
+        synthetic_file, tmp_path,
+        data=DataConfig(path=str(synthetic_file), **variables,
+                        normalisation=NormalisationConfig(fit_period=("2000-01", "2003-12")),
+                        cache_dir=str(tmp_path / "cache")),
+        loss=LossConfig(terms=terms),
+    )
+
+
+def test_global_closure_term_is_renamed(synthetic_file, tmp_path):
+    with pytest.raises(ValueError, match="heat_closure"):
+        closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0, "global_closure": 0.1})
+
+
+def test_closure_needs_its_variables(synthetic_file, tmp_path):
+    with pytest.raises(ValueError, match="ocean_freshwater_content_2d"):
+        closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0, "freshwater_closure": 0.1},
+                    prognostic=["ocean_heat_content_2d"])
+    with pytest.raises(ValueError, match="ocean_freshwater_flux"):
+        closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0, "freshwater_closure": 0.1},
+                    forcing=["total_surface_heat_flx", "tau_x"],
+                    prognostic=["ocean_heat_content_2d", "ocean_freshwater_content_2d"])
+    # An inactive closure (weight 0) needs nothing.
+    closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0, "freshwater_closure": 0.0},
+                prognostic=["ocean_heat_content_2d"])
+
+
+def test_custom_budget_becomes_a_loss_term(synthetic_file, tmp_path):
+    with pytest.raises(ValueError, match="Unknown loss terms"):
+        closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0, "fw2_closure": 0.2})
+    cfg = closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0})
+    cfg.loss.closures["fw2"] = ClosureConfig("ocean_freshwater_content_2d", "ocean_freshwater_flux", 1.0, 1.0)
+    cfg.loss.terms["fw2_closure"] = 0.2
+    cfg.validate()
+    assert set(cfg.active_closures()) == {"fw2"}
+
+
+def test_heat_and_freshwater_closures_train_with_independent_weights(synthetic_file, tmp_path):
+    cfg = closure_cfg(synthetic_file, tmp_path,
+                      {"local_mse": 1.0, "heat_closure": 0.1, "freshwater_closure": [0.0, 0.0, 0.3, 0.3]})
+    data = build_data(cfg, verbose=False)
+    assert data.fields["forcing_std"].shape[1] == len(HEAT_AND_FRESHWATER["forcing"])
+    losses = build_losses(cfg, data)
+    weights = {t.name: t.step_weights for t in losses}
+    assert weights["heat_closure"] == [0.1] * 4
+    assert weights["freshwater_closure"] == [0.0, 0.0, 0.3, 0.3]
+
+    module = build_module(cfg, build_model(cfg, data), losses, data)
+    assert set(module.closure_std) == {"heat", "freshwater"}
+    # Each budget gets its own content and flux std (OHC and FWC are very different sizes).
+    assert not torch.equal(module.closure_std["heat"][0], module.closure_std["freshwater"][0])
+    batch = data.windows(next(iter(data.train_dl)))
+    loss = module._step(batch, 4, "train")
+    loss.backward()
+    assert torch.isfinite(loss)
+
+    results = check_known_closure(cfg, data, warn_threshold=np.inf, max_batches=2)
+    assert set(results) == {"heat", "freshwater"}
+    assert all(np.isfinite(r["mean"]) for r in results.values())
+
+
+def test_only_active_closures_use_gpu_buffers(synthetic_file, tmp_path):
+    cfg = closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0, "freshwater_closure": 0.1})
+    data = build_data(cfg, verbose=False)
+    module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
+    assert module.budgets == ["freshwater"]
+    assert not hasattr(module, "heat_content_std")
+
+
+def test_plot_scales_are_automatic(data_and_cfg):
+    """No fixed colour limits: each variable's maps scale to its own anomalies."""
+    from Experiment import plot_snapshots
+
+    data, cfg = data_and_cfg
+    skill = run_skill_test(cfg, build_model(cfg, data), data)
+    fig = plot_snapshots(skill, ["2004-06"])
+    vmax = fig.axes[0].collections[0].get_clim()[1]
+    truth = np.abs(skill["ocean_heat_content_2d_truth_anom"].values)
+    assert vmax == pytest.approx(np.nanquantile(truth, 0.99))
+    plt.close(fig)
+
+
+# =============================================================================
+# Architecture: widths scale with the variables, residual prediction,
+# full-resolution input skip
+# =============================================================================
+
+def test_unet_widths_scale_with_input_channels(synthetic_file, tmp_path):
+    for cfg in (make_cfg(synthetic_file, tmp_path), two_prognostic_cfg(synthetic_file, tmp_path)):
+        data = build_data(cfg, verbose=False)
+        unet = build_model(cfg, data).backbone
+        in_ch = cfg.window.n_prior * data.n_prognostic + data.n_forcing
+        width1 = cfg.model.width_multiplier * in_ch
+        assert unet.enc1.conv.in_channels == in_ch
+        assert unet.enc1.conv.out_channels == width1
+        assert unet.enc2.conv.out_channels == 2 * width1
+        assert unet.latent_channel_count == unet.enc3.out_channels == 4 * width1
+        assert unet.dec3.conv.in_channels == width1  # no raw-input skip at full resolution
+        assert unet.dec3.conv.out_channels == data.n_prognostic
+
+
+def test_width_multiplier_must_be_positive(synthetic_file, tmp_path):
+    with pytest.raises(ValueError, match="width_multiplier"):
+        make_cfg(synthetic_file, tmp_path, model=ModelConfig(width_multiplier=0))
+
+
+def test_zero_backbone_output_persists_last_state(data_and_cfg):
+    """The emulator predicts the change: a backbone that outputs 0 persists the last prior state."""
+    data, cfg = data_and_cfg
+    model = build_model(cfg, data)
+    with torch.no_grad():
+        model.backbone.dec3.conv.weight.zero_()
+        model.backbone.dec3.conv.bias.zero_()
+    prior = torch.randn(2, cfg.window.n_prior * data.n_prognostic, H, W)
+    out = model(prior, torch.randn(2, data.n_forcing, H, W), data.fields["mask"])
+    torch.testing.assert_close(out, prior[:, -data.n_prognostic :])
+
+
+
+# =============================================================================
+# Speed and memory: lean partial convolution, 3x3 stacks, gradient
+# checkpointing, channels_last, compile
+# =============================================================================
+
+@pytest.mark.parametrize("kernel_size,stride,padding", [(3, 1, 1), (4, 2, 1), (7, 1, 3)])
+def test_mask_aware_conv_fills_land_then_convolves(kernel_size, stride, padding):
+    """No renormalisation: the output is an ordinary convolution of the land-filled, padded input."""
+    from Emulator import PartialConv2d
+    from Emulator.om2_model_utils import fill_land
+
+    torch.manual_seed(0)
+    layer = PartialConv2d(5, 6, kernel_size, stride, padding, padding_mode="zeros")
+    x = torch.randn(3, 5, H, W)
+    mask = (torch.rand(1, 1, H, W) > 0.3).float()
+    expected = layer.conv(layer._pad(fill_land(x, mask)))
+    for m in (mask, mask.expand(3, 1, H, W)):  # shared (1, 1, H, W) or per-sample copies of one mask
+        out, new_mask = layer(x, m)
+        torch.testing.assert_close(out, expected)
+    if stride == 1:
+        assert new_mask is m  # land is refilled at every layer, not dilated
+    else:
+        # A coarse cell is ocean if any fine cell in it is ocean.
+        torch.testing.assert_close(new_mask[:1], torch.nn.functional.adaptive_max_pool2d(mask, out.shape[-2:]))
+
+
+def test_output_ignores_input_values_on_land():
+    """Land inputs are overwritten (Neumann or Dirichlet) before every layer, so they cannot affect the output."""
+    from Emulator import UNet
+
+    torch.manual_seed(0)
+    unet = UNet(input_channel_count=3, output_channel_count=2, padding_mode="zeros", dirichlet={1: 0.5}).eval()
+    mask = (torch.rand(1, 1, H, W) > 0.3).float()
+    x = torch.randn(2, 3, H, W)
+    noise_on_land = torch.randn_like(x) * 100 * (1 - mask)
+    with torch.no_grad():
+        torch.testing.assert_close(unet(x + noise_on_land, mask), unet(x, mask))
+
+
+def test_nearest_ocean_index_wraps_in_longitude():
+    from Emulator.om2_model_utils import nearest_ocean_index
+
+    mask = torch.zeros(4, 10)
+    mask[2, 9] = 1.0  # one ocean cell, in the last column
+    mask[0, 5] = 1.0
+    index = nearest_ocean_index(mask).reshape(4, 10)
+    assert index[2, 9] == 2 * 10 + 9 and index[0, 5] == 5        # ocean cells map to themselves
+    assert index[2, 0] == 2 * 10 + 9                             # nearest across the seam, one cell away
+    assert index[0, 4] == 5                                      # nearest within the row
+
+
+def test_fill_land_neumann_and_dirichlet():
+    from Emulator.om2_model_utils import fill_land
+
+    mask = torch.tensor([[1.0, 0.0, 0.0, 1.0, 1.0]])  # (1, 5): land at columns 1-2
+    x = torch.tensor([[[[1.0, -7.0, -7.0, 4.0, 5.0]], [[2.0, -7.0, -7.0, 6.0, 8.0]]]])  # (1, 2, 1, 5)
+    out = fill_land(x, mask, dirichlet={1: 0.25})
+    torch.testing.assert_close(out[0, 0, 0], torch.tensor([1.0, 1.0, 4.0, 4.0, 5.0]))    # Neumann: nearest ocean value
+    torch.testing.assert_close(out[0, 1, 0], torch.tensor([2.0, 0.25, 0.25, 6.0, 8.0]))  # Dirichlet: fixed on land
+    torch.testing.assert_close(out[..., [0, 3, 4]], x[..., [0, 3, 4]])                  # ocean untouched
+
+
+def test_boundary_conditions_map_to_input_channels(synthetic_file, tmp_path):
+    """Dirichlet variables mark every input channel that carries them: each prior level, or the forcing slot."""
+    from Experiment.models import dirichlet_channels
+
+    cfg = two_prognostic_cfg(synthetic_file, tmp_path)  # prognostic [OHC, tau_x], forcing [heat flux, tau_y], n_prior 2
+    cfg.data.boundary_conditions = {"tau_x": "dirichlet", "tau_y": ["dirichlet", 0.5], "ocean_heat_content_2d": "neumann"}
+    cfg.validate()
+    expected = {1: 0.0, 3: 0.0, 5: 0.5}  # tau_x at prior levels 0 and 1; tau_y is forcing channel 1 after 4 prior channels
+    assert dirichlet_channels(cfg) == expected
+    data = build_data(cfg, verbose=False)
+    assert build_model(cfg, data).backbone.enc1.dirichlet == expected
+    assert build_model(cfg, data).backbone.dec2.dirichlet == {}  # hidden layers are always Neumann
+
+
+@pytest.mark.parametrize("conditions,message", [
+    ({"not_a_variable": "dirichlet"}, "not a prognostic or forcing variable"),
+    ({"tau_x": "robin"}, "use 'neumann', 'dirichlet'"),
+])
+def test_invalid_boundary_conditions_are_rejected(synthetic_file, tmp_path, conditions, message):
+    cfg = make_cfg(synthetic_file, tmp_path)
+    cfg.data.boundary_conditions = conditions
+    with pytest.raises(ValueError, match=message):
+        cfg.validate()
+
+
+def test_unet_has_no_large_kernels(data_and_cfg):
+    data, cfg = data_and_cfg
+    sizes = {m.kernel_size for m in build_model(cfg, data).modules() if isinstance(m, torch.nn.Conv2d)}
+    assert max(max(k) for k in sizes) <= 4
+
+
+def test_checkpointed_rollout_gives_same_loss_and_gradients(data_and_cfg):
+    from Emulator import total_rollout_loss
+
+    data, cfg = data_and_cfg
+    model = build_model(cfg, data)
+    losses = build_losses(cfg, data)
+    module = build_module(cfg, model, losses, data)
+    batch = data.windows(next(iter(data.train_dl)))
+    results = []
+    # No checkpointing, every step checkpointed, and steps 0-1 checkpointed with 2-3 kept.
+    for checkpoint_steps, steps_in_memory in ((False, 0), (True, 0), (True, 2)):
+        model.zero_grad()
+        loss = total_rollout_loss(
+            model=model,
+            initial_prior_states=batch["prior"].flatten(1, 2),
+            forcing_sequence=batch["forcing"],
+            target_sequence=batch["target"],
+            mask=module.mask,
+            losses=losses,
+            n_steps=4,
+            target_time_indices=batch["target_time_index"],
+            area=module.area,
+            closure_std=module.closure_std,
+            dt_seconds=cfg.loss.seconds_per_step,
+            initial_forcing=batch["initial_forcing"],
+            n_prognostic=data.n_prognostic,
+            checkpoint_steps=checkpoint_steps,
+            steps_in_memory=steps_in_memory,
+        )
+        loss.backward()
+        for term in losses:
+            term.pop_running()
+        results.append((loss.detach(), [p.grad.clone() for p in model.parameters() if p.requires_grad]))
+    for loss, grads in results[1:]:
+        torch.testing.assert_close(loss, results[0][0])
+        for a, b in zip(grads, results[0][1]):
+            torch.testing.assert_close(a, b)
+
+
+def test_checkpointed_training_runs(synthetic_file, tmp_path):
+    cfg = make_cfg(synthetic_file, tmp_path,
+                   train=TrainConfig(batch_size=8, max_epochs=1, gpu_check=False, checkpoint_rollout_steps=True,
+                                     rollout_steps_in_memory=2))
+    data = build_data(cfg, verbose=False)
+    module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
+    build_trainer(cfg).fit(module, data.train_dl, data.valid_dl)
+    assert len(module.rmse_history) > 0
+
+
+def test_channels_last_gives_same_output(synthetic_file, tmp_path):
+    outputs = []
+    prior = torch.randn(2, 2, H, W)
+    forcing = torch.randn(2, len(FORCING), H, W)
+    for channels_last in (False, True):
+        cfg = make_cfg(synthetic_file, tmp_path, model=ModelConfig(channels_last=channels_last))
+        data = build_data(cfg, verbose=False)
+        model = build_model(cfg, data)  # same seed -> same weights
+        outputs.append(model(prior, forcing, data.fields["mask"]))
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=1e-4, atol=1e-5)
+
+
+def test_compiled_model_keeps_plain_state_dict(data_and_cfg):
+    """torch.compile is lazy, so building the wrapper is cheap; checkpoints must not change keys."""
+    data, cfg = data_and_cfg
+    model = build_model(cfg, data)
+    plain = build_module(cfg, model, build_losses(cfg, data), data)
+    cfg.train.compile_model = True
+    try:
+        compiled = build_module(cfg, model, build_losses(cfg, data), data)
+    finally:
+        cfg.train.compile_model = False
+    assert compiled._run_model is not compiled.model
+    assert list(compiled.state_dict()) == list(plain.state_dict())
+
+
+# =============================================================================
+# Data pipeline: index batches, windows cut on the module's device
+# =============================================================================
+
+def test_dataloaders_yield_initial_months(data_and_cfg):
+    data, cfg = data_and_cfg
+    batch = next(iter(data.valid_dl))
+    assert batch.dtype == torch.long and batch.ndim == 1
+    torch.testing.assert_close(batch, data.valid_indices[: cfg.train.batch_size])
+
+
+def test_windows_cut_only_the_steps_in_use(data_and_cfg):
+    data, cfg = data_and_cfg
+    t0 = data.train_indices[:3]
+    full = data.windows(t0)
+    short = data.windows(t0, n_steps=2)
+    assert full["target"].shape[1] == cfg.window.posterior_steps
+    assert short["target"].shape[1] == short["forcing"].shape[1] == 2
+    for key in ("prior", "initial_forcing"):
+        torch.testing.assert_close(short[key], full[key])
+    torch.testing.assert_close(short["target"], full["target"][:, :2])
+    torch.testing.assert_close(short["forcing"], full["forcing"][:, :2])
+    torch.testing.assert_close(short["target_time_index"], full["target_time_index"][:, :2])
+
+
+def test_module_cuts_windows_from_its_own_fields(data_and_cfg):
+    """An index batch gives the same loss as the equivalent window dict; the fields stay out of checkpoints."""
+    data, cfg = data_and_cfg
+    module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
+    t0 = next(iter(data.train_dl))
+    with torch.no_grad():
+        from_indices = module._step(t0, 3, "val")
+        from_windows = module._step(data.windows(t0, n_steps=3), 3, "val")
+    torch.testing.assert_close(from_indices, from_windows)
+    keys = set(module.state_dict())
+    assert "prognostic_z" not in keys and "forcing_z" not in keys
+    assert module.prognostic_z.data_ptr() == data.fields["prognostic"].data_ptr()  # no CPU copy
+
+
+def test_rollout_steps_in_memory_must_be_non_negative(synthetic_file, tmp_path):
+    with pytest.raises(ValueError, match="rollout_steps_in_memory"):
+        make_cfg(synthetic_file, tmp_path, train=TrainConfig(rollout_steps_in_memory=-1))
+
+
+SPECTRUM_LAT = np.linspace(-70, 80, H)  # the synthetic grid's latitudes
+
+
+def _reference_band_energy(field, mask):
+    """Band energies by explicit loops over rows and harmonics (no index_add)."""
+    from Emulator import zonal_wavenumber_bands
+
+    rows, band, _, k = zonal_wavenumber_bands(SPECTRUM_LAT, field.shape[-1])
+    n_lon, n_harmonics = field.shape[-1], field.shape[-1] // 2
+    spectrum = torch.fft.rfft(field * mask, dim=-1)
+    energy = [field.new_zeros(field.shape[:-2]) for _ in range(k.size)]
+    for i, row in enumerate(rows):
+        cos_lat = np.cos(np.deg2rad(SPECTRUM_LAT[row]))
+        for n in range(1, n_harmonics + 1):
+            pair = 2.0 if n < n_lon / 2 else 1.0  # +n and -n; Nyquist is alone
+            power = spectrum[..., row, n].abs() ** 2 * (cos_lat * pair / n_lon**2)
+            energy[band[i * n_harmonics + n - 1]] = energy[band[i * n_harmonics + n - 1]] + power
+    return torch.stack(energy, dim=-1)
+
+
+def test_spectral_loss_is_log_band_energy_mse_with_checkpointing():
+    """Value and gradient (through the checkpointed path) match an explicit loop implementation."""
+    from Emulator import spectral_loss
+
+    g = torch.Generator().manual_seed(3)
+    mask = (torch.rand(H, W, generator=g) > 0.3).float()
+    pred = torch.randn(2, 3, H, W, generator=g, requires_grad=True)
+    target = torch.randn(2, 3, H, W, generator=g)
+
+    def reference(pred_t):
+        p, t = _reference_band_energy(pred_t, mask), _reference_band_energy(target, mask)
+        floor = 1e-8 * t.sum(-1, keepdim=True) + 1e-20
+        return ((torch.log10(p + floor) - torch.log10(t + floor)) ** 2).mean()
+
+    expected = reference(pred)
+    (expected_grad,) = torch.autograd.grad(expected, pred)
+    loss = spectral_loss(weight=1.0, latitude=SPECTRUM_LAT)(pred_t=pred, target_t=target, mask=mask, rollout_step=0)
+    (grad,) = torch.autograd.grad(loss, pred)
+    torch.testing.assert_close(loss, expected)
+    torch.testing.assert_close(grad, expected_grad)
+
+
+def test_spectral_loss_ignores_phase_and_penalises_lost_energy():
+    """Shifting a field in longitude costs nothing; halving its amplitude costs (log10 1/4)^2 in every band."""
+    from Emulator import spectral_loss
+
+    loss_fn = spectral_loss(weight=1.0, latitude=SPECTRUM_LAT)
+    mask = torch.ones(H, W)
+    target = torch.randn(2, 1, H, W, generator=torch.Generator().manual_seed(4))
+    shifted = torch.roll(target, shifts=7, dims=-1)  # longitude is periodic
+    assert loss_fn(pred_t=shifted, target_t=target, mask=mask, rollout_step=0) < 1e-10
+    torch.testing.assert_close(
+        loss_fn(pred_t=0.5 * target, target_t=target, mask=mask, rollout_step=0),
+        torch.tensor(np.log10(0.25) ** 2, dtype=torch.float32),
+    )
+
+
+def test_spectral_loss_runs_in_half_precision_on_any_grid_size():
+    """Half-precision inputs on a non-power-of-two grid (cuFFT half needs powers of two): computed in float32."""
+    from Emulator import spectral_loss
+
+    pred = torch.randn(1, 2, H, W).half()
+    loss = spectral_loss(weight=1.0, latitude=SPECTRUM_LAT)(pred_t=pred, target_t=pred.float() * 2, mask=torch.ones(H, W),
+                                                             rollout_step=0)
+    assert loss.dtype == torch.float32 and torch.isfinite(loss)
+
+
+def test_wavenumber_bands_are_physical_across_resolutions():
+    """Rows south of the tripole only, and the same bands (same k) at 1 deg and 1/4 deg."""
+    from Emulator import zonal_wavenumber_bands
+
+    coarse_lat, fine_lat = np.arange(-77.5, 90, 1.0), np.arange(-77.875, 90, 0.25)
+    rows, band, weight, k_coarse = zonal_wavenumber_bands(coarse_lat, 360)
+    assert coarse_lat[rows].min() >= -65 and coarse_lat[rows].max() <= 60
+    assert band.size == rows.size * 180 and band.max() == k_coarse.size - 1
+    _, _, _, k_fine = zonal_wavenumber_bands(fine_lat, 1440)
+    # Both grids have a row at 0.125 deg of the equator, so the band edges coincide;
+    # the 1/4 deg grid adds bands at higher k.
+    torch.testing.assert_close(torch.tensor(k_fine[: k_coarse.size]), torch.tensor(k_coarse), rtol=1e-3, atol=0)
+    assert k_fine.size > k_coarse.size
+
+
+def test_training_with_spectral_loss(data_and_cfg):
+    data, cfg = data_and_cfg
+    cfg.loss.terms = {"local_mse": 1.0, "spectral": 0.5, "heat_closure": 0.1}
+    try:
+        model = build_model(cfg, data)
+        module = build_module(cfg, model, build_losses(cfg, data), data)
+        trainer = build_trainer(cfg)
+        trainer.fit(module, data.train_dl, data.valid_dl)
+    finally:
+        cfg.loss.terms = {"local_mse": 1.0, "spectral": 0.0, "heat_closure": 0.1}
+    assert torch.isfinite(trainer.callback_metrics["val_loss"])
+    assert torch.isfinite(trainer.callback_metrics["train_spectral"])
+
+
+def test_skill_diagnostics_and_spectra(synthetic_file, tmp_path):
+    from Experiment import plot_skill_diagnostics, plot_spectra, skill_diagnostics, skill_summary, zonal_spectrum
+
+    cfg = two_prognostic_cfg(synthetic_file, tmp_path)
+    data = build_data(cfg, verbose=False)
+    skill = run_skill_test(cfg, build_model(cfg, data), data)
+    name = "ocean_heat_content_2d"
+
+    d = skill_diagnostics(skill, name)
+    xr.testing.assert_allclose(d.rmse_climatology, d.amplitude_truth)  # zero anomaly: error = truth's RMS
+    assert (np.abs(d.acc_emulator) <= 1 + 1e-6).all() and (np.abs(d.acc_persistence) <= 1 + 1e-6).all()
+    truth_self = skill.assign({f"{name}_pred_anom": skill[f"{name}_truth_anom"]})
+    np.testing.assert_allclose(skill_diagnostics(truth_self, name).acc_emulator, 1.0, rtol=1e-5)
+
+    summary = skill_summary(skill, TWO_PROGNOSTIC)
+    assert list(summary.index) == TWO_PROGNOSTIC
+    assert np.isfinite(summary["amplitude_ratio_last_year"]).all()
+
+    # Parseval: PSD integrated over the bands = area-weighted mean zonal variance (zonal mean removed).
+    anomaly = skill[f"{name}_truth_anom"].fillna(0.0)
+    k, psd = zonal_spectrum(anomaly)
+    half = 0.5 / 8
+    band_rows = (anomaly.latitude >= -65) & (anomaly.latitude <= 60)
+    a = anomaly.where(band_rows, drop=True)
+    zonal_var = ((a - a.mean("longitude")) ** 2).mean("longitude").mean("time")
+    cos_lat = np.cos(np.deg2rad(a.latitude))
+    expected = float((zonal_var * cos_lat).sum() / cos_lat.sum())
+    np.testing.assert_allclose((psd * k * (10**half - 10**-half)).sum(), expected, rtol=1e-4)
+
+    for fig in (plot_skill_diagnostics(skill, TWO_PROGNOSTIC), plot_spectra(skill, TWO_PROGNOSTIC)):
+        plotted = [ax for ax in fig.axes if ax.lines]
+        assert len(plotted) == 3 * len(TWO_PROGNOSTIC)
+        assert all(np.isfinite(line.get_ydata()).all() for ax in plotted for line in ax.lines)
+        plt.close(fig)
+
+
+# =============================================================================
+# Stability diagnostic: leading growth mode
+# =============================================================================
+
+class _ScaledPersistence(torch.nn.Module):
+    """next state = a * last state: every perturbation grows by exactly a per step."""
+
+    def __init__(self, a, n_prognostic):
+        super().__init__()
+        self.a, self.n_prognostic = a, n_prognostic
+        self.dummy = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, prior, forcing, mask):
+        return self.a * prior[:, -self.n_prognostic :]
+
+
+@pytest.mark.parametrize("a", [0.9, 1.2])
+def test_leading_growth_mode_recovers_known_growth(data_and_cfg, a):
+    from Experiment import leading_growth_mode
+
+    data, _ = data_and_cfg
+    result = leading_growth_mode(_ScaledPersistence(a, data.n_prognostic), data, "2004-01")
+    assert result["growth"] == pytest.approx(a, rel=1e-3)
+    land = data.fields["mask"].numpy() == 0
+    assert np.isnan(result["mode"][:, land]).all()
+    assert np.isfinite(result["mode"][:, ~land]).all()
+
+
+def test_leading_growth_mode_runs_on_the_emulator(data_and_cfg):
+    from Experiment import leading_growth_mode, plot_growth_mode
+
+    data, cfg = data_and_cfg
+    result = leading_growth_mode(build_model(cfg, data), data, "2004-01", n_iter=5)
+    assert np.isfinite(result["growth"]) and result["growth"] > 0
+    assert result["mode"].shape == (data.n_prognostic, H, W)
+    plt.close(plot_growth_mode(result, data))
+
+
+# =============================================================================
+# Grid topology: periodic longitude, tripolar north fold
+# =============================================================================
+
+def test_padding_follows_the_tripolar_grid():
+    """Ghost rows above the top row are the top rows reversed in x; x wraps; the south edge is zero."""
+    from Emulator import PartialConv2d
+
+    layer = PartialConv2d(1, 1, kernel_size=5, padding=2, padding_mode="zeros")
+    t = torch.arange(6 * 8, dtype=torch.float32).reshape(1, 1, 6, 8)
+    padded = layer._pad(t)                      # (1, 1, 10, 12)
+    interior = padded[..., 2:-2]
+    torch.testing.assert_close(interior[..., 2:-2, :], t)                           # original field
+    torch.testing.assert_close(interior[..., -2, :], torch.flip(t[..., -1, :], dims=(-1,)))  # first ghost row
+    torch.testing.assert_close(interior[..., -1, :], torch.flip(t[..., -2, :], dims=(-1,)))  # second ghost row
+    assert (interior[..., :2, :] == 0).all()                                        # south edge
+    torch.testing.assert_close(padded[..., :2], padded[..., -4:-2])                 # x wraps
+    torch.testing.assert_close(padded[..., -2:], padded[..., 2:4])
+
+
+@pytest.mark.parametrize("kernel_size,stride,padding", [(3, 1, 1), (4, 2, 1)])
+def test_partial_conv_respects_the_grid_symmetry(kernel_size, stride, padding):
+    """Rolling by half the grid width is a symmetry of the periodic, folded grid: the output rolls with it."""
+    from Emulator import PartialConv2d
+
+    torch.manual_seed(0)
+    layer = PartialConv2d(3, 4, kernel_size, stride, padding, padding_mode="zeros")
+    x = torch.randn(2, 3, H, W)
+    # All ocean: this tests the grid topology; ties in the nearest-ocean land
+    # fill are broken by scan order, which a roll changes.
+    mask = torch.ones(1, 1, H, W)
+    shift = W // 2
+    out, new_mask = layer(x, mask)
+    out_rolled, mask_rolled = layer(torch.roll(x, shift, dims=-1), torch.roll(mask, shift, dims=-1))
+    torch.testing.assert_close(out_rolled, torch.roll(out, shift // stride, dims=-1))
+
+
+def test_periodic_upsampling_matches_interpolating_a_tiled_field():
+    from Emulator.om2_model_utils import upsample_periodic_x
+
+    x = torch.randn(2, 3, 5, 10)
+    tiled = torch.cat([x, x, x], dim=-1)  # three copies side by side: the middle one has true neighbours
+    expected = torch.nn.functional.interpolate(tiled, size=(10, 60), mode="bilinear", align_corners=False)[..., 20:40]
+    torch.testing.assert_close(upsample_periodic_x(x, (10, 20)), expected)
+
+
+def test_unet_respects_the_grid_symmetry():
+    """The whole backbone has no seam: rolling inputs and mask by half the width rolls the output by half."""
+    from Emulator import UNet
+
+    torch.manual_seed(0)
+    h, w = 16, 32  # width divisible by 8 so the half-width roll is exact at every UNet level
+    unet = UNet(input_channel_count=3, output_channel_count=2, padding_mode="zeros").eval()
+    x = torch.randn(1, 3, h, w)
+    mask = torch.ones(1, 1, h, w)  # all ocean: see test_partial_conv_respects_the_grid_symmetry
+    with torch.no_grad():
+        out = unet(x, mask)
+        out_rolled = unet(torch.roll(x, w // 2, dims=-1), torch.roll(mask, w // 2, dims=-1))
+    torch.testing.assert_close(out_rolled, torch.roll(out, w // 2, dims=-1), rtol=1e-4, atol=1e-5)
+
+
+# =============================================================================
+# Persistence baseline
+# =============================================================================
+
+def test_persistence_rmse_matches_direct_computation(data_and_cfg):
+    from Experiment import persistence_rmse
+
+    data, cfg = data_and_cfg
+    f = data.fields
+    t0s, n_steps = data.valid_indices.tolist(), cfg.window.posterior_steps
+    weight = (f["area"].double() * f["mask"].double()).numpy()
+    weight /= weight.sum()
+    squared, count = np.zeros(data.n_prognostic), 0
+    for t0 in t0s:
+        z0 = f["prognostic"][t0].double().numpy()
+        for t in range(t0 + 1, t0 + n_steps + 1):
+            squared += (((z0 - f["prognostic"][t].double().numpy()) ** 2) * weight).sum(axis=(-2, -1))
+            count += 1
+    expected = np.sqrt(squared / count)
+    result = persistence_rmse(cfg, data, n_steps=n_steps)
+    np.testing.assert_allclose([result[n] for n in f["prognostic_names"]], expected, rtol=1e-5)
+
+
+def test_skill_test_includes_persistence(data_and_cfg):
+    data, cfg = data_and_cfg
+    skill = run_skill_test(cfg, build_model(cfg, data), data)
+    name = "ocean_heat_content_2d"
+    persist = skill[f"{name}_persist_anom"].values
+    np.testing.assert_allclose(persist, np.broadcast_to(persist[0], persist.shape))  # held fixed
+    t0 = data.index_of(cfg.time.test[0])
+    ocean = data.fields["mask"].numpy() > 0
+    seed_anomaly = (data.fields["prognostic"][t0, 0] * data.fields["prognostic_std"][t0, 0]).numpy()
+    np.testing.assert_allclose(persist[0][ocean], seed_anomaly[ocean], rtol=1e-5)
+
+    fig = plot_global_rmse_all_variables(skill, [name])
+    lines = {line.get_label(): line for line in fig.axes[0].lines}
+    assert set(lines) == {"Emulator", "Persistence", "Climatology (zero anomaly)"}
+    # Zero anomaly: the error is the truth's area-weighted RMS anomaly.
+    truth_anom = skill[f"{name}_truth_anom"]
+    area = skill["area"].where(truth_anom.isel(time=0).notnull(), 0.0)
+    expected = np.sqrt((truth_anom.fillna(0.0) ** 2 * area).sum(("latitude", "longitude")) / area.sum())
+    np.testing.assert_allclose(lines["Climatology (zero anomaly)"].get_ydata(), expected.values, rtol=1e-5)
+    plt.close(fig)
+
+
+def test_climatology_rmse_matches_direct_computation(data_and_cfg):
+    from Experiment import climatology_rmse
+
+    data, cfg = data_and_cfg
+    f = data.fields
+    t0s, n_steps = data.valid_indices.tolist(), cfg.window.posterior_steps
+    weight = (f["area"].double() * f["mask"].double()).numpy()
+    weight /= weight.sum()
+    targets = [f["prognostic"][t].double().numpy() for t0 in t0s for t in range(t0 + 1, t0 + n_steps + 1)]
+    expected = np.sqrt(np.mean([((z**2) * weight).sum(axis=(-2, -1)) for z in targets], axis=0))
+    result = climatology_rmse(cfg, data, n_steps=n_steps)
+    np.testing.assert_allclose([result[n] for n in f["prognostic_names"]], expected, rtol=1e-5)
+
+
+def test_rmse_by_epoch_draws_baselines():
+    history = pd.DataFrame([{"epoch": e, "stage": s, "variable": "v", "rmse": 1.0 / (e + 1)}
+                            for e in range(3) for s in ("train", "val")])
+    fig = plot_rmse_by_epoch(history, ["v"], baselines={"Persistence": {"v": 0.5}, "Climatology": {"v": 0.4}})
+    labels = [line.get_label() for line in fig.axes[0].lines]
+    assert labels == ["Training", "Validation", "Persistence", "Climatology"]
+    plt.close(fig)
+
+
+# =============================================================================
+# Cached land levels and channels_last fill
+# =============================================================================
+
+def test_unet_caches_land_levels_until_the_mask_changes():
+    from Emulator import UNet
+
+    torch.manual_seed(0)
+    unet = UNet(input_channel_count=3, output_channel_count=2, padding_mode="zeros").eval()
+    mask = (torch.rand(H, W) > 0.3).float()
+    x = torch.randn(2, 3, H, W)
+    with torch.no_grad():
+        out = unet(x, mask[None, None])
+        assert unet.land_levels(mask[None, None]) is unet.land_levels(mask)  # one entry for the mask and its views
+        mask[0, :5] = 1 - mask[0, :5]  # in-place edit: the cached levels must be recomputed
+        edited = unet(x, mask[None, None])
+        unet._land_cache.clear()
+        torch.testing.assert_close(edited, unet(x, mask[None, None]))
+    assert not torch.equal(out, edited)
+    assert [m.shape[-2:] for m, _ in unet.land_levels(mask)] == [(H, W), (H // 2, W // 2), (H // 4, W // 4)]
+
+
+def test_fill_land_keeps_channels_last():
+    from Emulator.om2_model_utils import fill_land
+
+    torch.manual_seed(0)
+    mask = (torch.rand(1, 1, H, W) > 0.3).float()
+    x = torch.randn(2, 5, H, W)
+    x_cl = x.contiguous(memory_format=torch.channels_last)
+    out_cl = fill_land(x_cl, mask, dirichlet={2: 0.5})
+    assert out_cl.is_contiguous(memory_format=torch.channels_last)
+    torch.testing.assert_close(out_cl, fill_land(x, mask, dirichlet={2: 0.5}))
+
+
+def test_local_mse_is_area_weighted():
+    """Each cell's squared error counts in proportion to its area; without area every ocean cell counts equally."""
+    from Emulator import local_mse_loss
+
+    g = torch.Generator().manual_seed(4)
+    mask = (torch.rand(H, W, generator=g) > 0.3).float()
+    area = torch.rand(H, W, generator=g) * 1e10 + 1e9
+    pred, target = torch.randn(2, 3, H, W, generator=g), torch.randn(2, 3, H, W, generator=g)
+    loss_fn = local_mse_loss(weight=1.0)
+
+    weights = (mask * area).expand(2, 3, H, W)
+    expected = (((pred - target) ** 2) * weights).sum() / weights.sum()
+    torch.testing.assert_close(loss_fn(pred_t=pred, target_t=target, mask=mask, area=area, rollout_step=0), expected)
+
+    unweighted = (((pred - target) ** 2) * mask).sum() / (mask.sum() * 6)
+    torch.testing.assert_close(loss_fn(pred_t=pred, target_t=target, mask=mask, rollout_step=0), unweighted)
