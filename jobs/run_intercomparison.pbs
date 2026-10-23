@@ -1,0 +1,43 @@
+#!/bin/bash
+# Run notebooks/Emulator_intercomparison.ipynb headless on one Hopper GPU.
+# Same project, CPUs, memory, jobfs, storage, software and environment as the
+# ARE JupyterLab session it was developed in; only the queue differs.
+#
+#   qsub jobs/run_intercomparison.pbs
+#
+# Stages with saved weights (runs/intercomparison/<name>/weights.pt) are loaded,
+# not retrained (see RETRAIN in the notebook). The executed notebook, with all
+# outputs, is written to runs/intercomparison/Emulator_intercomparison_executed.ipynb;
+# figures go to figures/intercomparison/ as each cell finishes.
+#PBS -N om2-intercomparison
+#PBS -P v46
+#PBS -q gpuhopper
+#PBS -l ngpus=1
+#PBS -l ncpus=12
+#PBS -l mem=97280M
+#PBS -l jobfs=100GB
+#PBS -l walltime=24:00:00
+#PBS -l storage=gdata/cj50+gdata/e14+gdata/v46+gdata/p73+gdata/v45+gdata/x77+gdata/fs38+gdata/ik11+gdata/oi10+gdata/xp65+gdata/g40+gdata/ol01+gdata/nm47+gdata/dk92+gdata/rv74+gdata/rq0
+#PBS -l wd
+#PBS -j oe
+#PBS -o /home/156/txs156/uom/OM2-emulator/runs/intercomparison/job.log
+
+set -euo pipefail
+
+REPO=/home/156/txs156/uom/OM2-emulator
+module use /g/data/dk92/apps/Modules/modulefiles
+module load pet/2025.05
+export PYTHONUSERBASE=/g/data/v46/txs156/python-userbase
+
+cd "$REPO"
+echo "Job ${PBS_JOBID} on $(hostname) at $(date); commit $(git rev-parse --short HEAD)"
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+jupyter nbconvert --to notebook --execute \
+    --ExecutePreprocessor.timeout=-1 \
+    --ExecutePreprocessor.kernel_name=python3 \
+    --output-dir runs/intercomparison \
+    --output Emulator_intercomparison_executed \
+    notebooks/Emulator_intercomparison.ipynb
+
+echo "Finished at $(date)"
