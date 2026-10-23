@@ -20,6 +20,7 @@ from Emulator import zonal_wavenumber_bands
 from Emulator.om2_loss_functions import SPECTRAL_BANDS_PER_DECADE
 
 from .config import rollout_spec
+from .data import _open_time_axis, _rename_xy
 from .losses import closure_loss, closure_std_fields
 
 
@@ -409,3 +410,69 @@ def zonal_spectrum(anomaly):
     energy = np.bincount(band, power.ravel(), minlength=k.size) / np.cos(np.deg2rad(latitude[rows])).sum()
     half = 0.5 / SPECTRAL_BANDS_PER_DECADE
     return k, energy / (k * (10.0**half - 10.0**-half))
+
+
+# =============================================================================
+# Implied meridional transports (MHT, MFWT)
+# =============================================================================
+
+def implied_meridional_transport(content, flux, area, dt_seconds, flux_sign=1.0):
+    """
+    Northward transport implied by a column budget, across the northern edge
+    of each grid row, one value per month interval:
+
+        d(content)/dt = surface flux - div(transport)
+        T(j) = sum over rows <= j, all longitudes, of area * (flux - d(content)/dt)
+
+    content (time, latitude, longitude) in X m^-2, flux in X m^-2 s^-1 (e.g. J
+    and W, or kg and kg s^-1); positive flux = into the ocean after flux_sign.
+    The tendency between consecutive months, (C[t+1] - C[t]) / dt_seconds, is
+    paired with the mean flux of those two months (as in the closure loss) and
+    labelled with the later month. Ocean = where content is defined.
+
+    Returns a Dataset (time, latitude) in X s^-1: "transport", and its two
+    parts "surface" (the cumulative surface flux) and "storage" (the
+    cumulative content tendency), with transport = surface - storage.
+    """
+    ocean_area = area.where(content.isel(time=0).notnull(), 0.0)
+    tendency = (content.diff("time", label="upper") / dt_seconds).fillna(0.0)
+    flux_mid = (0.5 * (flux + flux.shift(time=1)) * flux_sign).isel(time=slice(1, None)).fillna(0.0)
+    row = lambda x: (x * ocean_area).sum("longitude")
+    surface = row(flux_mid).cumsum("latitude")
+    storage = row(tendency).cumsum("latitude")
+    return xr.Dataset({"transport": surface - storage, "surface": surface, "storage": storage})
+
+
+def meridional_transports(cfg, data, skill):
+    """
+    Implied meridional transports through the skill test, for every budget in
+    cfg.loss.closures whose content is predicted and whose flux is forcing
+    (heat -> MHT, freshwater -> MFWT).
+
+    The surface flux is the prescribed forcing, identical for the truth and the
+    emulator, so the two differ only through the storage term (the content
+    tendency). The truth is ACCESS-OM2's own implied transport: the data hold
+    no diagnosed transports to compare against.
+
+    Returns {budget: Dataset} with <truth|pred>_<transport|storage> and
+    "surface" on (time, latitude), and attrs content_units.
+    """
+    budgets = {b: c for b, c in cfg.loss.closures.items()
+               if c.content_variable in cfg.data.prognostic and c.flux_variable in cfg.data.forcing}
+    months = [pd.Timestamp(t).strftime("%Y-%m") for t in skill.time.values]
+    positions = [data.index_of(m) for m in months]
+    result = {}
+    with _open_time_axis(cfg) as ds:
+        for budget, closure in budgets.items():
+            flux = _rename_xy(ds[closure.flux_variable]).isel(time=positions)
+            flux = flux.transpose("time", "latitude", "longitude").assign_coords(
+                time=skill.time.values, latitude=skill.latitude.values, longitude=skill.longitude.values).load()
+            out = {}
+            for kind in ("truth", "pred"):
+                t = implied_meridional_transport(skill[f"{closure.content_variable}_{kind}"], flux, skill["area"],
+                                                 cfg.loss.seconds_per_step, closure.surface_flux_sign)
+                out[f"{kind}_transport"], out[f"{kind}_storage"], out["surface"] = t.transport, t.storage, t.surface
+            result[budget] = xr.Dataset(out, attrs={
+                "content_variable": closure.content_variable,
+                "content_units": skill[f"{closure.content_variable}_truth"].attrs.get("units", "")})
+    return result

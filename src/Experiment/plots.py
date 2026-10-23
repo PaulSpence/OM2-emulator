@@ -15,6 +15,10 @@ import xarray as xr
 
 from .evaluation import global_integral, global_rmse, skill_diagnostics, zonal_spectrum
 
+# Display units for implied transports, by content units: J/m2 -> W -> PW, kg/m2 -> kg/s -> Sv.
+_TRANSPORT_UNITS = {"J/m2": (1e15, "PW"), "J m-2": (1e15, "PW"), "kg m-2": (1e9, "Sv"), "kg/m2": (1e9, "Sv")}
+TRIPOLE_LATITUDE = 65.0  # north of this the grid rows are not latitude circles
+
 
 def _default_variable(ds):
     return next(name[: -len("_pred")] for name in ds.data_vars if name.endswith("_pred"))
@@ -217,6 +221,49 @@ def plot_spectra(skill, variables=None):
             ax.set_ylabel(f"PSD ({units}$^2$ km)")
             ax.grid(alpha=0.3, which="both")
             ax.secondary_xaxis("top", functions=(inverse, inverse)).set_xlabel("wavelength (km)")
+            ax.legend(frameon=False, fontsize=8)
+    return fig
+
+
+def plot_meridional_transports(transports):
+    """
+    Implied meridional transports through the skill test (evaluation.
+    meridional_transports), one row per budget (heat = MHT, freshwater = MFWT):
+
+      1. time-mean northward transport, ACCESS-OM2 vs emulator;
+      2. time-mean storage term (cumulative content tendency): the only part
+         the emulator changes, since both use the same surface flux;
+      3. month-to-month: the truth's standard deviation over time and the RMS
+         over time of emulator minus truth.
+
+    Shading marks the tripole region, where grid rows are not latitude circles
+    (the transport there is across the row, not across a latitude).
+    """
+    fig, axes = plt.subplots(len(transports), 3, figsize=(17, 4 * len(transports)), squeeze=False,
+                             constrained_layout=True)
+    names = {"heat": "MHT", "freshwater": "MFWT"}
+    for row, (budget, t) in zip(axes, transports.items()):
+        scale, unit = _TRANSPORT_UNITS.get(t.attrs.get("content_units", ""), (1.0, "content units s$^{-1}$"))
+        label = names.get(budget, f"{budget} transport")
+        lat = t.latitude.values
+        truth, pred = t.truth_transport / scale, t.pred_transport / scale
+        panels = (
+            (row[0], f"{label}: time mean", ((truth.mean("time"), "ACCESS-OM2"), (pred.mean("time"), "Emulator"))),
+            (row[1], f"{label}: storage term, time mean",
+             ((t.truth_storage.mean("time") / scale, "ACCESS-OM2"), (t.pred_storage.mean("time") / scale, "Emulator"))),
+            (row[2], f"{label}: month-to-month",
+             ((truth.std("time"), "ACCESS-OM2 std over time"),
+              (np.sqrt(((pred - truth) ** 2).mean("time")), "RMS emulator minus truth"))),
+        )
+        for ax, title, series in panels:
+            for (values, name), color, ls in zip(series, ("tab:orange", "firebrick"), ("-", "--")):
+                ax.plot(lat, values.values, color=color, lw=2, ls=ls, label=name)
+            ax.axhline(0.0, color="0.5", lw=0.8)
+            ax.axvspan(TRIPOLE_LATITUDE, lat.max(), color="0.9", zorder=0)
+            ax.set_title(title)
+            ax.set_xlabel("latitude (row north edge, deg)")
+            ax.set_ylabel(f"northward ({unit})")
+            ax.grid(alpha=0.3)
             ax.legend(frameon=False, fontsize=8)
     return fig
 

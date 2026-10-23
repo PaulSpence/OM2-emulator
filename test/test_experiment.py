@@ -1093,6 +1093,95 @@ def test_unet_respects_the_grid_symmetry():
 
 
 # =============================================================================
+# Implied meridional transports
+# =============================================================================
+
+def _transport_grid(n_time=4):
+    lat = np.linspace(-60, 60, H)
+    coords = {"time": pd.date_range("2005-01", periods=n_time, freq="MS"), "latitude": lat, "longitude": np.arange(W)}
+    dims = ("time", "latitude", "longitude")
+    area = xr.DataArray(np.random.default_rng(5).uniform(1e9, 2e9, (H, W)), dims=dims[1:], coords={k: coords[k] for k in dims[1:]})
+    zeros = xr.DataArray(np.zeros((n_time, H, W)), dims=dims, coords=coords)
+    return zeros, area
+
+
+def test_implied_transport_of_surface_flux_alone():
+    """No content change: the transport across each row's north edge is the surface flux into everything south of it."""
+    from Experiment import implied_meridional_transport
+
+    content, area = _transport_grid()
+    content[:, :, :3] = np.nan  # land
+    flux = content * 0 + 5.0
+    t = implied_meridional_transport(content, flux, area, dt_seconds=10.0)
+    ocean_area = area.where(content.isel(time=0).notnull(), 0.0)
+    expected = (5.0 * ocean_area.sum("longitude")).cumsum("latitude")
+    assert t.sizes["time"] == 3  # one value per month interval
+    np.testing.assert_allclose(t.transport.values, np.broadcast_to(expected.values, t.transport.shape))
+    np.testing.assert_allclose(t.storage.values, 0.0)
+
+
+def test_implied_transport_of_storage_in_one_row():
+    """No flux, content rising in one row: transport is zero south of it and carries the storage north of it."""
+    from Experiment import implied_meridional_transport
+
+    content, area = _transport_grid()
+    j, rate, dt = 6, 3.0, 10.0
+    content[:, j, :] = rate * dt * np.arange(content.sizes["time"])[:, None]
+    t = implied_meridional_transport(content, content * 0, area, dt_seconds=dt, flux_sign=-1.0)
+    row_storage = float(rate * area.isel(latitude=j).sum())
+    np.testing.assert_allclose(t.transport.isel(latitude=slice(None, j)).values, 0.0)
+    np.testing.assert_allclose(t.transport.isel(latitude=slice(j, None)).values, -row_storage, rtol=1e-12)
+
+
+def test_implied_transport_pairs_tendency_with_two_month_mean_flux():
+    from Experiment import implied_meridional_transport
+
+    content, area = _transport_grid(n_time=3)
+    flux = content + np.array([1.0, 3.0, 7.0])[:, None, None]
+    t = implied_meridional_transport(content, flux, area, dt_seconds=1.0, flux_sign=-1.0)
+    first_row = float(area.isel(latitude=0).sum())
+    np.testing.assert_allclose(t.surface.isel(latitude=0).values, [-2.0 * first_row, -5.0 * first_row])
+    assert list(t.time.values) == list(content.time.values[1:])  # labelled with the later month
+
+
+def test_meridional_transports_through_skill_test(synthetic_file, tmp_path):
+    from Experiment import meridional_transports, plot_meridional_transports
+
+    cfg = make_cfg(
+        synthetic_file, tmp_path,
+        data=DataConfig(path=str(synthetic_file),
+                        prognostic=["ocean_heat_content_2d", "ocean_freshwater_content_2d"],
+                        forcing=["total_surface_heat_flx", "ocean_freshwater_flux", "tau_x"],
+                        normalisation=NormalisationConfig(fit_period=("2000-01", "2003-12")),
+                        cache_dir=str(tmp_path / "cache")),
+    )
+    data = build_data(cfg, verbose=False)
+    skill = run_skill_test(cfg, build_model(cfg, data), data)
+    transports = meridional_transports(cfg, data, skill)
+    assert set(transports) == {"heat", "freshwater"}
+
+    heat = transports["heat"]
+    # The truth's transport is built from the file's own heat flux and OHC.
+    raw = xr.open_dataset(synthetic_file)
+    months = [pd.Timestamp(t).strftime("%Y-%m") for t in skill.time.values]
+    flux = raw.total_surface_heat_flx.rename(yt_ocean="latitude", xt_ocean="longitude")
+    flux = flux.isel(time=[data.index_of(m) for m in months]).assign_coords(time=skill.time.values,
+                                                                             longitude=skill.longitude.values,
+                                                                             latitude=skill.latitude.values)
+    from Experiment import implied_meridional_transport
+    expected = implied_meridional_transport(skill.ocean_heat_content_2d_truth, flux, skill.area, cfg.loss.seconds_per_step)
+    np.testing.assert_allclose(heat.truth_transport.values, expected.transport.values, rtol=1e-5)
+    # Same surface flux for both: they differ only by the storage term.
+    np.testing.assert_allclose((heat.truth_transport + heat.truth_storage).values,
+                               (heat.pred_transport + heat.pred_storage).values, rtol=1e-5)
+
+    fig = plot_meridional_transports(transports)
+    assert len([ax for ax in fig.axes if ax.lines]) == 6
+    assert "PW" in fig.axes[0].get_ylabel() and "Sv" in fig.axes[3].get_ylabel()
+    plt.close(fig)
+
+
+# =============================================================================
 # Persistence baseline
 # =============================================================================
 
