@@ -105,6 +105,44 @@ def local_mse_loss(weight=1.0):
     return loss_fn
 
 
+def crps_loss(weight=1.0):
+    """
+    Return a weighted fair-CRPS loss for an ensemble, area-weighted over the
+    ocean, in z-score units.
+
+    The batch holds ``n_members`` (from the rollout context) consecutive
+    members of each sample: pred_t is (B * M, ...) and target_t repeats the
+    truth for every member. Per cell, the fair (unbiased in M) CRPS is
+
+        mean_i |x_i - y|  -  sum_{i,j} |x_i - x_j| / (2 M (M - 1))
+
+    (Ferro 2014; used for ensemble training by e.g. NeuralGCM and AIFS-CRPS).
+    The first term pulls every member towards the truth, the second pushes
+    members apart, so the loss is minimised by members drawn from the
+    distribution of the truth, not by their mean: sharp members are not
+    penalised for unpredictable detail as they are by MSE.
+    """
+
+    def loss_fn(*, pred_t, target_t, mask, n_members=1, rollout_step=None, area=None, **_):
+        current_weight = step_weight(weight, rollout_step, pred_t)
+        if current_weight == 0.0:
+            return pred_t.new_zeros(())
+        m = int(n_members)
+        if m < 2:
+            raise ValueError("crps_loss needs an ensemble: n_members >= 2 in the rollout context")
+        b = pred_t.shape[0] // m
+        members = pred_t.reshape(b, m, *pred_t.shape[1:])
+        truth = target_t.reshape(b, m, *target_t.shape[1:])[:, 0]
+        skill = (members - truth[:, None]).abs().mean(dim=1)
+        spread = (members[:, :, None] - members[:, None]).abs().sum(dim=(1, 2)) / (m * (m - 1))
+        crps = skill - 0.5 * spread                                   # (B, P, H, W)
+        cell_weight = expand_ocean_mask(mask, crps)
+        if area is not None:
+            cell_weight = cell_weight * area.to(device=crps.device, dtype=crps.dtype)
+        return current_weight * (crps * cell_weight).sum() / cell_weight.sum().clamp_min(1e-12)
+
+    return loss_fn
+
 EARTH_RADIUS_KM = 6371.0
 # Rows used for zonal spectra. North of ~65N the ACCESS-OM2 tripole grid's
 # nominal longitude is not a true longitude, so a row there is not a circle of
@@ -325,7 +363,8 @@ def budget_closure_loss(
         forcing_time_indices,
         area,
         mask,
-        dt_seconds,
+        dt_seconds=None,
+        month_seconds=None,
         initial_state_norm=None,
         initial_ohc_norm=None,
         ohc_std=None,
@@ -420,11 +459,19 @@ def budget_closure_loss(
             flux_anom = flux_norm * flux_std_t
 
             # e.g. W/m^2 * m^2 * s -> J, times the trapezoid weight (1/2 at the
-            # two ends of the window, 1 in between). surface_flux_sign flips the
-            # convention if positive flux means leaving the ocean.
+            # two ends of the window, 1 in between) and the length of that month
+            # (month_seconds, (T,), indexed per sample; a fixed dt_seconds only
+            # for callers without it). surface_flux_sign flips the convention if
+            # positive flux means leaving the ocean.
+            if month_seconds is not None:
+                seconds = month_seconds.to(device=pred_t.device)[flux_time_index].to(pred_t.dtype)
+            elif dt_seconds is not None:
+                seconds = dt_seconds
+            else:
+                raise ValueError(f"The {name} needs month_seconds (or dt_seconds) in the rollout context")
             flux_integral_global = flux_integral_global + (
                 (flux_anom * area_t).sum(dim=(-2, -1))
-                * dt_seconds
+                * seconds
                 * trapezoid_weight
                 * surface_flux_sign
             )
@@ -533,6 +580,9 @@ def total_rollout_loss(
     closure_std=None,
     checkpoint_steps=False,
     steps_in_memory=0,
+    month_seconds=None,
+    constraint=None,
+    n_members=1,
 ):
     """
     Run an autoregressive rollout and average any supplied loss callables.
@@ -565,6 +615,13 @@ def total_rollout_loss(
     ``steps_in_memory`` keeps the activations of the last that many steps
     (no recompute for them) and checkpoints only the earlier ones: memory for
     about steps_in_memory + 1 steps, with proportionally less recompute.
+
+    ``month_seconds`` (T,) gives the closure losses the true month lengths.
+    ``constraint(pred, previous, previous_index, target_index)``, if given, is
+    applied to every prediction before the losses and before it is fed back
+    (e.g. Experiment.constraints.GlobalBudgetConstraint); it needs
+    target_time_indices. ``n_members`` is passed to the losses: with an
+    ensemble the batch holds n_members consecutive members per sample.
     """
     if not losses:
         raise ValueError("total_rollout_loss requires at least one loss function")
@@ -600,6 +657,10 @@ def total_rollout_loss(
         if target_time_indices is not None:
             target_time_index = target_time_indices[:, step].to(pred_t.device)
             forcing_time_indices = target_time_indices[:, : step + 1].to(pred_t.device)
+        if constraint is not None:
+            if target_time_index is None:
+                raise ValueError("A constraint needs target_time_indices")
+            pred_t = constraint(pred_t, prior_states[:, -n_prognostic:], target_time_index - 1, target_time_index)
 
         context = dict(
             rollout_step=step,
@@ -621,7 +682,9 @@ def total_rollout_loss(
             forcing_std=forcing_std,
             closure_std=closure_std,
             dt_seconds=dt_seconds,
+            month_seconds=month_seconds,
             initial_forcing=initial_forcing,
+            n_members=n_members,
         )
 
         for loss_fn in losses:

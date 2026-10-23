@@ -25,7 +25,7 @@ import torch
 import xarray as xr
 from torch.utils.data import DataLoader, Dataset
 
-CACHE_FORMAT_VERSION = 2  # 2: forcing_std for every forcing channel (replaces heat_flux_std)
+CACHE_FORMAT_VERSION = 3  # 3: month_seconds and global integrals for the budget constraint
 
 
 # =============================================================================
@@ -166,6 +166,18 @@ def build_fields(cfg):
 
         units = [str(ds[v].attrs.get("units", "")) for v in d.prognostic]
         months = [pd.Timestamp(x).strftime("%Y-%m") for x in ds.time.values]
+        month_seconds = [pd.Period(m, freq="M").days_in_month * 86400.0 for m in months]
+
+        # Ocean-integrated (area-weighted) totals per month, in physical units,
+        # for the global budget constraint: every forcing variable (e.g. W, kg/s)
+        # and the climatological mean of every prognostic variable (e.g. J, kg).
+        ocean_area = xr.DataArray(area_np, dims=("latitude", "longitude"))
+        def ocean_integral(field):
+            field = _rename_xy(field).transpose("time", "latitude", "longitude").fillna(0.0)
+            return torch.as_tensor((field * ocean_area.values).sum(("latitude", "longitude")).values,
+                                   dtype=torch.float64)
+        forcing_global = torch.stack([ocean_integral(ds[v]) for v in d.forcing], dim=1)
+        mean_global = (prognostic_mean.double() * torch.as_tensor(area_np)).sum(dim=(-2, -1))
         latitude = np.asarray(like["latitude"].values)
         longitude = np.asarray(like["longitude"].values)
 
@@ -176,6 +188,9 @@ def build_fields(cfg):
         "prognostic_mean": prognostic_mean,  # (T, P, H, W) physical units
         "prognostic_std": prognostic_std,    # (T, P, H, W) physical units
         "forcing_std": forcing_std,          # (T, C, H, W) physical units (closure fluxes)
+        "forcing_global": forcing_global,    # (T, C) float64 ocean integral of each forcing, physical units x m^2
+        "prognostic_mean_global": mean_global,  # (T, P) float64 ocean integral of the climatological mean
+        "month_seconds": torch.as_tensor(month_seconds, dtype=torch.float64),  # (T,) length of each month
         "mask": torch.as_tensor(mask_np),    # (H, W), 1 = ocean
         "area": torch.as_tensor(area_np, dtype=torch.float64),  # (H, W) m^2, 0 on land
         "months": months,

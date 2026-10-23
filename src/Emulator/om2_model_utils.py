@@ -523,13 +523,18 @@ class UNet(nn.Module):
                  latent_processor=None,
                  padding_mode="replicate",
                  width_multiplier=4,
-                 dirichlet=None):
+                 dirichlet=None,
+                 width_channel_count=None):
         # padding_mode is passed to every PartialConv2d layer; see
         # PartialConv2d for the "replicate" vs "zeros" trade-off.
+        # width_channel_count: the input count the widths are scaled from
+        # (default input_channel_count). Extra inputs such as noise channels
+        # then leave every layer but the first unchanged, so a trained
+        # network's weights still fit.
 
         super(UNet, self).__init__()
 
-        width1, width2, latent_width = self.channel_widths(input_channel_count, width_multiplier)
+        width1, width2, latent_width = self.channel_widths(width_channel_count or input_channel_count, width_multiplier)
         self.latent_channel_count = latent_width
 
         # ---------- Encoder ----------

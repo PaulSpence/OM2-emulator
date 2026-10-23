@@ -20,6 +20,7 @@ from Emulator import zonal_wavenumber_bands
 from Emulator.om2_loss_functions import SPECTRAL_BANDS_PER_DECADE
 
 from .config import rollout_spec
+from .constraints import build_constraint
 from .data import _open_time_axis, _rename_xy
 from .losses import closure_loss, closure_std_fields
 
@@ -45,7 +46,7 @@ def check_known_closure(cfg, data, dataloader=None, max_batches=None, warn_thres
         area=f["area"].float(),
         mask=f["mask"].float(),
         closure_std=closure_std_fields(cfg, data),
-        dt_seconds=cfg.loss.seconds_per_step,
+        month_seconds=f["month_seconds"],
     )
     n_steps = cfg.window.posterior_steps
     by_lead = {budget: [[] for _ in range(n_steps)] for budget in closures}
@@ -97,27 +98,48 @@ def check_known_closure(cfg, data, dataloader=None, max_batches=None, warn_thres
 # =============================================================================
 
 @torch.no_grad()
-def autoregressive_rollout(model, prior, forcing_sequence, mask):
+def autoregressive_rollout(model, prior, forcing_sequence, mask, target_indices=None, initial_index=None,
+                           constraint=None, members=1):
     """
-    Free-running rollout from one initial state.
+    Free-running rollout from one initial state, for ``members`` members at
+    once (each a separate sample for a stochastic model; 1 for a deterministic
+    one).
 
     prior            (n_prior, P, H, W) true initial states, oldest first
     forcing_sequence (N, C, H, W)       forcing for each predicted month
-    returns          (N, P, H, W)       predictions (z-scores), on the CPU
+    target_indices   (N,)               time index of each predicted month, and
+    initial_index    int                that of the last prior state: needed by
+    constraint                          (e.g. GlobalBudgetConstraint), applied after every step
+    returns          (members, N, P, H, W) predictions (z-scores), on the CPU
     """
     device = next(model.parameters()).device
     was_training = model.training
     model.eval()
     n_prognostic = prior.shape[1]
-    state = prior.flatten(0, 1)[None].to(device)  # (1, n_prior * P, H, W)
+    state = prior.flatten(0, 1)[None].to(device).repeat(members, 1, 1, 1)  # (M, n_prior * P, H, W)
     mask = mask.to(device)
+    if constraint is not None:
+        if target_indices is None or initial_index is None:
+            raise ValueError("A constraint needs target_indices and initial_index")
+        constraint = constraint.to(device)
+        previous = torch.full((members,), int(initial_index), dtype=torch.long, device=device)
     predictions = []
     for k in range(forcing_sequence.shape[0]):
-        pred = model(state, forcing_sequence[k : k + 1].to(device), mask)  # (1, P, H, W)
-        predictions.append(pred[0].float().cpu())
-        state = torch.cat([state[:, n_prognostic:], pred], dim=1)
+        forcing = forcing_sequence[k : k + 1].to(device).expand(members, -1, -1, -1)
+        pred = model(state, forcing, mask)  # (M, P, H, W)
+        if constraint is not None:
+            target = torch.full_like(previous, int(target_indices[k]))
+            pred = constraint(pred, state[:, -n_prognostic:], previous, target)
+            previous = target
+        predictions.append(pred.float().cpu())
+        state = torch.cat([state[:, n_prognostic:], pred.to(state.dtype)], dim=1)
     model.train(was_training)
-    return torch.stack(predictions)
+    return torch.stack(predictions, dim=1)
+
+
+def default_members(cfg):
+    """Rollout members for cfg's paradigm: 1 if deterministic, else ensemble.eval_members."""
+    return 1 if cfg.paradigm == "deterministic" else cfg.ensemble.eval_members
 
 
 def _to_physical(z, time_indices, data):
@@ -148,12 +170,19 @@ def _as_dataset(arrays, time_coord, data, time_dim="time"):
     return ds
 
 
-def run_skill_test(cfg, model, data):
+def run_skill_test(cfg, model, data, members=None):
     """
     Seed from the truth at time.test[0], then free-run with the real forcing
-    through time.test[1] + 1 month. Returns a Dataset of predictions, truth and
-    the persistence baseline (<var>_persist, <var>_persist_anom: the seed
-    month's physical anomaly held fixed).
+    through time.test[1] + 1 month, with the global budget constraint. Returns
+    a Dataset of predictions, truth and the persistence baseline
+    (<var>_persist, <var>_persist_anom: the seed month's physical anomaly held
+    fixed).
+
+    members (default: default_members(cfg)) rollouts are run. <var>_pred and
+    <var>_pred_anom are the first member: one realisation, whose variability
+    and spectra can be compared with the truth's. <var>_pred_mean(_anom) is the
+    ensemble mean, for skill scores; with more than one member,
+    <var>_ens_anom (member, time, latitude, longitude) holds every member.
     """
     f, n_prior = data.fields, cfg.window.n_prior
     t0 = data.index_of(cfg.time.test[0])
@@ -163,20 +192,37 @@ def run_skill_test(cfg, model, data):
     if t0 - n_prior + 1 < 0:
         raise ValueError(f"time.test starts at {cfg.time.test[0]}: not enough prior months on the time axis")
 
+    members = members or default_members(cfg)
     targets = torch.arange(t0 + 1, t_last + 1)
-    z_pred = autoregressive_rollout(model, f["prognostic"][t0 - n_prior + 1 : t0 + 1], f["forcing"][targets], f["mask"])
+    z_ens = autoregressive_rollout(model, f["prognostic"][t0 - n_prior + 1 : t0 + 1], f["forcing"][targets], f["mask"],
+                                   targets, t0, build_constraint(cfg, data), members)
     z_true = f["prognostic"][targets]
-    pred_anom, pred = _to_physical(z_pred, targets, data)
+    pred_anom, pred = _to_physical(z_ens[0], targets, data)
+    mean_anom, mean = _to_physical(z_ens.mean(dim=0), targets, data)
     true_anom, true = _to_physical(z_true, targets, data)
     persist_anom = (f["prognostic"][t0] * f["prognostic_std"][t0]).expand_as(true_anom)
     persist = persist_anom + f["prognostic_mean"][targets]
     time = pd.to_datetime([data.months[i] for i in targets.tolist()])
     ds = _as_dataset(
         {"pred": pred, "truth": true, "pred_anom": pred_anom, "truth_anom": true_anom,
+         "pred_mean": mean, "pred_mean_anom": mean_anom,
          "persist": persist, "persist_anom": persist_anom},
         time, data,
     )
-    ds.attrs["description"] = f"Skill test seeded at {cfg.time.test[0]}, {len(targets)} months"
+    if members > 1:
+        land = f["mask"].numpy() == 0
+        std = f["prognostic_std"][targets]
+        for p, name in enumerate(f["prognostic_names"]):
+            ens = (z_ens[:, :, p] * std[:, p]).numpy().astype(np.float32)
+            ens[..., land] = np.nan
+            ds[f"{name}_ens_anom"] = xr.DataArray(
+                ens, dims=("member", "time", "latitude", "longitude"),
+                coords={"time": time, "latitude": f["latitude"], "longitude": f["longitude"]},
+                attrs={"units": f["prognostic_units"][p]},
+            )
+    ds.attrs["description"] = f"Skill test seeded at {cfg.time.test[0]}, {len(targets)} months, {members} member(s)"
+    ds.attrs["paradigm"] = cfg.paradigm
+    ds.attrs["members"] = members
     print(f"Skill test: seeded at {cfg.time.test[0]}, predicted {data.months[t0 + 1]}..{data.months[t_last]} ({len(targets)} months)")
     return ds
 
@@ -186,7 +232,8 @@ def run_control(cfg, model, data):
     Seed from the truth at time.control[0], then free-run with the forcing of
     the control months repeated time.control_repeats times. As in the original
     control run, the forcing for initial month t is the forcing at t+1.
-    Returns a Dataset of predictions on a "step" axis (no truth to compare).
+    Returns a Dataset of predictions on a "step" axis (no truth to compare):
+    one member, with the global budget constraint.
     """
     if cfg.time.control is None:
         raise ValueError("time.control is None: no control window configured")
@@ -197,7 +244,8 @@ def run_control(cfg, model, data):
 
     window = torch.arange(first + 1, last + 2)  # forcing months of one repeat
     targets = window.repeat(cfg.time.control_repeats)
-    z_pred = autoregressive_rollout(model, f["prognostic"][first - n_prior + 1 : first + 1], f["forcing"][targets], f["mask"])
+    z_pred = autoregressive_rollout(model, f["prognostic"][first - n_prior + 1 : first + 1], f["forcing"][targets], f["mask"],
+                                    targets, first, build_constraint(cfg, data))[0]
     pred_anom, pred = _to_physical(z_pred, targets, data)
     steps = np.arange(1, len(targets) + 1)
     ds = _as_dataset({"pred": pred, "pred_anom": pred_anom}, steps, data, time_dim="step")
@@ -416,7 +464,7 @@ def zonal_spectrum(anomaly):
 # Implied meridional transports (MHT, MFWT)
 # =============================================================================
 
-def implied_meridional_transport(content, flux, area, dt_seconds, flux_sign=1.0):
+def implied_meridional_transport(content, flux, area, month_seconds, flux_sign=1.0):
     """
     Northward transport implied by a column budget, across the northern edge
     of each grid row, one value per month interval:
@@ -426,20 +474,26 @@ def implied_meridional_transport(content, flux, area, dt_seconds, flux_sign=1.0)
 
     content (time, latitude, longitude) in X m^-2, flux in X m^-2 s^-1 (e.g. J
     and W, or kg and kg s^-1); positive flux = into the ocean after flux_sign.
-    The tendency between consecutive months, (C[t+1] - C[t]) / dt_seconds, is
-    paired with the mean flux of those two months (as in the closure loss) and
-    labelled with the later month. Ocean = where content is defined.
+    month_seconds: the length of each month (time,). Between the centres of
+    months a and b the content changes by C_b - C_a and the flux integral is
+    F_a L_a / 2 + F_b L_b / 2 (as in the budget constraint); both are divided by
+    the interval (L_a + L_b) / 2 to give rates, labelled with the later month.
+    Ocean = where content is defined.
 
     Returns a Dataset (time, latitude) in X s^-1: "transport", and its two
     parts "surface" (the cumulative surface flux) and "storage" (the
     cumulative content tendency), with transport = surface - storage.
     """
+    seconds = xr.DataArray(np.asarray(month_seconds, dtype=float), dims="time", coords={"time": content.time})
     ocean_area = area.where(content.isel(time=0).notnull(), 0.0)
-    tendency = (content.diff("time", label="upper") / dt_seconds).fillna(0.0)
-    flux_mid = (0.5 * (flux + flux.shift(time=1)) * flux_sign).isel(time=slice(1, None)).fillna(0.0)
+    flux_seconds = flux.fillna(0.0) * seconds
+    later = slice(1, None)
+    interval = (0.5 * (seconds + seconds.shift(time=1))).isel(time=later)
+    flux_integral = (0.5 * (flux_seconds + flux_seconds.shift(time=1)) * flux_sign).isel(time=later)
+    change = content.diff("time", label="upper").fillna(0.0)
     row = lambda x: (x * ocean_area).sum("longitude")
-    surface = row(flux_mid).cumsum("latitude")
-    storage = row(tendency).cumsum("latitude")
+    surface = row(flux_integral / interval).cumsum("latitude")
+    storage = row(change / interval).cumsum("latitude")
     return xr.Dataset({"transport": surface - storage, "surface": surface, "storage": storage})
 
 
@@ -470,7 +524,8 @@ def meridional_transports(cfg, data, skill):
             out = {}
             for kind in ("truth", "pred"):
                 t = implied_meridional_transport(skill[f"{closure.content_variable}_{kind}"], flux, skill["area"],
-                                                 cfg.loss.seconds_per_step, closure.surface_flux_sign)
+                                                 data.fields["month_seconds"][positions].numpy(),
+                                                 closure.surface_flux_sign)
                 out[f"{kind}_transport"], out[f"{kind}_storage"], out["surface"] = t.transport, t.storage, t.surface
             result[budget] = xr.Dataset(out, attrs={
                 "content_variable": closure.content_variable,

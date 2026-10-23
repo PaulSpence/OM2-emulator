@@ -34,7 +34,9 @@ KNOWN_ARCHITECTURES = ("unet",)
 KNOWN_OUTPUT_HEADS = (None, "spatial_residual")
 KNOWN_LATENT_PROCESSORS = (None, "latent_residual")
 # Fitting terms. Every budget in LossConfig.closures adds a "<budget>_closure" term.
-KNOWN_LOSS_TERMS = ("local_mse", "spectral")
+KNOWN_LOSS_TERMS = ("local_mse", "spectral", "crps")
+# How the emulator turns one state into the next (see ExperimentConfig.paradigm).
+KNOWN_PARADIGMS = ("deterministic", "crps_ensemble", "diffusion")
 CLOSURE_SUFFIX = "_closure"
 
 
@@ -173,6 +175,12 @@ class ClosureConfig:
     flux_variable: str
     surface_flux_sign: float = 1.0  # +1 if positive flux means INTO the ocean
     min_scale: float = 1.0          # floor on the residual's normalisation scale (content units x m^2)
+    # Enforce the budget exactly after every model step (constraints.
+    # GlobalBudgetConstraint) whenever the content is predicted and the flux is
+    # forcing: the global content change then equals the surface flux
+    # integrated over true month lengths, so global drift is impossible. With
+    # it on, the soft "<budget>_closure" loss term is redundant.
+    enforce: bool = True
 
 
 def _default_closures():
@@ -207,7 +215,9 @@ class LossConfig:
     step_weights: list | None = None
     # The budgets available as "<budget>_closure" terms: {budget: ClosureConfig}.
     closures: dict = field(default_factory=_default_closures)
-    seconds_per_step: float = 30 * 24 * 60 * 60  # one month
+    # Time step: the true length of each month (fields["month_seconds"]); a
+    # fixed 30-day month biased the global heat budget by about half of the
+    # 1970-2018 OHC change.
 
 
 @dataclass
@@ -286,6 +296,36 @@ class EvalConfig:
 
 
 @dataclass
+class EnsembleConfig:
+    # CRPS ensemble (paradigm "crps_ensemble"): the UNet gets noise_channels
+    # extra inputs of fresh Gaussian noise at every step, so each rollout is
+    # one sample. Trained with the "crps" loss term over train_members members
+    # per sample (memory and compute ~ train_members x deterministic).
+    noise_channels: int = 4
+    train_members: int = 4
+    # Members per skill-test rollout, for every stochastic paradigm.
+    eval_members: int = 10
+
+
+@dataclass
+class DiffusionConfig:
+    # Residual diffusion (paradigm "diffusion"), after CorrDiff (Mardani et al.
+    # 2025): a frozen deterministic model gives the mean next state and an EDM
+    # denoiser (Karras et al. 2022) samples the residual. Training draws noise
+    # levels sigma ~ lognormal(p_mean, p_std); sampling runs sampler_steps
+    # Heun steps from sigma_max to sigma_min (2 * sampler_steps - 1 network
+    # evaluations per month).
+    sampler_steps: int = 18
+    sigma_min: float = 0.002
+    sigma_max: float = 80.0
+    rho: float = 7.0
+    p_mean: float = -1.2
+    p_std: float = 1.2
+    # Denoiser width multiplier (its own UNet; see ModelConfig.width_multiplier).
+    width_multiplier: float = 4
+
+
+@dataclass
 class ExperimentConfig:
     data: DataConfig
     time: TimeConfig = field(default_factory=TimeConfig)
@@ -294,6 +334,12 @@ class ExperimentConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
+    # "deterministic": one next state per step (ForwardEmulator).
+    # "crps_ensemble": a ForwardEmulator with noise inputs, trained with CRPS (see ensemble).
+    # "diffusion": deterministic mean + sampled residual (see diffusion).
+    paradigm: str = "deterministic"
+    ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
+    diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
 
     def __post_init__(self):
         self.validate()
@@ -398,6 +444,23 @@ class ExperimentConfig:
         if tr.lr_scheduler not in (None, "cosine"):
             raise ValueError("train.lr_scheduler must be None or 'cosine'")
 
+        if self.paradigm not in KNOWN_PARADIGMS:
+            raise ValueError(f"Unknown paradigm {self.paradigm!r}; use {KNOWN_PARADIGMS}")
+        e, df = self.ensemble, self.diffusion
+        if e.noise_channels < 1 or e.train_members < 2 or e.eval_members < 1:
+            raise ValueError("ensemble needs noise_channels >= 1, train_members >= 2 and eval_members >= 1")
+        crps_active = _is_active(lo.terms.get("crps", 0))
+        if crps_active and self.paradigm != "crps_ensemble":
+            raise ValueError("The 'crps' loss term needs paradigm='crps_ensemble' (an ensemble to score)")
+        if self.paradigm == "crps_ensemble" and not crps_active:
+            raise ValueError("paradigm='crps_ensemble' needs an active 'crps' loss term")
+        if self.paradigm == "crps_ensemble" and m.output_head is not None:
+            raise ValueError("paradigm='crps_ensemble' does not support model.output_head (it would see the noise)")
+        if self.paradigm == "crps_ensemble" and _is_active(lo.terms.get("local_mse", 0)):
+            raise ValueError("paradigm='crps_ensemble': drop 'local_mse' (it pulls every member to the mean)")
+        if df.sampler_steps < 1 or not 0 < df.sigma_min < df.sigma_max or df.rho <= 0:
+            raise ValueError("diffusion needs sampler_steps >= 1, 0 < sigma_min < sigma_max and rho > 0")
+
     # --------------------------------------------------------------- utilities
     def active_closures(self):
         """{budget: ClosureConfig} for every "<budget>_closure" term with a non-zero weight."""
@@ -407,6 +470,23 @@ class ExperimentConfig:
             for budget, closure in lo.closures.items()
             if _is_active(lo.terms.get(budget + CLOSURE_SUFFIX, 0))
         }
+
+    def with_changes(self, **changes):
+        """
+        A validated copy with some settings changed, e.g. for a training branch:
+
+            cfg.with_changes(paradigm="crps_ensemble", train={"max_epochs": 30, "run_dir": ...})
+
+        A dict updates the named fields of that section; anything else replaces
+        the attribute.
+        """
+        updates = {}
+        for name, value in changes.items():
+            current = getattr(self, name)
+            if isinstance(value, dict) and dataclasses.is_dataclass(current):
+                value = dataclasses.replace(current, **value)
+            updates[name] = value
+        return dataclasses.replace(self, **updates)
 
     def to_dict(self):
         return dataclasses.asdict(self)

@@ -14,7 +14,7 @@ so ``step_weights`` shifts emphasis between lead times without changing the
 overall size of the loss.
 """
 
-from Emulator import budget_closure_loss, local_mse_loss, spectral_loss
+from Emulator import budget_closure_loss, crps_loss, local_mse_loss, spectral_loss
 
 from .config import CLOSURE_SUFFIX, _is_active
 
@@ -52,6 +52,7 @@ def closure_std_fields(cfg, data):
 LOSS_TERMS = {
     "local_mse": lambda cfg, data: local_mse_loss(weight=1.0),
     "spectral": lambda cfg, data: spectral_loss(weight=1.0, latitude=data.fields["latitude"]),
+    "crps": lambda cfg, data: crps_loss(weight=1.0),
 }
 
 

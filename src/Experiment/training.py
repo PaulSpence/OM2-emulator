@@ -20,6 +20,7 @@ from lightning.pytorch.loggers import CSVLogger
 from Emulator import total_rollout_loss
 
 from .config import rollout_spec
+from .constraints import build_constraint
 from .data import gather_windows
 from .losses import closure_std_fields
 
@@ -125,7 +126,8 @@ class EmulatorModule(L.LightningModule):
         # (n_free, n_trained); train_steps is updated by RolloutSchedule, if used.
         self.train_steps = rollout_spec(w.rollout_steps)
         self.valid_steps = (0, w.valid_rollout_steps or sum(self.train_steps))
-        self.dt_seconds = cfg.loss.seconds_per_step
+        # CRPS ensemble: every sample is rolled out as n_members members.
+        self.n_members = cfg.ensemble.train_members if cfg.paradigm == "crps_ensemble" else 1
         self.lr, self.weight_decay = tr.lr, tr.weight_decay
         self.lr_scheduler, self.max_epochs = tr.lr_scheduler, tr.max_epochs
 
@@ -136,6 +138,9 @@ class EmulatorModule(L.LightningModule):
         self.register_buffer("forcing_z", f["forcing"].float(), persistent=False)
         self.register_buffer("mask", f["mask"].float())
         self.register_buffer("area", f["area"].float())
+        self.register_buffer("month_seconds", f["month_seconds"].double(), persistent=False)
+        # Hard global budget closure after every step (None if no budget is enforced).
+        self.constraint = build_constraint(cfg, data)
         # Normalisation std fields that the closure terms use to turn z-scores
         # into physical anomalies: (T, H, W) content and flux std per active
         # budget. Only active budgets are kept, as each pair costs GPU memory.
@@ -172,6 +177,8 @@ class EmulatorModule(L.LightningModule):
         with torch.no_grad():
             for k in range(1, n_free + 1):
                 pred = self._run_model(prior, self.forcing_z[t0 + k], self.mask)
+                if self.constraint is not None:
+                    pred = self.constraint(pred, prior[:, -self.n_prognostic:], t0 + k - 1, t0 + k)
                 prior = torch.cat([prior[:, self.n_prognostic:], pred.to(prior.dtype)], dim=1)
         # Under mixed precision, autocast caches each weight's fp16 copy for the
         # rest of the training step. Copies made here, without gradients, would be
@@ -184,13 +191,15 @@ class EmulatorModule(L.LightningModule):
 
     def _step(self, batch, steps, stage):
         n_free, n_steps = rollout_spec(steps)  # n or (n_free, n_trained)
+        m = self.n_members
         if isinstance(batch, dict):
             if n_free:
                 raise ValueError("A [n_free, n_trained] rollout needs initial months, not ready-made windows")
-        elif n_free:
-            batch = self.push_forward(batch, n_free, n_steps)
+            if m > 1:  # the members of a sample are consecutive
+                batch = {k: v.repeat_interleave(m, dim=0) for k, v in batch.items()}
         else:
-            batch = self.windows(batch, n_steps)
+            t0 = torch.as_tensor(batch).repeat_interleave(m)
+            batch = self.push_forward(t0, n_free, n_steps) if n_free else self.windows(t0, n_steps)
         loss = total_rollout_loss(
             model=self._run_model,
             # (B, n_prior, P, H, W) -> (B, n_prior * P, H, W), oldest state first
@@ -203,13 +212,15 @@ class EmulatorModule(L.LightningModule):
             target_time_indices=batch["target_time_index"],
             area=self.area,
             closure_std=self.closure_std,
-            dt_seconds=self.dt_seconds,
+            month_seconds=self.month_seconds,
+            constraint=self.constraint,
+            n_members=m,
             initial_forcing=batch["initial_forcing"],
             n_prognostic=self.n_prognostic,
             checkpoint_steps=self.checkpoint_steps,
             steps_in_memory=self.steps_in_memory,
         )
-        batch_size = batch["prior"].shape[0]
+        batch_size = batch["prior"].shape[0] // m
         self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size)
         for term in self.losses:
             value = term.pop_running()
@@ -243,7 +254,8 @@ class EmulatorModule(L.LightningModule):
         return self._step(batch, self.valid_steps, "val")
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam(trainable, lr=self.lr, weight_decay=self.weight_decay)
         if self.lr_scheduler == "cosine":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.max_epochs)
             return {"optimizer": optimizer, "lr_scheduler": scheduler}

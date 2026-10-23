@@ -10,6 +10,7 @@ from .om2_model_utils import (
 )
 from .om2_loss_functions import (
     budget_closure_loss,
+    crps_loss,
     freshwater_closure_loss,
     global_closure_loss,
     heat_closure_loss,
@@ -23,6 +24,7 @@ from .om2_loss_functions import (
 __all__ = [
     "AutoEncoder",
     "budget_closure_loss",
+    "crps_loss",
     "freshwater_closure_loss",
     "global_closure_loss",
     "heat_closure_loss",

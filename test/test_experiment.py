@@ -765,7 +765,7 @@ def test_checkpointed_rollout_gives_same_loss_and_gradients(data_and_cfg):
             target_time_indices=batch["target_time_index"],
             area=module.area,
             closure_std=module.closure_std,
-            dt_seconds=cfg.loss.seconds_per_step,
+            month_seconds=data.fields["month_seconds"],
             initial_forcing=batch["initial_forcing"],
             n_prognostic=data.n_prognostic,
             checkpoint_steps=checkpoint_steps,
@@ -1112,7 +1112,7 @@ def test_implied_transport_of_surface_flux_alone():
     content, area = _transport_grid()
     content[:, :, :3] = np.nan  # land
     flux = content * 0 + 5.0
-    t = implied_meridional_transport(content, flux, area, dt_seconds=10.0)
+    t = implied_meridional_transport(content, flux, area, month_seconds=[10.0] * content.sizes["time"])
     ocean_area = area.where(content.isel(time=0).notnull(), 0.0)
     expected = (5.0 * ocean_area.sum("longitude")).cumsum("latitude")
     assert t.sizes["time"] == 3  # one value per month interval
@@ -1127,7 +1127,8 @@ def test_implied_transport_of_storage_in_one_row():
     content, area = _transport_grid()
     j, rate, dt = 6, 3.0, 10.0
     content[:, j, :] = rate * dt * np.arange(content.sizes["time"])[:, None]
-    t = implied_meridional_transport(content, content * 0, area, dt_seconds=dt, flux_sign=-1.0)
+    t = implied_meridional_transport(content, content * 0, area, month_seconds=[dt] * content.sizes["time"],
+                                     flux_sign=-1.0)
     row_storage = float(rate * area.isel(latitude=j).sum())
     np.testing.assert_allclose(t.transport.isel(latitude=slice(None, j)).values, 0.0)
     np.testing.assert_allclose(t.transport.isel(latitude=slice(j, None)).values, -row_storage, rtol=1e-12)
@@ -1138,10 +1139,23 @@ def test_implied_transport_pairs_tendency_with_two_month_mean_flux():
 
     content, area = _transport_grid(n_time=3)
     flux = content + np.array([1.0, 3.0, 7.0])[:, None, None]
-    t = implied_meridional_transport(content, flux, area, dt_seconds=1.0, flux_sign=-1.0)
+    t = implied_meridional_transport(content, flux, area, month_seconds=[1.0] * 3, flux_sign=-1.0)
     first_row = float(area.isel(latitude=0).sum())
     np.testing.assert_allclose(t.surface.isel(latitude=0).values, [-2.0 * first_row, -5.0 * first_row])
     assert list(t.time.values) == list(content.time.values[1:])  # labelled with the later month
+
+
+def test_implied_transport_uses_true_month_lengths():
+    """Each interval spans half of each month: flux integral F_a L_a/2 + F_b L_b/2 over (L_a + L_b)/2."""
+    from Experiment import implied_meridional_transport
+
+    content, area = _transport_grid(n_time=2)
+    lengths = [31.0, 28.0]
+    flux = content + np.array([2.0, 4.0])[:, None, None]
+    t = implied_meridional_transport(content, flux, area, month_seconds=lengths)
+    first_row = float(area.isel(latitude=0).sum())
+    expected_rate = (2.0 * 31 / 2 + 4.0 * 28 / 2) / ((31 + 28) / 2)
+    np.testing.assert_allclose(t.surface.isel(latitude=0).values, [expected_rate * first_row])
 
 
 def test_meridional_transports_through_skill_test(synthetic_file, tmp_path):
@@ -1169,7 +1183,8 @@ def test_meridional_transports_through_skill_test(synthetic_file, tmp_path):
                                                                              longitude=skill.longitude.values,
                                                                              latitude=skill.latitude.values)
     from Experiment import implied_meridional_transport
-    expected = implied_meridional_transport(skill.ocean_heat_content_2d_truth, flux, skill.area, cfg.loss.seconds_per_step)
+    seconds = data.fields["month_seconds"][[data.index_of(m) for m in months]].numpy()
+    expected = implied_meridional_transport(skill.ocean_heat_content_2d_truth, flux, skill.area, seconds)
     np.testing.assert_allclose(heat.truth_transport.values, expected.transport.values, rtol=1e-5)
     # Same surface flux for both: they differ only by the storage term.
     np.testing.assert_allclose((heat.truth_transport + heat.truth_storage).values,
@@ -1299,3 +1314,167 @@ def test_local_mse_is_area_weighted():
 
     unweighted = (((pred - target) ** 2) * mask).sum() / (mask.sum() * 6)
     torch.testing.assert_close(loss_fn(pred_t=pred, target_t=target, mask=mask, rollout_step=0), unweighted)
+
+
+# =============================================================================
+# Paradigms (deterministic, CRPS ensemble, diffusion) and their comparison
+# =============================================================================
+
+def test_month_seconds_are_true_month_lengths(data_and_cfg):
+    data, _ = data_and_cfg
+    seconds = data.fields["month_seconds"]
+    assert seconds[data.index_of("2000-01")] == 31 * 86400
+    assert seconds[data.index_of("2000-02")] == 29 * 86400  # leap year
+    assert seconds[data.index_of("2001-02")] == 28 * 86400
+
+
+def test_budget_constraint_closes_the_global_budget(data_and_cfg):
+    from Experiment import build_constraint
+
+    data, cfg = data_and_cfg
+    constraint = build_constraint(cfg, data)
+    assert [b[0] for b in constraint.budgets] == ["heat"]
+    f = data.fields
+    t = data.train_indices[:3]
+    previous = f["prognostic"][t]
+    pred = (previous + 0.3 * torch.randn(previous.shape, generator=torch.Generator().manual_seed(0))).requires_grad_()
+    before, _ = constraint.residual(pred, previous, t, t + 1, constraint.budgets[0])
+    out = constraint(pred, previous, t, t + 1)
+    after, _ = constraint.residual(out, previous, t, t + 1, constraint.budgets[0])
+    assert after.abs().max() < 1e-4 * before.abs().max()
+    land = f["mask"] == 0
+    assert torch.equal(out.detach()[..., land], pred.detach()[..., land])  # land untouched
+    out.sum().backward()  # linear in pred: gradients pass through
+    assert pred.grad is not None and torch.isfinite(pred.grad).all()
+    again = constraint(out.detach(), previous, t, t + 1)  # already closed: unchanged
+    torch.testing.assert_close(again, out.detach())
+
+
+def test_skill_test_closes_the_global_budget_every_month(data_and_cfg):
+    """With the constraint, the predicted ocean heat changes by exactly the surface flux each month."""
+    data, cfg = data_and_cfg
+    skill = run_skill_test(cfg, build_model(cfg, data), data)
+    f = data.fields
+    months = [pd.Timestamp(t).strftime("%Y-%m") for t in skill.time.values]
+    idx = [data.index_of(m) for m in months]
+    pred = skill.ocean_heat_content_2d_pred.fillna(0.0).astype("float64")
+    content = (pred * skill.area).sum(("latitude", "longitude")).values
+    flux = f["forcing_global"][idx, FORCING.index("total_surface_heat_flx")].numpy() * f["month_seconds"][idx].numpy()
+    change = np.diff(content)
+    expected = 0.5 * (flux[:-1] + flux[1:])
+    np.testing.assert_allclose(change, expected, rtol=1e-3, atol=1e-4 * np.abs(expected).max())
+
+
+def test_crps_loss_values():
+    from Emulator import crps_loss
+
+    loss = crps_loss(weight=1.0)
+    mask = torch.ones(2, 2)
+    target = torch.zeros(2, 1, 2, 2)  # one sample, two members
+    spread_members = torch.cat([torch.full((1, 1, 2, 2), 1.0), torch.full((1, 1, 2, 2), 3.0)])
+    # mean |x - y| = 2, minus sum |xi - xj| / (2 M (M - 1)) = 4 / 4 = 1
+    torch.testing.assert_close(loss(pred_t=spread_members, target_t=target, mask=mask, n_members=2, rollout_step=0),
+                               torch.tensor(1.0))
+    same = torch.full((2, 1, 2, 2), 2.0)  # identical members: CRPS = MAE
+    torch.testing.assert_close(loss(pred_t=same, target_t=target, mask=mask, n_members=2, rollout_step=0),
+                               torch.tensor(2.0))
+    with pytest.raises(ValueError, match="n_members"):
+        loss(pred_t=same, target_t=target, mask=mask, n_members=1, rollout_step=0)
+
+
+def test_paradigm_config_validation(synthetic_file, tmp_path):
+    cfg = make_cfg(synthetic_file, tmp_path)
+    ensemble_terms = {"crps": 1.0, "spectral": 0.5}
+    branch = cfg.with_changes(paradigm="crps_ensemble", loss={"terms": ensemble_terms}, train={"max_epochs": 3})
+    assert branch.paradigm == "crps_ensemble" and branch.train.max_epochs == 3 and cfg.train.max_epochs == 1
+    for changes, message in (
+        (dict(paradigm="gan"), "Unknown paradigm"),
+        (dict(loss={"terms": ensemble_terms}), "needs paradigm='crps_ensemble'"),
+        (dict(paradigm="crps_ensemble"), "needs an active 'crps'"),
+        (dict(paradigm="crps_ensemble", loss={"terms": {"crps": 1.0, "local_mse": 1.0}}), "drop 'local_mse'"),
+        (dict(diffusion={"sigma_min": 0.0}), "diffusion needs"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            cfg.with_changes(**changes)
+
+
+def test_crps_ensemble_branch_starts_from_the_trunk_and_trains(synthetic_file, tmp_path):
+    from Experiment import load_trunk
+
+    cfg = make_cfg(synthetic_file, tmp_path)
+    data = build_data(cfg, verbose=False)
+    trunk = build_model(cfg, data)
+    ens_cfg = cfg.with_changes(paradigm="crps_ensemble", loss={"terms": {"crps": 1.0, "spectral": 0.5}},
+                               ensemble={"train_members": 3})
+    ens = load_trunk(build_model(ens_cfg, data), trunk.state_dict())
+
+    # The noise weights start at zero: the branch starts out as the trunk.
+    w = data.windows(data.train_indices[:2], n_steps=1)
+    args = (w["prior"].flatten(1, 2), w["forcing"][:, 0], data.fields["mask"])
+    torch.testing.assert_close(ens(*args), trunk(*args))
+
+    module = build_module(ens_cfg, ens, build_losses(ens_cfg, data), data)
+    assert module.n_members == 3
+    trainer = build_trainer(ens_cfg)
+    trainer.fit(module, data.train_dl, data.valid_dl)
+    assert torch.isfinite(trainer.callback_metrics["train_crps"])
+    noise_weights = ens.backbone.enc1.conv.weight[:, -ens_cfg.ensemble.noise_channels:]
+    assert noise_weights.abs().sum() > 0  # training switched the noise on
+
+    skill = run_skill_test(ens_cfg, ens, data, members=3)
+    members = skill.ocean_heat_content_2d_ens_anom
+    assert members.sizes["member"] == 3 and float(members.std("member").max()) > 0
+    xr.testing.assert_allclose(skill.ocean_heat_content_2d_pred_mean_anom, members.mean("member"), rtol=1e-4)
+
+
+def test_diffusion_branch_trains_only_the_denoiser(synthetic_file, tmp_path):
+    from Experiment import build_diffusion, build_diffusion_module
+
+    cfg = make_cfg(synthetic_file, tmp_path)
+    data = build_data(cfg, verbose=False)
+    mean_model = build_model(cfg, data)
+    gen_cfg = cfg.with_changes(paradigm="diffusion", diffusion={"sampler_steps": 2, "width_multiplier": 1})
+    diffusion = build_diffusion(gen_cfg, data, mean_model)
+    assert float(diffusion.sigma_data) > 0
+    frozen = [p.detach().clone() for p in mean_model.parameters()]
+    denoiser_before = [p.detach().clone() for p in diffusion.denoiser.parameters()]
+
+    trainer = build_trainer(gen_cfg)
+    trainer.fit(build_diffusion_module(gen_cfg, diffusion, data), data.train_dl, data.valid_dl)
+    assert torch.isfinite(trainer.callback_metrics["val_loss"])
+    assert all(torch.equal(a, b) for a, b in zip(frozen, mean_model.parameters()))
+    assert any(not torch.equal(a, b) for a, b in zip(denoiser_before, diffusion.denoiser.parameters()))
+
+    sigmas = diffusion.noise_levels("cpu")
+    assert sigmas[0] == gen_cfg.diffusion.sigma_max and sigmas[-1] == 0 and len(sigmas) == 3
+    skill = run_skill_test(gen_cfg, diffusion, data, members=2)
+    members = skill.ocean_heat_content_2d_ens_anom
+    assert members.sizes["member"] == 2 and float(members.std("member").max()) > 0
+    assert np.isfinite(skill.ocean_heat_content_2d_pred.values[:, data.fields["mask"].numpy() > 0]).all()
+
+
+def test_intercomparison_scores_and_figures(data_and_cfg):
+    from Experiment import (ensemble_scores, intercomparison_summary, meridional_transports, plot_intercomparison,
+                            plot_intercomparison_spectra, plot_intercomparison_transports)
+
+    data, cfg = data_and_cfg
+    model = build_model(cfg, data)
+    skills = {"deterministic": run_skill_test(cfg, model, data),
+              "three identical members": run_skill_test(cfg, model, data, members=3)}
+
+    single, triple = (ensemble_scores(s, "ocean_heat_content_2d") for s in skills.values())
+    # A deterministic model gives identical members: no spread, and CRPS = MAE of the forecast.
+    np.testing.assert_allclose(triple.spread, 0.0, atol=1e-3 * float(triple.rmse_mean.max()))
+    np.testing.assert_allclose(triple.crps, single.crps, rtol=1e-4)
+    np.testing.assert_allclose(single.rmse_mean, triple.rmse_mean, rtol=1e-4)
+
+    summary = intercomparison_summary(skills, PROGNOSTIC, leads=(1, 12))
+    assert list(summary.index.get_level_values("emulator")) == list(skills)
+    assert np.isfinite(summary[["rmse/clim_12mo", "acc_12mo", "crps", "global_rms_error"]].values).all()
+
+    figures = [plot_intercomparison(skills, PROGNOSTIC), plot_intercomparison_spectra(skills, PROGNOSTIC)]
+    transports = {name: meridional_transports(cfg, data, skill) for name, skill in skills.items()}
+    figures.append(plot_intercomparison_transports(transports))
+    for fig in figures:
+        assert all(np.isfinite(line.get_ydata()).all() for ax in fig.axes for line in ax.lines)
+        plt.close(fig)

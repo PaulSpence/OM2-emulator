@@ -12,11 +12,18 @@ pipeline, model, losses, training and evaluation all live in this package.
     trainer = build_trainer(cfg)
     trainer.fit(module, data.train_dl, data.valid_dl)
     skill   = run_skill_test(cfg, model, data)
+
+Paradigms (cfg.paradigm): "deterministic", "crps_ensemble" (build_model adds
+noise inputs; trained with the "crps" term) and "diffusion" (build_diffusion on
+a trained deterministic model, trained with build_diffusion_module). Branches
+start from shared weights with load_trunk; intercomparison.py compares them.
 """
 
 from .config import (
     ClosureConfig,
     DataConfig,
+    DiffusionConfig,
+    EnsembleConfig,
     EvalConfig,
     ExperimentConfig,
     LossConfig,
@@ -26,10 +33,12 @@ from .config import (
     TrainConfig,
     WindowConfig,
 )
+from .constraints import GlobalBudgetConstraint, build_constraint
 from .data import ExperimentData, InitialMonthDataset, build_data, compute_normalisation, gather_windows
 from .evaluation import (
     check_known_closure,
     climatology_rmse,
+    default_members,
     global_integral,
     global_rmse,
     implied_meridional_transport,
@@ -42,8 +51,17 @@ from .evaluation import (
     skill_summary,
     zonal_spectrum,
 )
+from .diffusion import ResidualDiffusion, build_diffusion, build_diffusion_module
+from .intercomparison import (
+    ensemble_scores,
+    global_anomaly,
+    intercomparison_summary,
+    plot_intercomparison,
+    plot_intercomparison_spectra,
+    plot_intercomparison_transports,
+)
 from .losses import build_losses
-from .models import ForwardEmulator, build_model, count_parameters
+from .models import ForwardEmulator, build_model, count_parameters, load_trunk
 from .plots import (
     plot_control,
     plot_growth_mode,
@@ -62,6 +80,21 @@ from .plots import (
 from .training import EmulatorModule, build_module, build_trainer, check_gpu
 
 __all__ = [
+    "DiffusionConfig",
+    "EnsembleConfig",
+    "GlobalBudgetConstraint",
+    "build_constraint",
+    "default_members",
+    "ResidualDiffusion",
+    "build_diffusion",
+    "build_diffusion_module",
+    "ensemble_scores",
+    "global_anomaly",
+    "intercomparison_summary",
+    "plot_intercomparison",
+    "plot_intercomparison_spectra",
+    "plot_intercomparison_transports",
+    "load_trunk",
     "ClosureConfig",
     "DataConfig",
     "EvalConfig",
