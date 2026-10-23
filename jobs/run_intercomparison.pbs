@@ -1,14 +1,15 @@
 #!/bin/bash
 # Run notebooks/Emulator_intercomparison.ipynb headless on one Hopper GPU.
 # Same project, CPUs, memory, jobfs, storage, software and environment as the
-# ARE JupyterLab session it was developed in; only the queue differs.
+# ARE JupyterLab session it was developed in; only the queue (and walltime) differ.
 #
-#   qsub jobs/run_intercomparison.pbs
+#   qsub -v NOTEBOOK_COMMIT=$(git rev-parse HEAD) jobs/run_intercomparison.pbs
 #
-# Stages with saved weights (runs/intercomparison/<name>/weights.pt) are loaded,
-# not retrained (see RETRAIN in the notebook). The executed notebook, with all
-# outputs, is written to runs/intercomparison/Emulator_intercomparison_executed.ipynb;
-# figures go to figures/intercomparison/ as each cell finishes.
+# The notebook is taken from git at NOTEBOOK_COMMIT (default: HEAD when the job
+# starts), so editing or saving the working copy cannot change a queued run.
+# Outputs go where the notebook's RUN_NAME says (runs/<RUN_NAME>/,
+# figures/<RUN_NAME>/); stages with saved weights there are loaded, not retrained.
+# The executed notebook, with all outputs, and this log go to runs/.
 #PBS -N om2-intercomparison
 #PBS -P v46
 #PBS -q gpuhopper
@@ -20,7 +21,7 @@
 #PBS -l storage=gdata/cj50+gdata/e14+gdata/v46+gdata/p73+gdata/v45+gdata/x77+gdata/fs38+gdata/ik11+gdata/oi10+gdata/xp65+gdata/g40+gdata/ol01+gdata/nm47+gdata/dk92+gdata/rv74+gdata/rq0
 #PBS -l wd
 #PBS -j oe
-#PBS -o /home/156/txs156/uom/OM2-emulator/runs/intercomparison/job.log
+#PBS -o /home/156/txs156/uom/OM2-emulator/runs/
 
 set -euo pipefail
 
@@ -30,14 +31,18 @@ module load pet/2025.05
 export PYTHONUSERBASE=/g/data/v46/txs156/python-userbase
 
 cd "$REPO"
-echo "Job ${PBS_JOBID} on $(hostname) at $(date); commit $(git rev-parse --short HEAD)"
+COMMIT=${NOTEBOOK_COMMIT:-$(git rev-parse HEAD)}
+JOB=${PBS_JOBID%%.*}
+INPUT=runs/Emulator_intercomparison_${JOB}.ipynb
+git show "${COMMIT}:notebooks/Emulator_intercomparison.ipynb" > "$INPUT"
+echo "Job ${PBS_JOBID} on $(hostname) at $(date); notebook from commit ${COMMIT}"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
 jupyter nbconvert --to notebook --execute \
     --ExecutePreprocessor.timeout=-1 \
     --ExecutePreprocessor.kernel_name=python3 \
-    --output-dir runs/intercomparison \
-    --output Emulator_intercomparison_executed \
-    notebooks/Emulator_intercomparison.ipynb
+    --output-dir runs \
+    --output "Emulator_intercomparison_${JOB}_executed" \
+    "$INPUT"
 
 echo "Finished at $(date)"
