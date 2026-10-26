@@ -1603,12 +1603,14 @@ def test_samudra_unet_shapes_and_periodicity():
     from Emulator.samudra_unet import SamudraUNet
 
     torch.manual_seed(0)
+    # Samudra's dilations pad up to 8 cells around the 1/16-resolution middle,
+    # so the grid needs at least 8 columns there (the 1-degree grid has 22).
     net = SamudraUNet(8, 2, ch_width=[8, 12, 16, 16], dilation=[1, 2, 4, 8]).eval()
     # Odd grid sizes: pooling drops a row/column, the skips are matched back.
-    assert net(torch.randn(2, 8, 15, 21)).shape == (2, 2, 15, 21)
+    assert net(torch.randn(2, 8, 15, 141)).shape == (2, 2, 15, 141)
     # Periodic in longitude: shifting the input by a multiple of 16 columns (the
     # pooling factor over four levels) shifts the output by the same amount.
-    x = torch.randn(1, 8, 16, 32)
+    x = torch.randn(1, 8, 16, 128)
     torch.testing.assert_close(net(torch.roll(x, 16, dims=-1)), torch.roll(net(x), 16, dims=-1), atol=1e-5, rtol=1e-5)
 
 
