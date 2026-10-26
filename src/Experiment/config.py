@@ -30,7 +30,7 @@ KNOWN_NORMALISATION_STRATEGIES = (
     "Spatial_in_time",
     "Global_in_time",
 )
-KNOWN_ARCHITECTURES = ("unet",)
+KNOWN_ARCHITECTURES = ("unet", "samudra")
 KNOWN_OUTPUT_HEADS = (None, "spatial_residual")
 KNOWN_LATENT_PROCESSORS = (None, "latent_residual")
 # Fitting terms. Every budget in LossConfig.closures adds a "<budget>_closure" term.
@@ -222,6 +222,8 @@ class LossConfig:
 
 @dataclass
 class ModelConfig:
+    # "unet": this package's mask-aware UNet. "samudra": the Samudra ConvNeXt
+    # U-Net (Emulator.samudra_unet), sized by samudra_ch_width / samudra_dilation.
     arch: str = "unet"
     # North/south edge padding of every partial convolution (longitude is
     # always periodic; see PartialConv2d).
@@ -242,6 +244,11 @@ class ModelConfig:
     # Residual refinement of the UNet bottleneck: None or "latent_residual".
     latent_processor: str | None = None
     latent_residual_scale: float = 0.1
+    # arch="samudra": channel width and dilation per level. Samudra's published
+    # defaults ([200, 250, 300, 400], [1, 2, 4, 8]) are about 127 million
+    # parameters; scale the widths down for a size-matched comparison.
+    samudra_ch_width: list = field(default_factory=lambda: [200, 250, 300, 400])
+    samudra_dilation: list = field(default_factory=lambda: [1, 2, 4, 8])
 
 
 @dataclass
@@ -432,6 +439,13 @@ class ExperimentConfig:
             raise ValueError(f"Unknown output_head {m.output_head!r}; use {KNOWN_OUTPUT_HEADS}")
         if m.latent_processor not in KNOWN_LATENT_PROCESSORS:
             raise ValueError(f"Unknown latent_processor {m.latent_processor!r}; use {KNOWN_LATENT_PROCESSORS}")
+        if m.arch == "samudra":
+            if m.latent_processor is not None or m.output_head is not None:
+                raise ValueError("arch='samudra' supports neither latent_processor nor output_head")
+            if any(_dirichlet_value(n, c) is not None for n, c in d.boundary_conditions.items()):
+                raise ValueError("arch='samudra' does not fill land, so it has no Dirichlet boundary conditions")
+            if len(m.samudra_ch_width) != len(m.samudra_dilation) or len(m.samudra_ch_width) < 2:
+                raise ValueError("model.samudra_ch_width and samudra_dilation need one entry per level (at least 2)")
         if m.width_multiplier < 1:
             raise ValueError("model.width_multiplier must be >= 1")
         if m.padding_mode not in ("zeros", "replicate", "reflect", "circular"):

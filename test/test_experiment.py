@@ -1593,3 +1593,47 @@ def test_regrid_u_to_t_averages_the_ocean_corners():
     # A land corner is skipped, not propagated as NaN
     u[1, 1] = np.nan
     assert float(regrid_u_to_t(u, target)[1, 1]) == (4 + 1 + 0) / 3
+
+
+# =============================================================================
+# Samudra architecture (baseline)
+# =============================================================================
+
+def test_samudra_unet_shapes_and_periodicity():
+    from Emulator.samudra_unet import SamudraUNet
+
+    torch.manual_seed(0)
+    net = SamudraUNet(8, 2, ch_width=[8, 12, 16, 16], dilation=[1, 2, 4, 8]).eval()
+    # Odd grid sizes: pooling drops a row/column, the skips are matched back.
+    assert net(torch.randn(2, 8, 15, 21)).shape == (2, 2, 15, 21)
+    # Periodic in longitude: shifting the input by a multiple of 16 columns (the
+    # pooling factor over four levels) shifts the output by the same amount.
+    x = torch.randn(1, 8, 16, 32)
+    torch.testing.assert_close(net(torch.roll(x, 16, dims=-1)), torch.roll(net(x), 16, dims=-1), atol=1e-5, rtol=1e-5)
+
+
+def test_samudra_architecture_trains_in_the_pipeline(synthetic_file, tmp_path):
+    cfg = make_cfg(synthetic_file, tmp_path,
+                   model=ModelConfig(arch="samudra", samudra_ch_width=[8, 12], samudra_dilation=[1, 2]))
+    data = build_data(cfg, verbose=False)
+    model = build_model(cfg, data)
+    assert type(model.backbone).__name__ == "SamudraUNet"
+    trainer = build_trainer(cfg)
+    trainer.fit(build_module(cfg, model, build_losses(cfg, data), data), data.train_dl, data.valid_dl)
+    assert torch.isfinite(trainer.callback_metrics["val_loss"])
+    skill = run_skill_test(cfg, model, data)
+    ocean = data.fields["mask"].numpy() > 0
+    assert np.isfinite(skill.ocean_heat_content_2d_pred.values[:, ocean]).all()
+
+
+@pytest.mark.parametrize(
+    "model, message",
+    [
+        (dict(arch="samudra", latent_processor="latent_residual"), "neither latent_processor"),
+        (dict(arch="samudra", samudra_ch_width=[8, 12], samudra_dilation=[1]), "one entry per level"),
+        (dict(arch="samudra", samudra_ch_width=[8], samudra_dilation=[1]), "at least 2"),
+    ],
+)
+def test_samudra_config_validation(synthetic_file, tmp_path, model, message):
+    with pytest.raises(ValueError, match=message):
+        make_cfg(synthetic_file, tmp_path, model=ModelConfig(**model))

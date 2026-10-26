@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from Emulator import LatentResidualTuner, SpatialResidualHead, UNet
+from Emulator.samudra_unet import SamudraUNet
 
 from .config import _dirichlet_value
 
@@ -30,6 +31,10 @@ ARCHITECTURES = {
         width_multiplier=m.width_multiplier,
         dirichlet=dirichlet,
         width_channel_count=in_ch,
+    ),
+    # Samudra's ConvNeXt U-Net: no land filling, so no Dirichlet channels.
+    "samudra": lambda in_ch, out_ch, latent_processor, m, dirichlet, extra=0: SamudraUNet(
+        in_ch + extra, out_ch, ch_width=list(m.samudra_ch_width), dilation=list(m.samudra_dilation),
     ),
 }
 
