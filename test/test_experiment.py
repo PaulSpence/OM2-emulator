@@ -1525,3 +1525,71 @@ def test_read_metrics_keeps_the_latest_value_per_epoch(tmp_path):
     merged = read_metrics(tmp_path)
     assert list(merged["epoch"]) == [0, 1, 2]
     assert list(merged["train_loss"]) == [3.0, 1.5, 1.0]  # epoch 1 rerun after the resume wins
+
+
+# =============================================================================
+# Basin heat and freshwater content
+# =============================================================================
+
+def _basin_file(path):
+    """A basin-id file for the synthetic grid: ids 1-5 in longitude bands, 0 (land) in the first column."""
+    ids = np.repeat((np.arange(W) * 5 // W + 1)[None, :], H, axis=0).astype(np.int32)
+    ids[:, 0] = 0
+    xr.Dataset({"basin": (("yt_ocean", "xt_ocean"), ids)},
+               coords={"yt_ocean": np.linspace(-70, 80, H), "xt_ocean": np.linspace(-280, 79, W)}).to_netcdf(path)
+    return path
+
+
+def test_basins_add_up_to_the_global_integral(data_and_cfg, tmp_path):
+    from Experiment import basin_anomaly, basin_scores, global_anomaly, load_basins, plot_basin_content
+
+    data, cfg = data_and_cfg
+    skill = run_skill_test(cfg, build_model(cfg, data), data, members=2)
+    basins = load_basins(_basin_file(tmp_path / "basins.nc"), data.fields["latitude"], data.fields["longitude"])
+    assert list(basins.basin.values) == ["Southern Ocean", "Atlantic", "Indian", "Pacific", "Arctic"]
+    assert not bool((basins.sum("basin") > 1).any())  # no cell in two basins
+
+    name = "ocean_heat_content_2d"
+    per_basin = basin_anomaly(skill, name, basins, "truth")
+    covered = basins.any("basin")
+    expected = global_anomaly(skill.where(covered), name, "truth")
+    np.testing.assert_allclose(per_basin.sum("basin").values, expected.values, rtol=1e-5)
+    assert basin_anomaly(skill, name, basins, "ens").sizes["member"] == 2
+
+    scores = basin_scores({"model": skill}, [name], basins)
+    assert len(scores) == 5 and np.isfinite(scores["rms_error"]).all()
+    fig = plot_basin_content({"model": skill}, name, basins)
+    assert len([ax for ax in fig.axes if ax.lines]) == 5
+    plt.close(fig)
+
+
+def test_basin_mask_must_match_the_grid(tmp_path):
+    from Experiment import load_basins
+
+    with pytest.raises(ValueError, match="the grid is"):
+        load_basins(_basin_file(tmp_path / "basins.nc"), np.zeros(H + 1), np.zeros(W))
+
+
+# =============================================================================
+# u-cell to t-cell regridding (extraction)
+# =============================================================================
+
+def test_regrid_u_to_t_averages_the_ocean_corners():
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from om2_grid import regrid_u_to_t
+
+    xt, yt = np.arange(-279.5, -275.5), np.array([-60.0, -59.0, -58.0])
+    u = xr.DataArray(np.arange(12.0).reshape(3, 4), dims=("yu_ocean", "xu_ocean"),
+                     coords={"yu_ocean": yt + 0.5, "xu_ocean": xt + 0.5})
+    target = xr.Dataset(coords={"yt_ocean": yt, "xt_ocean": xt})
+    t = regrid_u_to_t(u, target)
+    assert t.dims == ("yt_ocean", "xt_ocean") and np.array_equal(t.xt_ocean, xt)
+    # t(1, 1): corners u(1,1)=5, u(1,0)=4, u(0,1)=1, u(0,0)=0
+    assert float(t[1, 1]) == 2.5
+    # The westernmost column wraps to the easternmost u-column: u(1,0)=4, u(1,3)=7, u(0,0)=0, u(0,3)=3
+    assert float(t[1, 0]) == 3.5
+    # The southernmost row has only its two northern corners: u(0,1)=1, u(0,0)=0
+    assert float(t[0, 1]) == 0.5
+    # A land corner is skipped, not propagated as NaN
+    u[1, 1] = np.nan
+    assert float(regrid_u_to_t(u, target)[1, 1]) == (4 + 1 + 0) / 3

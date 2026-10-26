@@ -53,7 +53,13 @@ from .evaluation import (
 )
 from .diffusion import ResidualDiffusion, build_diffusion, build_diffusion_module
 from .intercomparison import (
+    BASIN_GROUPS,
+    OM2_1DEG_BASIN_MASK,
+    basin_anomaly,
+    basin_scores,
     ensemble_scores,
+    load_basins,
+    plot_basin_content,
     global_anomaly,
     intercomparison_summary,
     plot_intercomparison,
@@ -92,6 +98,12 @@ __all__ = [
     "build_diffusion",
     "build_diffusion_module",
     "ensemble_scores",
+    "BASIN_GROUPS",
+    "OM2_1DEG_BASIN_MASK",
+    "basin_anomaly",
+    "basin_scores",
+    "load_basins",
+    "plot_basin_content",
     "global_anomaly",
     "intercomparison_summary",
     "plot_intercomparison",

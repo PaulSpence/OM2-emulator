@@ -212,3 +212,96 @@ def plot_intercomparison_transports(transports):
             ax.grid(alpha=0.3)
             ax.legend(frameon=False, fontsize=8)
     return fig
+
+
+# =============================================================================
+# Basin heat and freshwater content
+# =============================================================================
+
+# Basins as groups of COSIMA basin-mask ids (Collier, CSIRO 2021: 1 Southern
+# Ocean, 2 Atlantic, 3 Pacific, 4 Arctic, 5 Indian, 6 Mediterranean, 7 Black
+# Sea, 8 Hudson Bay, 9 Baltic, 10 Red Sea); marginal seas join their ocean.
+BASIN_GROUPS = {
+    "Southern Ocean": (1,),
+    "Atlantic": (2, 6, 7, 8, 9),
+    "Indian": (5, 10),
+    "Pacific": (3,),
+    "Arctic": (4,),
+}
+OM2_1DEG_BASIN_MASK = "/g/data/ik11/grids/om2_1deg_basinmask_yt_xt.nc"
+
+
+def load_basins(path, latitude, longitude, groups=BASIN_GROUPS):
+    """
+    (basin, latitude, longitude) boolean masks from a basin-id file on the
+    emulator's grid (e.g. OM2_1DEG_BASIN_MASK), one per entry of groups.
+    """
+    with xr.open_dataset(path) as ds:
+        ids = ds["basin"].rename({d: n for d, n in zip(ds["basin"].dims, ("latitude", "longitude"))}).load()
+    if ids.shape != (len(latitude), len(longitude)):
+        raise ValueError(f"{path} is {ids.shape}, the grid is {(len(latitude), len(longitude))}")
+    ids = ids.assign_coords(latitude=np.asarray(latitude), longitude=np.asarray(longitude))
+    masks = [ids.isin(list(members)) for members in groups.values()]
+    return xr.concat(masks, dim=pd.Index(list(groups), name="basin"))
+
+
+def basin_anomaly(skill, variable, basins, kind="pred"):
+    """Ocean-integrated anomaly per basin, (basin, time) (kind: pred, truth, pred_mean; or ens -> member too)."""
+    field = skill[f"{variable}_{kind}_anom"].fillna(0.0)
+    return (field * skill["area"] * basins).sum(("latitude", "longitude"))
+
+
+def basin_scores(skills, variables, basins):
+    """
+    One row per (variable, basin, emulator): RMS error of one member's basin
+    anomaly against the truth's, the correlation of the two time series, and
+    the trend error (per decade, as a fraction of the truth's trend).
+    """
+    rows = []
+    for variable in variables:
+        for name, skill in skills.items():
+            pred = basin_anomaly(skill, variable, basins)
+            truth = basin_anomaly(skill, variable, basins, "truth")
+            for basin in basins.basin.values:
+                p, t = pred.sel(basin=basin), truth.sel(basin=basin)
+                truth_trend = _trend_per_decade(t)
+                rows.append({
+                    "variable": variable, "basin": basin, "emulator": name,
+                    "rms_error": float(np.sqrt(((p - t) ** 2).mean())),
+                    "correlation": float(np.corrcoef(p.values, t.values)[0, 1]),
+                    "trend_error": (_trend_per_decade(p) - truth_trend) / abs(truth_trend) if truth_trend else np.nan,
+                })
+    return pd.DataFrame(rows).set_index(["variable", "basin", "emulator"])
+
+
+def plot_basin_content(skills, variable, basins):
+    """
+    Integrated anomaly of one variable per basin through the skill test: the
+    truth (black) and one member per emulator, with the ensemble range shaded
+    where there is one. One panel per basin, each on its own scale.
+    """
+    reference = next(iter(skills.values()))
+    units = reference[f"{variable}_truth_anom"].attrs.get("units", "")
+    names = list(basins.basin.values)
+    fig, axes = plt.subplots(1, len(names), figsize=(4.6 * len(names), 3.8), sharex=True, squeeze=False,
+                             constrained_layout=True)
+    truth = basin_anomaly(reference, variable, basins, "truth")
+    members = {name: basin_anomaly(skill, variable, basins) for name, skill in skills.items()}
+    ranges = {name: basin_anomaly(skill, variable, basins, "ens") for name, skill in skills.items()
+              if f"{variable}_ens_anom" in skill}
+    for ax, basin in zip(axes[0], names):
+        time = reference.time.values
+        ax.plot(time, truth.sel(basin=basin), label="ACCESS-OM2", **TRUTH_STYLE)
+        for name, series in members.items():
+            colour = _colour(skills, name)
+            ax.plot(time, series.sel(basin=basin), color=colour, lw=1.4, label=name)
+            if name in ranges:
+                ens = ranges[name].sel(basin=basin)
+                ax.fill_between(time, ens.min("member"), ens.max("member"), color=colour, alpha=0.15, lw=0)
+        ax.axhline(0.0, color="0.7", lw=0.8)
+        ax.set_title(f"{basin}", fontsize=11)
+        ax.set_ylabel(f"{variable} anomaly ({units} m$^2$)")
+        ax.grid(alpha=0.3)
+    axes[0, 0].legend(frameon=False, fontsize=8)
+    fig.suptitle(f"Basin-integrated {variable} anomaly through the skill test", fontsize=13)
+    return fig

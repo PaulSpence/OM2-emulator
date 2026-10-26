@@ -140,6 +140,19 @@ def build_fields(cfg):
             d.normalisation.area_weight,
         )
 
+        # A variable missing at ocean cells is silently filled with zero anomaly
+        # (z = 0) below: say so. (v1 of the dataset lost tau_x, tau_y and
+        # surface_speed in a ring of coastal cells and the seam column to its
+        # u-to-t regrid; see om2_grid.regrid_u_to_t.)
+        ocean = np.asarray(mask.values) == 1
+        for v in variables:
+            missing = int((ocean & ~np.isfinite(_rename_xy(ds[v]).isel(time=0).values)).sum())
+            if missing:
+                warnings.warn(
+                    f"{v} is missing at {missing} of {int(ocean.sum())} ocean cells (first month); "
+                    "those cells get zero anomaly. Regenerate the dataset if this is not intended."
+                )
+
         def normalised(v):
             field = _rename_xy(ds[v]).transpose("time", "latitude", "longitude")
             z = ((field - mean[v]) / std[v]).fillna(0.0)
