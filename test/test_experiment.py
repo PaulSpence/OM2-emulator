@@ -1607,7 +1607,7 @@ def test_samudra_unet_shapes_and_periodicity():
     # so the grid needs at least 8 columns there (the 1-degree grid has 22).
     net = SamudraUNet(8, 2, ch_width=[8, 12, 16, 16], dilation=[1, 2, 4, 8]).eval()
     # Odd grid sizes: pooling drops a row/column, the skips are matched back.
-    assert net(torch.randn(2, 8, 15, 141)).shape == (2, 2, 15, 141)
+    assert net(torch.randn(2, 8, 31, 141)).shape == (2, 2, 31, 141)
     # Periodic in longitude: shifting the input by a multiple of 16 columns (the
     # pooling factor over four levels) shifts the output by the same amount.
     x = torch.randn(1, 8, 16, 128)
