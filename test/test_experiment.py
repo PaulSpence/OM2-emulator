@@ -6,6 +6,7 @@ dataset, so the suite needs no /g/data access and no GPU.
 """
 
 import importlib.util
+import json
 import sys
 import types
 
@@ -1479,3 +1480,48 @@ def test_intercomparison_scores_and_figures(data_and_cfg):
     for fig in figures:
         assert all(np.isfinite(line.get_ydata()).all() for ax in fig.axes for line in ax.lines)
         plt.close(fig)
+
+
+# =============================================================================
+# Resuming an interrupted stage
+# =============================================================================
+
+def test_interrupted_training_resumes_from_the_last_epoch(synthetic_file, tmp_path):
+    """A stage cut short after epoch 0 carries on at epoch 1, keeping the training log and times of both."""
+    from Experiment import last_checkpoint, prepare_resume, read_metrics, training_minutes
+
+    run_dir = tmp_path / "run"
+    cfg = make_cfg(synthetic_file, tmp_path,
+                   train=TrainConfig(batch_size=8, max_epochs=1, gpu_check=False, run_dir=str(run_dir)))
+    data = build_data(cfg, verbose=False)
+    assert prepare_resume(run_dir) is None  # nothing to resume yet
+    build_trainer(cfg).fit(build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data),
+                           data.train_dl, data.valid_dl)
+    assert last_checkpoint(run_dir) is not None
+
+    # The "rest of the run": the same stage, two epochs, resumed in a new process.
+    longer = cfg.with_changes(train={"max_epochs": 2})
+    checkpoint = prepare_resume(run_dir)
+    assert checkpoint == last_checkpoint(run_dir) and (run_dir / "metrics_part0.csv").exists()
+    model = build_model(longer, data)
+    trainer = build_trainer(longer)
+    trainer.fit(build_module(longer, model, build_losses(longer, data), data), data.train_dl, data.valid_dl,
+                ckpt_path=checkpoint)
+    assert trainer.current_epoch == 2  # epoch 1 only was trained here
+
+    metrics = read_metrics(run_dir)
+    assert list(metrics["epoch"]) == [0, 1]
+    assert metrics[["train_loss", "val_loss"]].notna().all().all()
+    assert training_minutes(run_dir) > 0
+    assert sorted(json.loads((run_dir / "epoch_seconds.json").read_text())) == ["0", "1"]
+
+
+def test_read_metrics_keeps_the_latest_value_per_epoch(tmp_path):
+    from Experiment import read_metrics
+
+    pd.DataFrame({"epoch": [0, 1, 1], "step": [1, 2, 2], "train_loss": [3.0, 2.0, None]}).to_csv(
+        tmp_path / "metrics_part0.csv", index=False)
+    pd.DataFrame({"epoch": [1, 2], "step": [3, 4], "train_loss": [1.5, 1.0]}).to_csv(tmp_path / "metrics.csv", index=False)
+    merged = read_metrics(tmp_path)
+    assert list(merged["epoch"]) == [0, 1, 2]
+    assert list(merged["train_loss"]) == [3.0, 1.5, 1.0]  # epoch 1 rerun after the resume wins

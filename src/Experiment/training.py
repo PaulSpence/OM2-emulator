@@ -6,8 +6,10 @@ Training: the Lightning module, the rollout-length schedule and the Trainer.
     trainer.fit(module, data.train_dl, data.valid_dl)
 """
 
+import json
 import os
 import subprocess
+import time
 import warnings
 from pathlib import Path
 
@@ -284,6 +286,84 @@ class RolloutSchedule(Callback):
         pl_module.train_steps = steps
 
 
+# =============================================================================
+# Resuming an interrupted stage
+# =============================================================================
+
+def last_checkpoint(run_dir):
+    """
+    The newest last*.ckpt in run_dir/checkpoints, or None. ModelCheckpoint
+    (see build_trainer) overwrites it after every epoch, with the weights,
+    optimizer and learning-rate schedule and the epoch number, so
+    trainer.fit(..., ckpt_path=last_checkpoint(run_dir)) carries on from the
+    last completed epoch (the rollout schedule follows the epoch number).
+    """
+    if run_dir is None:
+        return None
+    candidates = sorted(Path(run_dir, "checkpoints").glob("last*.ckpt"), key=lambda p: p.stat().st_mtime)
+    return candidates[-1] if candidates else None
+
+
+def prepare_resume(run_dir):
+    """
+    The checkpoint to resume run_dir's training from (last_checkpoint), or
+    None. When resuming, the existing metrics.csv is renamed to
+    metrics_part<N>.csv first, because the CSV logger replaces metrics.csv
+    when training starts; read_metrics joins the parts.
+    """
+    checkpoint = last_checkpoint(run_dir)
+    log = Path(run_dir, "metrics.csv") if run_dir is not None else None
+    if checkpoint is not None and log.exists():
+        part = len(list(Path(run_dir).glob("metrics_part*.csv")))
+        log.rename(log.with_name(f"metrics_part{part}.csv"))
+    return checkpoint
+
+
+def read_metrics(run_dir):
+    """
+    The CSV training log of run_dir as one row per epoch: metrics_part*.csv
+    (from earlier, interrupted runs; see prepare_resume) then metrics.csv,
+    keeping the latest value of every column for each epoch.
+    """
+    run_dir = Path(run_dir)
+    parts = sorted(run_dir.glob("metrics_part*.csv"), key=lambda p: int(p.stem[len("metrics_part"):]))
+    files = [*parts, run_dir / "metrics.csv"]
+    frames = [pd.read_csv(f) for f in files if f.exists()]
+    if not frames:
+        raise FileNotFoundError(f"No metrics.csv in {run_dir}")
+    return pd.concat(frames, ignore_index=True).groupby("epoch", as_index=False).last()
+
+
+class EpochTimer(Callback):
+    """
+    Wall-clock seconds of every training epoch (validation included), kept in
+    run_dir/epoch_seconds.json as {epoch: seconds} and updated after each
+    epoch, so the training time of a stage adds up across interrupted and
+    resumed jobs (training_minutes).
+    """
+
+    def __init__(self, run_dir):
+        self.path = Path(run_dir) / "epoch_seconds.json"
+        self.start = None
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self.start = time.perf_counter()
+
+    def on_validation_end(self, trainer, pl_module):
+        if self.start is None or trainer.sanity_checking:
+            return
+        seconds = json.loads(self.path.read_text()) if self.path.exists() else {}
+        seconds[str(trainer.current_epoch)] = time.perf_counter() - self.start
+        self.path.write_text(json.dumps(seconds, indent=1))
+        self.start = None
+
+
+def training_minutes(run_dir):
+    """Total training wall time of run_dir in minutes (EpochTimer), or NaN if unrecorded."""
+    path = Path(run_dir) / "epoch_seconds.json"
+    return sum(json.loads(path.read_text()).values()) / 60 if path.exists() else float("nan")
+
+
 def build_module(cfg, model, losses, data):
     return EmulatorModule(model, losses, data, cfg)
 
@@ -307,7 +387,9 @@ def build_trainer(cfg):
         run_dir.mkdir(parents=True, exist_ok=True)
         cfg.save(run_dir / "config.json")
         logger = CSVLogger(save_dir=str(run_dir), name="", version="")
+        # save_last: checkpoints/last.ckpt is overwritten after every epoch (see last_checkpoint).
         callbacks.append(ModelCheckpoint(dirpath=run_dir / "checkpoints", monitor="val_loss", save_last=True))
+        callbacks.append(EpochTimer(run_dir))
         checkpointing = True
 
     if use_gpu:

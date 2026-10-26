@@ -14,6 +14,7 @@ import pandas as pd
 import xarray as xr
 
 from .evaluation import global_integral, global_rmse, skill_diagnostics, zonal_spectrum
+from .training import read_metrics
 
 # Display units for implied transports, by content units: J/m2 -> W -> PW, kg/m2 -> kg/s -> Sv.
 _TRANSPORT_UNITS = {"J/m2": (1e15, "PW"), "J m-2": (1e15, "PW"), "kg m-2": (1e9, "Sv"), "kg/m2": (1e9, "Sv")}
@@ -280,7 +281,7 @@ def plot_rmse_by_epoch(history, variables=None, baselines=None):
      "Validation climatology (zero anomaly)": evaluation.climatology_rmse(...)}.
     """
     if not isinstance(history, pd.DataFrame):
-        metrics = pd.read_csv(Path(history) / "metrics.csv")
+        metrics = read_metrics(history)
         rows = []
         for column in metrics.columns:
             for stage in ("train", "val"):
@@ -370,7 +371,7 @@ def plot_control(control, variables=None):
 
 def plot_training_history(run_dir):
     """Train/validation loss per epoch from the CSV log in run_dir (needs train.run_dir)."""
-    metrics = pd.read_csv(Path(run_dir) / "metrics.csv")
+    metrics = read_metrics(run_dir)
     fig, ax = plt.subplots(figsize=(11, 4.5), constrained_layout=True)
     for column in ("train_loss", "val_loss"):
         if column in metrics:

@@ -77,7 +77,10 @@ from .plots import (
     plot_training_history,
     prognostic_variables,
 )
-from .training import EmulatorModule, build_module, build_trainer, check_gpu
+from .training import (
+    EmulatorModule, build_module, build_trainer, check_gpu, last_checkpoint, prepare_resume, read_metrics,
+    training_minutes,
+)
 
 __all__ = [
     "DiffusionConfig",
@@ -144,4 +147,8 @@ __all__ = [
     "build_module",
     "build_trainer",
     "check_gpu",
+    "last_checkpoint",
+    "prepare_resume",
+    "read_metrics",
+    "training_minutes",
 ]
