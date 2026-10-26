@@ -9,7 +9,7 @@
 # starts), so editing or saving the working copy cannot change a queued run.
 # Outputs go where the notebook's RUN_NAME says (runs/<RUN_NAME>/,
 # figures/<RUN_NAME>/); stages with saved weights there are loaded, not retrained.
-# The executed notebook, with all outputs, and this log go to runs/.
+# The executed notebook, with all outputs, and this log (<jobid>.gadi-pbs.OU) go to runs/.
 #PBS -N om2-intercomparison
 #PBS -P v46
 #PBS -q gpuhopper
@@ -26,6 +26,9 @@
 set -euo pipefail
 
 REPO=/home/156/txs156/uom/OM2-emulator
+# Start from no modules: ~/.bashrc loads conda/analysis3, cuda and openmpi/4.1.7,
+# and pet/2025.05 needs openmpi/4.1.5 (the first submission failed on this conflict).
+module purge
 module use /g/data/dk92/apps/Modules/modulefiles
 module load pet/2025.05
 export PYTHONUSERBASE=/g/data/v46/txs156/python-userbase
