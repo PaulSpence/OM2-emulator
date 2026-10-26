@@ -10,6 +10,9 @@
 # Outputs go where the notebook's RUN_NAME says (runs/<RUN_NAME>/,
 # figures/<RUN_NAME>/); stages with saved weights there are loaded, not retrained.
 # The executed notebook, with all outputs, and this log (<jobid>.gadi-pbs.OU) go to runs/.
+# The notebook also reads INTERCOMPARISON_RUN (run name) and INTERCOMPARISON_DATA
+# (dataset path) from the environment; pass them with -v to run another experiment, e.g.
+#   qsub -v NOTEBOOK_COMMIT=...,INTERCOMPARISON_RUN=intercomparison_90ep_v2,INTERCOMPARISON_DATA=/g/data/nm47/txs156/OM2-emulator/data/1deg_ocean_heat_emulator_data_v2.nc jobs/run_intercomparison.pbs
 #PBS -N om2-intercomparison
 #PBS -P v46
 #PBS -q gpuhopper

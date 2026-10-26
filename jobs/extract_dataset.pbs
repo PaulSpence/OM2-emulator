@@ -1,0 +1,47 @@
+#!/bin/bash
+# Build the emulator dataset from the ACCESS-OM2 1-degree IAF output by running
+# notebooks/Extract_om2_data.ipynb headless (CPU, dask). It writes the file named
+# by the notebook's OUTPUT_PATH (currently ..._v2.nc: wind stress and surface
+# speed averaged from their four u-corners, defined at every ocean cell).
+#
+#   qsub -v NOTEBOOK_COMMIT=$(git rev-parse HEAD) jobs/extract_dataset.pbs
+#
+# The notebook is taken from git at NOTEBOOK_COMMIT (default: HEAD when the job
+# starts). The executed notebook and this log (<jobid>.gadi-pbs.OU) go to runs/.
+#PBS -N om2-extract
+#PBS -P v46
+#PBS -q normal
+#PBS -l ncpus=48
+#PBS -l mem=190GB
+#PBS -l jobfs=200GB
+#PBS -l walltime=08:00:00
+#PBS -l storage=gdata/ik11+gdata/nm47+gdata/xp65+gdata/v46
+#PBS -l wd
+#PBS -j oe
+#PBS -o /home/156/txs156/uom/OM2-emulator/runs/
+
+set -euo pipefail
+
+REPO=/home/156/txs156/uom/OM2-emulator
+# Start from no modules (see run_intercomparison.pbs), then the analysis3 environment.
+module purge
+module use /g/data/xp65/public/modules
+module load conda/analysis3-26.10
+# Let dask spill to the job's local disk rather than to home.
+export DASK_TEMPORARY_DIRECTORY="${PBS_JOBFS}"
+
+cd "$REPO"
+COMMIT=${NOTEBOOK_COMMIT:-$(git rev-parse HEAD)}
+JOB=${PBS_JOBID%%.*}
+INPUT=runs/Extract_om2_data_${JOB}.ipynb
+git show "${COMMIT}:notebooks/Extract_om2_data.ipynb" > "$INPUT"
+echo "Job ${PBS_JOBID} on $(hostname) at $(date); notebook from commit ${COMMIT}"
+
+jupyter nbconvert --to notebook --execute \
+    --ExecutePreprocessor.timeout=-1 \
+    --ExecutePreprocessor.kernel_name=python3 \
+    --output-dir runs \
+    --output "Extract_om2_data_${JOB}_executed" \
+    "$INPUT"
+
+echo "Finished at $(date)"
