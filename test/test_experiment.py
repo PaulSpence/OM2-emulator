@@ -1673,4 +1673,4 @@ def test_diffusion_rollout_training(synthetic_file, tmp_path):
 def test_diffusion_config_trains_one_step_at_a_time(synthetic_file, tmp_path):
     cfg = make_cfg(synthetic_file, tmp_path)
     with pytest.raises(ValueError, match="one step at a time"):
-        cfg.with_changes(paradigm="diffusion", window={"rollout_steps": [2, 3]})
+        cfg.with_changes(paradigm="diffusion", window={"rollout_steps": [1, 2]})
