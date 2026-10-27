@@ -254,8 +254,10 @@ def basin_anomaly(skill, variable, basins, kind="pred"):
 def basin_scores(skills, variables, basins):
     """
     One row per (variable, basin, emulator): RMS error of one member's basin
-    anomaly against the truth's, the correlation of the two time series, and
-    the trend error (per decade, as a fraction of the truth's trend).
+    anomaly against the truth's, the correlation of the two time series, the
+    truth's linear trend and the emulator's trend error, both per decade in the
+    integrated units (e.g. J). The error is absolute, not a fraction of the
+    truth's trend, which is near zero in some basins.
     """
     rows = []
     for variable in variables:
@@ -269,7 +271,8 @@ def basin_scores(skills, variables, basins):
                     "variable": variable, "basin": basin, "emulator": name,
                     "rms_error": float(np.sqrt(((p - t) ** 2).mean())),
                     "correlation": float(np.corrcoef(p.values, t.values)[0, 1]),
-                    "trend_error": (_trend_per_decade(p) - truth_trend) / abs(truth_trend) if truth_trend else np.nan,
+                    "truth_trend_per_decade": truth_trend,
+                    "trend_error_per_decade": _trend_per_decade(p) - truth_trend,
                 })
     return pd.DataFrame(rows).set_index(["variable", "basin", "emulator"])
 

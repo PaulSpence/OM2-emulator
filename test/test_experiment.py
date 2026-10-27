@@ -1435,7 +1435,8 @@ def test_diffusion_branch_trains_only_the_denoiser(synthetic_file, tmp_path):
     cfg = make_cfg(synthetic_file, tmp_path)
     data = build_data(cfg, verbose=False)
     mean_model = build_model(cfg, data)
-    gen_cfg = cfg.with_changes(paradigm="diffusion", diffusion={"sampler_steps": 2, "width_multiplier": 1})
+    gen_cfg = cfg.with_changes(paradigm="diffusion", diffusion={"sampler_steps": 2, "width_multiplier": 1},
+                               window={"rollout_steps": 1})
     diffusion = build_diffusion(gen_cfg, data, mean_model)
     assert float(diffusion.sigma_data) > 0
     frozen = [p.detach().clone() for p in mean_model.parameters()]
@@ -1558,6 +1559,10 @@ def test_basins_add_up_to_the_global_integral(data_and_cfg, tmp_path):
 
     scores = basin_scores({"model": skill}, [name], basins)
     assert len(scores) == 5 and np.isfinite(scores["rms_error"]).all()
+    # Absolute trend error: zero for the truth itself, whatever its trend.
+    truth_as_model = skill.assign({f"{name}_pred_anom": skill[f"{name}_truth_anom"]})
+    np.testing.assert_allclose(basin_scores({"t": truth_as_model}, [name], basins)["trend_error_per_decade"], 0.0,
+                               atol=1e-6 * float(np.abs(scores["truth_trend_per_decade"]).max()) + 1e-30)
     fig = plot_basin_content({"model": skill}, name, basins)
     assert len([ax for ax in fig.axes if ax.lines]) == 5
     plt.close(fig)
@@ -1639,3 +1644,33 @@ def test_samudra_architecture_trains_in_the_pipeline(synthetic_file, tmp_path):
 def test_samudra_config_validation(synthetic_file, tmp_path, model, message):
     with pytest.raises(ValueError, match=message):
         make_cfg(synthetic_file, tmp_path, model=ModelConfig(**model))
+
+
+def test_diffusion_rollout_training(synthetic_file, tmp_path):
+    """[n_free, 1]: the full model runs n_free months freely, then the denoiser learns the next residual."""
+    from Experiment import build_diffusion, build_diffusion_module
+
+    cfg = make_cfg(synthetic_file, tmp_path)
+    data = build_data(cfg, verbose=False)
+    gen_cfg = cfg.with_changes(paradigm="diffusion", window={"rollout_steps": [2, 1]},
+                               diffusion={"sampler_steps": 2, "pushforward_sampler_steps": 1, "width_multiplier": 1})
+    diffusion = build_diffusion(gen_cfg, data, build_model(cfg, data))
+    module = build_diffusion_module(gen_cfg, diffusion, data)
+    assert module.train_steps == (2, 1)
+
+    t0 = data.train_indices[:2]
+    window = module.push_forward(t0, 2)
+    truth = data.windows(t0, n_steps=3)
+    assert not window["prior"].requires_grad
+    assert not torch.allclose(window["prior"][:, -1], truth["target"][:, 1])  # the model's own state, not the truth's
+    torch.testing.assert_close(window["target"][:, 0], truth["target"][:, 2])  # the month after the free run
+
+    trainer = build_trainer(gen_cfg)
+    trainer.fit(module, data.train_dl, data.valid_dl)
+    assert torch.isfinite(trainer.callback_metrics["train_loss"]) and torch.isfinite(trainer.callback_metrics["val_loss"])
+
+
+def test_diffusion_config_trains_one_step_at_a_time(synthetic_file, tmp_path):
+    cfg = make_cfg(synthetic_file, tmp_path)
+    with pytest.raises(ValueError, match="one step at a time"):
+        cfg.with_changes(paradigm="diffusion", window={"rollout_steps": [2, 3]})

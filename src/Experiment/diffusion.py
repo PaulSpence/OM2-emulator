@@ -31,6 +31,8 @@ import torch.nn as nn
 
 from Emulator import UNet
 
+from .config import rollout_spec
+from .constraints import build_constraint
 from .data import gather_windows
 from .models import dirichlet_channels
 
@@ -86,10 +88,10 @@ class ResidualDiffusion(nn.Module):
         return (weight * (denoised - residual) ** 2 * cell).sum() / (residual.shape[0] * residual.shape[1])
 
     # --------------------------------------------------------------- sampling
-    def noise_levels(self, device):
-        """The sampler's decreasing noise levels sigma_0 > ... > sigma_{N-1}, then 0."""
+    def noise_levels(self, device, steps=None):
+        """The sampler's decreasing noise levels sigma_0 > ... > sigma_{N-1}, then 0 (N = steps or sampler_steps)."""
         s = self.settings
-        n = s.sampler_steps
+        n = steps or s.sampler_steps
         i = torch.arange(n, device=device, dtype=torch.float64)
         ramp = i / max(n - 1, 1)
         smax, smin = s.sigma_max ** (1 / s.rho), s.sigma_min ** (1 / s.rho)
@@ -97,9 +99,9 @@ class ResidualDiffusion(nn.Module):
         return torch.cat([sigmas, sigmas.new_zeros(1)]).float()
 
     @torch.no_grad()
-    def sample_residual(self, condition, mask, shape):
-        """Heun (EDM Algorithm 1) from pure noise at sigma_max to a residual sample."""
-        sigmas = self.noise_levels(condition.device)
+    def sample_residual(self, condition, mask, shape, steps=None):
+        """Heun (EDM Algorithm 1) from pure noise at sigma_max to a residual sample, in `steps` (default sampler_steps)."""
+        sigmas = self.noise_levels(condition.device, steps)
         x = torch.randn(shape, device=condition.device) * sigmas[0]
         ones = torch.ones(shape[0], 1, 1, 1, device=condition.device)
         for current, nxt in zip(sigmas[:-1], sigmas[1:]):
@@ -111,10 +113,10 @@ class ResidualDiffusion(nn.Module):
             x = x_next
         return x
 
-    def forward(self, prior, forcing, mask):
+    def forward(self, prior, forcing, mask, sampler_steps=None):
         """One sampled next state: the deterministic mean plus a sampled residual."""
         mean = self.mean(prior, forcing, mask)
-        residual = self.sample_residual(self.condition(prior, forcing, mean), mask, mean.shape)
+        residual = self.sample_residual(self.condition(prior, forcing, mean), mask, mean.shape, sampler_steps)
         return (mean + residual).float()
 
 
@@ -166,15 +168,31 @@ def residual_rms(mean_model, data, n_batches):
 
 class DiffusionModule(L.LightningModule):
     """
-    Trains the denoiser of a ResidualDiffusion on one-step windows (true
-    inputs). The mean model stays frozen. Logs train_loss / val_loss; the
-    validation loss uses a fixed random seed so epochs are comparable.
+    Trains the denoiser of a ResidualDiffusion on one-step residuals. The mean
+    model stays frozen.
+
+    Rollout (pushforward) training: with rollout_steps [n_free, 1] (or a
+    schedule of them; see WindowConfig) the full model first runs n_free months
+    freely from the true state, without gradients: mean + sampled residual, with
+    diffusion.pushforward_sampler_steps Heun steps and the budget constraint.
+    The denoiser then learns the next month's residual from that drifted state,
+    i.e. to correct the drift its own samples cause. Trained on true inputs only,
+    a residual model adds independent noise every month and the variance of free
+    runs grows without bound.
+
+    Logs train_loss / val_loss; validation is one step from true states with a
+    fixed random seed, so epochs are comparable.
     """
 
     def __init__(self, diffusion, data, cfg):
         super().__init__()
         self.diffusion = diffusion
         self.n_prior = cfg.window.n_prior
+        self.n_prognostic = diffusion.n_prognostic
+        # (n_free, 1); updated by RolloutSchedule, if used.
+        self.train_steps = rollout_spec(cfg.window.rollout_steps)
+        self.free_sampler_steps = cfg.diffusion.pushforward_sampler_steps
+        self.constraint = build_constraint(cfg, data)
         tr = cfg.train
         self.lr, self.weight_decay = tr.lr, tr.weight_decay
         self.lr_scheduler, self.max_epochs = tr.lr_scheduler, tr.max_epochs
@@ -184,13 +202,36 @@ class DiffusionModule(L.LightningModule):
         self.register_buffer("mask", f["mask"].float())
         self.register_buffer("area", f["area"].float())
 
-    def _loss(self, t0):
-        w = gather_windows(self.prognostic_z, self.forcing_z, t0, self.n_prior, 1)
+    def push_forward(self, t0, n_free):
+        """
+        Run the full model n_free months from the true states at t0, without
+        gradients, and return the one-step window that follows (gather_windows
+        layout) with the model's own states as the prior.
+        """
+        t0 = torch.as_tensor(t0, dtype=torch.long, device=self.prognostic_z.device)
+        prior = gather_windows(self.prognostic_z, self.forcing_z, t0, self.n_prior, 0)["prior"].flatten(1, 2)
+        with torch.no_grad():
+            for k in range(1, n_free + 1):
+                pred = self.diffusion(prior, self.forcing_z[t0 + k], self.mask, sampler_steps=self.free_sampler_steps)
+                if self.constraint is not None:
+                    pred = self.constraint(pred, prior[:, -self.n_prognostic:], t0 + k - 1, t0 + k)
+                prior = torch.cat([prior[:, self.n_prognostic:], pred.to(prior.dtype)], dim=1)
+        # Weight copies cached by autocast without gradients must not reach the loss (see EmulatorModule).
+        torch.clear_autocast_cache()
+        window = gather_windows(self.prognostic_z, self.forcing_z, t0 + n_free, self.n_prior, 1)
+        window["prior"] = prior.unflatten(1, (self.n_prior, self.n_prognostic))
+        return window
+
+    def _loss(self, t0, n_free=0):
+        if n_free:
+            w = self.push_forward(t0, n_free)
+        else:
+            w = gather_windows(self.prognostic_z, self.forcing_z, t0, self.n_prior, 1)
         return self.diffusion.loss(w["prior"].flatten(1, 2), w["forcing"][:, 0], w["target"][:, 0],
                                    self.mask, self.area)
 
     def training_step(self, batch, batch_idx):
-        loss = self._loss(batch)
+        loss = self._loss(batch, self.train_steps[0])
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=len(batch))
         return loss
 
