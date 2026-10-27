@@ -1674,3 +1674,20 @@ def test_diffusion_config_trains_one_step_at_a_time(synthetic_file, tmp_path):
     cfg = make_cfg(synthetic_file, tmp_path)
     with pytest.raises(ValueError, match="one step at a time"):
         cfg.with_changes(paradigm="diffusion", window={"rollout_steps": [1, 2]})
+
+
+def test_surface_freshwater_flux_closes_the_column_budget():
+    """Freshwater content sum(rho dz (S_ref - S) / S_ref), S in g/kg: its tendency equals the flux."""
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from om2_grid import surface_freshwater_flux
+
+    s_ref, dt = 35.0, 86400.0
+    rho_dz = np.array([1025.0 * 10, 1026.0 * 20])           # kg m^-2 per layer
+    salt = np.array([34.0, 34.6])                           # g/kg
+    fwc = lambda m, s: float((m * (s_ref - s) / s_ref).sum())
+    pme, runoff, ice_salt = 2e-5, 1e-6, 3e-7                # kg m^-2 s^-1; ice salt flux in kg of salt
+    # The mass flux adds water to the top layer, the salt flux adds salt there.
+    mass_after = rho_dz + np.array([(pme + runoff) * dt, 0.0])
+    salt_g_after = rho_dz * salt + np.array([1000.0 * ice_salt * dt, 0.0])
+    tendency = (fwc(mass_after, salt_g_after / mass_after) - fwc(rho_dz, salt)) / dt
+    np.testing.assert_allclose(surface_freshwater_flux(pme, runoff, ice_salt, s_ref), tendency, rtol=1e-6)
