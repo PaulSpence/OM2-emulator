@@ -675,6 +675,29 @@ def test_mask_aware_conv_fills_land_then_convolves(kernel_size, stride, padding)
         torch.testing.assert_close(new_mask[:1], torch.nn.functional.adaptive_max_pool2d(mask, out.shape[-2:]))
 
 
+@pytest.mark.parametrize("padding_mode", ["zeros", "replicate", "reflect", "circular"])
+@pytest.mark.parametrize("padding", [1, 2, 3])
+def test_fill_and_pad_is_fill_land_then_pad(padding_mode, padding):
+    """The one-gather fill + tripolar pad gives the same values and gradients as the separate steps."""
+    from Emulator import PartialConv2d
+    from Emulator.om2_model_utils import fill_land
+
+    torch.manual_seed(0)
+    layer = PartialConv2d(5, 6, 3, 1, padding, padding_mode=padding_mode)
+    mask = (torch.rand(1, 1, H, W) > 0.3).float()
+    for layout in (torch.contiguous_format, torch.channels_last):
+        x = torch.randn(2, 5, H, W).contiguous(memory_format=layout).requires_grad_()
+        x_ref = x.detach().clone().requires_grad_()
+        out = layer._fill_and_pad(x, mask)
+        expected = layer._pad(fill_land(x_ref, mask))
+        assert torch.equal(out, expected)
+        assert out.is_contiguous(memory_format=layout)
+        weight = torch.randn_like(expected)
+        (out * weight).sum().backward()
+        (expected * weight).sum().backward()
+        torch.testing.assert_close(x.grad, x_ref.grad)
+
+
 def test_output_ignores_input_values_on_land():
     """Land inputs are overwritten (Neumann or Dirichlet) before every layer, so they cannot affect the output."""
     from Emulator import UNet
@@ -1192,6 +1215,34 @@ def test_fill_land_keeps_channels_last():
     out_cl = fill_land(x_cl, mask, dirichlet={2: 0.5})
     assert out_cl.is_contiguous(memory_format=torch.channels_last)
     torch.testing.assert_close(out_cl, fill_land(x, mask, dirichlet={2: 0.5}))
+
+
+def test_unet_feeds_every_layer_channels_last():
+    """
+    With a channels_last input, every convolution must get a channels_last
+    input. Otherwise the land fill takes its standard-layout path, whose
+    backward is several times slower, and cuDNN transposes the input: the
+    decoder layers after upsample_periodic_x did this.
+    """
+    from Emulator import UNet
+    from Emulator.om2_model_utils import PartialConv2d, upsample_periodic_x
+
+    torch.manual_seed(0)
+    unet = UNet(input_channel_count=5, output_channel_count=2, padding_mode="zeros").to(memory_format=torch.channels_last)
+    layouts = {}
+    for name, module in unet.named_modules():
+        if isinstance(module, PartialConv2d):
+            module.register_forward_pre_hook(
+                lambda _, args, name=name: layouts.__setitem__(name, args[0].is_contiguous(memory_format=torch.channels_last))
+            )
+    mask = (torch.rand(1, 1, H, W) > 0.3).float()
+    unet(torch.randn(2, 5, H, W).contiguous(memory_format=torch.channels_last), mask)
+    assert layouts and all(layouts.values()), [name for name, ok in layouts.items() if not ok]
+
+    x = torch.randn(2, 3, 5, 10)
+    out = upsample_periodic_x(x.contiguous(memory_format=torch.channels_last), (10, 20))
+    assert out.is_contiguous(memory_format=torch.channels_last)
+    torch.testing.assert_close(out, upsample_periodic_x(x, (10, 20)))
 
 
 def test_local_mse_is_area_weighted():
