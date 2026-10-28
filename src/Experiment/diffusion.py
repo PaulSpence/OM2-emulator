@@ -35,6 +35,7 @@ from .config import rollout_spec
 from .constraints import build_constraint
 from .data import gather_windows
 from .models import dirichlet_channels
+from .training import check_finite
 
 
 class ResidualDiffusion(nn.Module):
@@ -232,6 +233,7 @@ class DiffusionModule(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss = self._loss(batch, self.train_steps[0])
+        check_finite(loss, self.current_epoch)
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=len(batch))
         return loss
 

@@ -35,6 +35,7 @@ ARCHITECTURES = {
     # Samudra's ConvNeXt U-Net: no land filling, so no Dirichlet channels.
     "samudra": lambda in_ch, out_ch, latent_processor, m, dirichlet, extra=0: SamudraUNet(
         in_ch + extra, out_ch, ch_width=list(m.samudra_ch_width), dilation=list(m.samudra_dilation),
+        width_channel_count=in_ch,
     ),
 }
 

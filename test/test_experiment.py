@@ -5,6 +5,7 @@ Everything runs on a small synthetic NetCDF file shaped like the emulator
 dataset, so the suite needs no /g/data access and no GPU.
 """
 
+import dataclasses
 import importlib.util
 import json
 import sys
@@ -1691,3 +1692,56 @@ def test_surface_freshwater_flux_closes_the_column_budget():
     salt_g_after = rho_dz * salt + np.array([1000.0 * ice_salt * dt, 0.0])
     tendency = (fwc(mass_after, salt_g_after / mass_after) - fwc(rho_dz, salt)) / dt
     np.testing.assert_allclose(surface_freshwater_flux(pme, runoff, ice_salt, s_ref), tendency, rtol=1e-6)
+
+
+# =============================================================================
+# Long-term comparison: Samudra-style baseline, Samudra CRPS, safeguards
+# =============================================================================
+
+class _NaNModel(torch.nn.Module):
+    def __init__(self, n_prognostic):
+        super().__init__()
+        self.n_prognostic = n_prognostic
+        self.dummy = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, prior, forcing, mask):
+        return prior[:, -self.n_prognostic:] * float("nan") + self.dummy
+
+
+def test_training_stops_on_a_non_finite_loss(data_and_cfg):
+    data, cfg = data_and_cfg
+    module = build_module(cfg, _NaNModel(data.n_prognostic), build_losses(cfg, data), data)
+    with pytest.raises(FloatingPointError, match="Non-finite training loss"):
+        module._step(data.train_indices[:2], 1, "train")
+
+
+def test_samudra_crps_branch_starts_from_the_deterministic_weights(synthetic_file, tmp_path):
+    from Experiment import load_trunk
+
+    cfg = make_cfg(synthetic_file, tmp_path,
+                   model=ModelConfig(arch="samudra", samudra_ch_width=[8, 12], samudra_dilation=[1, 2]))
+    data = build_data(cfg, verbose=False)
+    deterministic = build_model(cfg, data).eval()
+    ens_cfg = cfg.with_changes(paradigm="crps_ensemble", loss={"terms": {"crps": 1.0, "spectral": 0.5}})
+    ensemble = load_trunk(build_model(ens_cfg, data), deterministic.state_dict()).eval()
+    w = data.windows(data.train_indices[:2], n_steps=1)
+    args = (w["prior"].flatten(1, 2), w["forcing"][:, 0], data.fields["mask"])
+    torch.testing.assert_close(ensemble(*args), deterministic(*args))  # noise weights start at zero
+
+
+def test_unconstrained_baseline_has_no_budget_constraint(synthetic_file, tmp_path):
+    from Experiment import ClosureConfig, build_constraint, intercomparison_summary
+
+    cfg = make_cfg(synthetic_file, tmp_path)
+    free = cfg.with_changes(loss={"closures": {
+        name: dataclasses.replace(c, enforce=False) for name, c in cfg.loss.closures.items()}})
+    data = build_data(free, verbose=False)
+    assert build_constraint(cfg, data) is not None and build_constraint(free, data) is None
+    skill = run_skill_test(free, build_model(free, data), data)
+
+    # Decadal pattern error: 0 for the truth itself.
+    name = "ocean_heat_content_2d"
+    perfect = skill.assign({f"{name}_pred_mean_anom": skill[f"{name}_truth_anom"]})
+    table = intercomparison_summary({"perfect": perfect, "model": skill}, [name], leads=(1,))
+    assert table.loc[(name, "perfect"), "decadal_pattern_error"] == pytest.approx(0.0, abs=1e-6)
+    assert np.isfinite(table.loc[(name, "model"), "decadal_pattern_error"])

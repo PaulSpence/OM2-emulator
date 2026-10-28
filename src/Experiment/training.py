@@ -94,6 +94,17 @@ class PerVariableError:
         return rmse
 
 
+def check_finite(loss, epoch):
+    """
+    Stop training on a non-finite loss. Under mixed precision the gradient
+    scaler silently skips every update whose loss is NaN or inf, so without
+    this a broken stage "trains" for all its epochs, changes nothing, and still
+    saves weights (as the first rollout-trained diffusion run did).
+    """
+    if not torch.isfinite(loss):
+        raise FloatingPointError(f"Non-finite training loss ({float(loss)}) in epoch {epoch}")
+
+
 class EmulatorModule(L.LightningModule):
     """
     Autoregressive rollout training for a ForwardEmulator.
@@ -223,6 +234,8 @@ class EmulatorModule(L.LightningModule):
             steps_in_memory=self.steps_in_memory,
         )
         batch_size = batch["prior"].shape[0] // m
+        if stage == "train":
+            check_finite(loss, self.current_epoch)
         self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size)
         for term in self.losses:
             value = term.pop_running()

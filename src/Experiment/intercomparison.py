@@ -23,7 +23,7 @@ import xarray as xr
 from .evaluation import global_integral, zonal_spectrum
 
 # Fixed colour per emulator, in this order (never cycled); the truth is black.
-MODEL_COLOURS = ("#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#8c564b")
+MODEL_COLOURS = ("#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22")
 TRUTH_STYLE = dict(color="black", lw=1.6)
 
 
@@ -89,10 +89,12 @@ def intercomparison_summary(skills, variables, leads=(12, 36)):
     One row per (emulator, variable): ensemble-mean RMSE / climatology RMSE at
     the given lead months and over the last year, anomaly correlation of the
     ensemble mean at those leads, the member/truth amplitude ratio over the
-    last year, mean spread-skill ratio and CRPS, and the global-integral
-    anomaly: RMS error against the truth and trend error (per decade, as a
-    fraction of the truth's trend). Lower is better except acc (higher),
-    amplitude_ratio and spread_skill (1 is best).
+    last year, mean spread-skill ratio and CRPS, the decadal pattern error
+    (RMS error of the ensemble mean's last-10-year mean anomaly against the
+    truth's, relative to the truth's: 0 = perfect, 1 = no better than zero
+    anomaly), and the global-integral anomaly: RMS error against the truth and
+    trend error (per decade, as a fraction of the truth's trend). Lower is
+    better except acc (higher), amplitude_ratio and spread_skill (1 is best).
     """
     rows = []
     for name, skill in skills.items():
@@ -107,6 +109,13 @@ def intercomparison_summary(skills, variables, leads=(12, 36)):
             row["rmse/clim_last_yr"] = float(s.rmse_mean[last].mean() / s.rmse_climatology[last].mean())
             row["amplitude_ratio_last_yr"] = float(s.amplitude_member[last].mean() / s.amplitude_truth[last].mean())
             row["spread_skill"] = float(s.spread_skill.mean())
+            # The forced response: the last decade's mean anomaly pattern of the ensemble
+            # mean against the truth's, as an RMS error relative to the truth's pattern.
+            truth_decade = skill[f"{variable}_truth_anom"].isel(time=slice(-120, None)).mean("time")
+            pred_decade = skill[f"{variable}_pred_mean_anom"].isel(time=slice(-120, None)).mean("time")
+            area = skill["area"].where(truth_decade.notnull(), 0.0)
+            ocean_rms = lambda x: float(np.sqrt((x.fillna(0.0) ** 2 * area).sum() / area.sum()))
+            row["decadal_pattern_error"] = ocean_rms(pred_decade - truth_decade) / ocean_rms(truth_decade)
             row["crps"] = float(s.crps.mean())
             pred, truth = global_anomaly(skill, variable), global_anomaly(skill, variable, "truth")
             row["global_rms_error"] = float(np.sqrt(((pred - truth) ** 2).mean()))

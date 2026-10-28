@@ -52,9 +52,10 @@ class ConvNeXtBlock(nn.Module):
     out_channels, and a skip (identity, or 1x1 when the widths differ).
     """
 
-    def __init__(self, in_channels, out_channels, dilation=1, kernel_size=3, upscale_factor=4):
+    def __init__(self, in_channels, out_channels, dilation=1, kernel_size=3, upscale_factor=4, width_channels=None):
         super().__init__()
-        inner = int(in_channels * upscale_factor)
+        # width_channels: the input count the inner width is scaled from (default in_channels).
+        inner = int((width_channels or in_channels) * upscale_factor)
         self.n_pad = (kernel_size + (kernel_size - 1) * (dilation - 1) - 1) // 2
         self.skip = nn.Identity() if in_channels == out_channels else nn.Conv2d(in_channels, out_channels, 1)
         self.conv1 = nn.Conv2d(in_channels, inner, kernel_size, dilation=dilation)
@@ -95,12 +96,18 @@ class SamudraUNet(nn.Module):
     level, then a block; a final block and a 3x3 output convolution.
     """
 
-    def __init__(self, in_channels, out_channels, ch_width=(200, 250, 300, 400), dilation=(1, 2, 4, 8)):
+    def __init__(self, in_channels, out_channels, ch_width=(200, 250, 300, 400), dilation=(1, 2, 4, 8),
+                 width_channel_count=None):
         super().__init__()
         if len(ch_width) != len(dilation) or len(ch_width) < 2:
             raise ValueError("ch_width and dilation need one entry per level, and at least two levels")
         widths = [in_channels, *ch_width]
-        self.down = nn.ModuleList(ConvNeXtBlock(a, b, d) for a, b, d in zip(widths[:-1], widths[1:], dilation))
+        # width_channel_count: the input count the first block's inner width is scaled
+        # from (default in_channels). Extra inputs (noise channels) then change only the
+        # first block's input weights, so a trained network's weights still fit.
+        inner_from = [width_channel_count or in_channels, *ch_width[:-1]]
+        self.down = nn.ModuleList(ConvNeXtBlock(a, b, d, width_channels=w)
+                                  for a, b, d, w in zip(widths[:-1], widths[1:], dilation, inner_from))
         self.middle = ConvNeXtBlock(widths[-1], widths[-1], dilation[-1])
         rev, rev_dilation = widths[::-1], list(dilation)[::-1]
         self.up = nn.ModuleList(ConvNeXtBlock(a, b, d) for a, b, d in zip(rev[:-2], rev[1:-1], rev_dilation))
