@@ -175,7 +175,7 @@ class DiffusionModule(L.LightningModule):
     Rollout (pushforward) training: with rollout_steps [n_free, 1] (or a
     schedule of them; see WindowConfig) the full model first runs n_free months
     freely from the true state, without gradients: mean + sampled residual, with
-    diffusion.pushforward_sampler_steps Heun steps and the budget constraint.
+    the evaluation sampler (diffusion.sampler_steps) and the budget constraint.
     The denoiser then learns the next month's residual from that drifted state,
     i.e. to correct the drift its own samples cause. Trained on true inputs only,
     a residual model adds independent noise every month and the variance of free
@@ -192,7 +192,6 @@ class DiffusionModule(L.LightningModule):
         self.n_prognostic = diffusion.n_prognostic
         # (n_free, 1); updated by RolloutSchedule, if used.
         self.train_steps = rollout_spec(cfg.window.rollout_steps)
-        self.free_sampler_steps = cfg.diffusion.pushforward_sampler_steps
         self.constraint = build_constraint(cfg, data)
         tr = cfg.train
         self.lr, self.weight_decay = tr.lr, tr.weight_decay
@@ -213,7 +212,7 @@ class DiffusionModule(L.LightningModule):
         prior = gather_windows(self.prognostic_z, self.forcing_z, t0, self.n_prior, 0)["prior"].flatten(1, 2)
         with torch.no_grad():
             for k in range(1, n_free + 1):
-                pred = self.diffusion(prior, self.forcing_z[t0 + k], self.mask, sampler_steps=self.free_sampler_steps)
+                pred = self.diffusion(prior, self.forcing_z[t0 + k], self.mask)
                 if self.constraint is not None:
                     pred = self.constraint(pred, prior[:, -self.n_prognostic:], t0 + k - 1, t0 + k)
                 prior = torch.cat([prior[:, self.n_prognostic:], pred.to(prior.dtype)], dim=1)

@@ -1654,7 +1654,7 @@ def test_diffusion_rollout_training(synthetic_file, tmp_path):
     cfg = make_cfg(synthetic_file, tmp_path)
     data = build_data(cfg, verbose=False)
     gen_cfg = cfg.with_changes(paradigm="diffusion", window={"rollout_steps": [2, 1]},
-                               diffusion={"sampler_steps": 2, "pushforward_sampler_steps": 1, "width_multiplier": 1})
+                               diffusion={"sampler_steps": 2, "width_multiplier": 1})
     diffusion = build_diffusion(gen_cfg, data, build_model(cfg, data))
     module = build_diffusion_module(gen_cfg, diffusion, data)
     assert module.train_steps == (2, 1)

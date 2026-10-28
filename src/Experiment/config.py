@@ -322,10 +322,10 @@ class DiffusionConfig:
     # levels sigma ~ lognormal(p_mean, p_std); sampling runs sampler_steps
     # Heun steps from sigma_max to sigma_min (2 * sampler_steps - 1 network
     # evaluations per month).
+    # Also used for the free-running months of rollout (pushforward) training:
+    # training must see the states the evaluated model produces (a 4-step sampler
+    # there gave states ~5x outside the data and losses ~60x normal, and diverged).
     sampler_steps: int = 18
-    # Heun steps for the free-running months of rollout (pushforward) training:
-    # fewer than sampler_steps, since every training batch samples them.
-    pushforward_sampler_steps: int = 4
     sigma_min: float = 0.002
     sigma_max: float = 80.0
     rho: float = 7.0
@@ -477,8 +477,6 @@ class ExperimentConfig:
             raise ValueError("paradigm='crps_ensemble': drop 'local_mse' (it pulls every member to the mean)")
         if df.sampler_steps < 1 or not 0 < df.sigma_min < df.sigma_max or df.rho <= 0:
             raise ValueError("diffusion needs sampler_steps >= 1, 0 < sigma_min < sigma_max and rho > 0")
-        if df.pushforward_sampler_steps < 1:
-            raise ValueError("diffusion.pushforward_sampler_steps must be >= 1")
         if self.paradigm == "diffusion":
             specs = [w.rollout_steps, *(w.rollout_schedule or {}).values()]
             if any(rollout_spec(spec)[1] != 1 for spec in specs):
