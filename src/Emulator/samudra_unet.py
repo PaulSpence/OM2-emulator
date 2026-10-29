@@ -57,7 +57,10 @@ class ConvNeXtBlock(nn.Module):
         # width_channels: the input count the inner width is scaled from (default in_channels).
         inner = int((width_channels or in_channels) * upscale_factor)
         self.n_pad = (kernel_size + (kernel_size - 1) * (dilation - 1) - 1) // 2
-        self.skip = nn.Identity() if in_channels == out_channels else nn.Conv2d(in_channels, out_channels, 1)
+        # The skip is an identity only when the widths match without extra inputs:
+        # noise channels that happen to make them equal must not change the network.
+        identity = in_channels == out_channels and (width_channels or in_channels) == in_channels
+        self.skip = nn.Identity() if identity else nn.Conv2d(in_channels, out_channels, 1)
         self.conv1 = nn.Conv2d(in_channels, inner, kernel_size, dilation=dilation)
         self.norm1 = nn.BatchNorm2d(inner)
         self.conv2 = nn.Conv2d(inner, inner, kernel_size, dilation=dilation)

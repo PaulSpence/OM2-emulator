@@ -1715,11 +1715,13 @@ def test_training_stops_on_a_non_finite_loss(data_and_cfg):
         module._step(data.train_indices[:2], 1, "train")
 
 
-def test_samudra_crps_branch_starts_from_the_deterministic_weights(synthetic_file, tmp_path):
+@pytest.mark.parametrize("first_width", [8, 9])
+def test_samudra_crps_branch_starts_from_the_deterministic_weights(synthetic_file, tmp_path, first_width):
+    """first_width 9: the 5 physical inputs + 4 noise channels equal the first width (as 8 + 4 = 12 at 1 degree)."""
     from Experiment import load_trunk
 
     cfg = make_cfg(synthetic_file, tmp_path,
-                   model=ModelConfig(arch="samudra", samudra_ch_width=[8, 12], samudra_dilation=[1, 2]))
+                   model=ModelConfig(arch="samudra", samudra_ch_width=[first_width, 12], samudra_dilation=[1, 2]))
     data = build_data(cfg, verbose=False)
     deterministic = build_model(cfg, data).eval()
     ens_cfg = cfg.with_changes(paradigm="crps_ensemble", loss={"terms": {"crps": 1.0, "spectral": 0.5}})
