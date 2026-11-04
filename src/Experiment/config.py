@@ -528,7 +528,8 @@ class ExperimentConfig:
         values = {}
         for name, value in raw.items():
             if name == "data":
-                value = DataConfig(**{**value, "normalisation": NormalisationConfig(**value["normalisation"])})
+                normalisation = {k: tuple(v) if isinstance(v, list) else v for k, v in value["normalisation"].items()}
+                value = DataConfig(**{**value, "normalisation": NormalisationConfig(**normalisation)})
             elif name == "loss":
                 value = LossConfig(**{**value, "closures": {k: ClosureConfig(**c) for k, c in value["closures"].items()}})
             elif name == "window" and value.get("rollout_schedule") is not None:
