@@ -1747,3 +1747,108 @@ def test_unconstrained_baseline_has_no_budget_constraint(synthetic_file, tmp_pat
     table = intercomparison_summary({"perfect": perfect, "model": skill}, [name], leads=(1,))
     assert table.loc[(name, "perfect"), "decadal_pattern_error"] == pytest.approx(0.0, abs=1e-6)
     assert np.isfinite(table.loc[(name, "model"), "decadal_pattern_error"])
+
+
+# =============================================================================
+# Long repeat-year controls
+# =============================================================================
+
+def test_config_load_round_trip(synthetic_file, tmp_path):
+    cfg = make_cfg(synthetic_file, tmp_path,
+                   window=WindowConfig(n_prior=2, posterior_steps=4, rollout_steps=[1, 2],
+                                       rollout_schedule={0: 1, 3: [1, 2]}))
+    cfg = cfg.with_changes(paradigm="crps_ensemble", loss={"terms": {"crps": 1.0}})
+    cfg.save(tmp_path / "config.json")
+    loaded = ExperimentConfig.load(tmp_path / "config.json")
+    assert loaded.to_dict() == cfg.to_dict()
+    assert loaded.window.rollout_schedule == {0: 1, 3: [1, 2]}  # integer epochs
+    assert loaded.loss.closures["heat"].enforce is True
+
+
+def test_balanced_year_forcing_integrates_to_zero(data_and_cfg):
+    from Experiment import balanced_year_forcing
+
+    data, cfg = data_and_cfg
+    f = data.fields
+    idx = list(range(data.index_of("2001-05"), data.index_of("2001-05") + 12))
+    forcing, offsets = balanced_year_forcing(cfg, data, idx)
+    c = cfg.data.forcing.index("total_surface_heat_flx")
+    assert set(offsets) == {c}
+    ocean_area = float(f["area"].sum())
+    seconds = f["month_seconds"][idx]
+    adjusted_global = f["forcing_global"][idx, c] - offsets[c] * ocean_area
+    assert abs(float((adjusted_global * seconds).sum())) < 1e-9 * float((f["forcing_global"][idx, c].abs() * seconds).sum())
+    # The z-score change is the physical offset over the std, on ocean cells only.
+    ocean = f["mask"] > 0
+    change = (forcing[:, c] - f["forcing"][idx, c]) * f["forcing_std"][idx, c]
+    torch.testing.assert_close(change[:, ocean], torch.full_like(change[:, ocean], -offsets[c]), rtol=1e-4, atol=1e-6)
+    torch.testing.assert_close(change[:, ~ocean], torch.zeros_like(change[:, ~ocean]))
+    unbalanced, none = balanced_year_forcing(cfg, data, idx, balance=False)
+    assert none == {} and torch.equal(unbalanced, f["forcing"][idx].float())
+
+
+def test_repeat_year_control_returns_to_the_same_global_content_every_year(data_and_cfg):
+    from Experiment import plot_long_control_spectra, plot_long_controls, reference_rms, run_repeat_year_control
+
+    data, cfg = data_and_cfg
+    f = data.fields
+    ds = run_repeat_year_control(cfg, build_model(cfg, data), data, first_month="2001-05", years=10, members=2,
+                                 snapshot_years=(1, 10))
+    assert ds.sizes["step"] == 120 and ds.sizes["member"] == 2 and ds.sizes["decade"] == 1
+    assert ds.attrs["constrained"] == 1 and ds.attrs["balanced"] == 1
+    # Balanced forcing + constraint: every April the global anomaly is back at the seed month's.
+    seed = data.index_of("2001-04")
+    initial = float((f["prognostic"][seed, 0].double() * f["prognostic_std"][seed, 0] * f["area"]).sum())
+    aprils = ds["global"].sel(variable="ocean_heat_content_2d").isel(step=slice(11, None, 12))
+    scale = float(np.abs(ds["global"]).max())
+    np.testing.assert_allclose(aprils.values, initial, atol=1e-4 * scale)
+    assert np.isfinite(ds["rms"]).all() and np.isfinite(ds["max_abs_z"]).all()
+
+    reference = {"ocean_heat_content_2d": reference_rms(data, "ocean_heat_content_2d")}
+    for fig in (plot_long_controls({"model": ds}, reference), plot_long_control_spectra({"model": ds})):
+        assert all(np.isfinite(line.get_ydata()).all() for ax in fig.axes for line in ax.lines)
+        plt.close(fig)
+
+
+def test_repeat_year_control_without_constraint(synthetic_file, tmp_path):
+    from Experiment import run_repeat_year_control
+
+    cfg = make_cfg(synthetic_file, tmp_path)
+    free = cfg.with_changes(loss={"closures": {
+        name: dataclasses.replace(c, enforce=False) for name, c in cfg.loss.closures.items()}})
+    data = build_data(free, verbose=False)
+    ds = run_repeat_year_control(free, build_model(free, data), data, first_month="2001-05", years=2)
+    assert ds.attrs["constrained"] == 0 and ds.attrs["balanced"] == 1
+    assert np.isfinite(ds["global"]).all()
+
+
+def test_seed_spread_and_separation():
+    from Experiment import seed_separation, seed_spread
+
+    index = pd.MultiIndex.from_product([["ocean_heat_content_2d"], ["a", "b"]], names=["variable", "emulator"])
+    summaries = {
+        seed: pd.DataFrame({"members": [10, 10],
+                            "crps": [1.0 + 0.1 * k, 2.0 + 0.1 * k],          # a below b in every seed
+                            "acc_12mo": [0.5 + 0.1 * k, 0.55 - 0.1 * k]},    # ranges overlap
+                           index=index)
+        for k, seed in enumerate((42, 43, 44))
+    }
+    # An emulator in one run only is summarised over that run.
+    extra = pd.DataFrame({"members": [1], "crps": [3.0], "acc_12mo": [0.1]},
+                         index=pd.MultiIndex.from_tuples([("ocean_heat_content_2d", "c")], names=["variable", "emulator"]))
+    summaries[42] = pd.concat([summaries[42], extra])
+
+    spread = seed_spread(summaries)
+    assert "members" not in spread.columns.get_level_values(0)
+    a = spread.loc[("ocean_heat_content_2d", "a")]
+    assert a[("crps", "count")] == 3
+    assert a[("crps", "mean")] == pytest.approx(1.1) and a[("crps", "std")] == pytest.approx(0.1)
+    assert a[("crps", "min")] == pytest.approx(1.0) and a[("crps", "max")] == pytest.approx(1.2)
+    c = spread.loc[("ocean_heat_content_2d", "c")]
+    assert c[("crps", "count")] == 1 and np.isnan(c[("crps", "std")])
+
+    table = seed_separation(summaries, "a", "b")
+    crps = table.loc[("ocean_heat_content_2d", "crps")]
+    assert crps["difference"] == pytest.approx(-1.0) and crps["seeds"] == 3 and crps["separated"]
+    acc = table.loc[("ocean_heat_content_2d", "acc_12mo")]
+    assert acc["difference"] == pytest.approx(0.15) and not acc["separated"]

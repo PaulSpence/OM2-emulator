@@ -125,6 +125,43 @@ def intercomparison_summary(skills, variables, leads=(12, 36)):
     return pd.DataFrame(rows).set_index(["variable", "emulator"]).sort_index()
 
 
+def seed_spread(summaries):
+    """
+    Scores over training seeds. summaries = {seed: intercomparison_summary
+    table} (e.g. each seed run's intercomparison_summary.csv read back with
+    index_col=["variable", "emulator"]). Returns one row per (variable,
+    emulator), columns (score, statistic): the number of seeds, the mean, the
+    standard deviation (ddof=1) and the min and max over seeds. An emulator
+    missing from some runs is summarised over the runs that have it.
+    """
+    scores = pd.concat(summaries, names=["seed"]).drop(columns="members", errors="ignore")
+    return scores.groupby(level=["variable", "emulator"]).agg(["count", "mean", "std", "min", "max"])
+
+
+def seed_separation(summaries, emulator, other):
+    """
+    Whether two emulators' scores differ by more than seed-to-seed spread.
+    One row per (variable, score): each emulator's mean and std over seeds,
+    the difference of means (emulator - other), the number of seeds both have,
+    and `separated`: True when every seed of one scores above every seed of
+    the other (the seed ranges do not overlap).
+    """
+    spread = seed_spread(summaries)
+    rows = []
+    for variable in spread.index.get_level_values("variable").unique():
+        a, b = spread.loc[(variable, emulator)], spread.loc[(variable, other)]
+        for score in spread.columns.get_level_values(0).unique():
+            rows.append({
+                "variable": variable, "score": score,
+                f"{emulator}_mean": a[(score, "mean")], f"{emulator}_std": a[(score, "std")],
+                f"{other}_mean": b[(score, "mean")], f"{other}_std": b[(score, "std")],
+                "difference": a[(score, "mean")] - b[(score, "mean")],
+                "seeds": int(min(a[(score, "count")], b[(score, "count")])),
+                "separated": bool(a[(score, "min")] > b[(score, "max")] or b[(score, "min")] > a[(score, "max")]),
+            })
+    return pd.DataFrame(rows).set_index(["variable", "score"])
+
+
 def plot_intercomparison(skills, variables):
     """
     One row per variable; columns: ensemble-mean RMSE (dotted: climatology),

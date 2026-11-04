@@ -1,0 +1,62 @@
+#!/bin/bash
+# Run a notebook from notebooks/ headless on one Hopper GPU (default:
+# Emulator_intercomparison). Same project, CPUs, memory, jobfs, storage, software
+# and environment as the ARE JupyterLab session it was developed in; only the
+# queue (and walltime) differ.
+#
+#   qsub -v NOTEBOOK_COMMIT=$(git rev-parse HEAD) jobs/run_notebook.pbs
+#   qsub -N om2-control -l walltime=6:00:00 -v NOTEBOOK=Control_RYF,NOTEBOOK_COMMIT=$(git rev-parse HEAD) jobs/run_notebook.pbs
+#
+# The notebook is taken from git at NOTEBOOK_COMMIT (default: HEAD when the job
+# starts), so editing or saving the working copy cannot change a queued run.
+# The executed notebook, with all outputs, and this log (<jobid>.gadi-pbs.OU) go to runs/.
+#
+# Emulator_intercomparison writes where its RUN_NAME says (runs/<RUN_NAME>/,
+# figures/<RUN_NAME>/); stages with saved weights there are loaded, not retrained.
+# It reads from the environment (pass with -v): INTERCOMPARISON_RUN (run name),
+# INTERCOMPARISON_DATA (dataset path), INTERCOMPARISON_SEED (training seed) and
+# INTERCOMPARISON_EMULATORS (comma-separated subset). qsub -v splits on commas, so
+# export a list from the shell and name it without a value, e.g. a seed replicate:
+#   INTERCOMPARISON_EMULATORS=deterministic,crps_ensemble,samudra,samudra_crps \
+#   qsub -N om2-seed43 -v INTERCOMPARISON_EMULATORS,NOTEBOOK_COMMIT=...,INTERCOMPARISON_SEED=43,INTERCOMPARISON_RUN=intercomparison_90ep_v3_seed43,INTERCOMPARISON_DATA=/g/data/nm47/txs156/OM2-emulator/data/1deg_ocean_heat_emulator_data_v3.nc jobs/run_notebook.pbs
+# Control_RYF reads CONTROL_SOURCE_RUN (the trained run) and CONTROL_YEARS.
+#PBS -N om2-notebook
+#PBS -P v46
+#PBS -q gpuhopper
+#PBS -l ngpus=1
+#PBS -l ncpus=12
+#PBS -l mem=97280M
+#PBS -l jobfs=100GB
+#PBS -l walltime=24:00:00
+#PBS -l storage=gdata/cj50+gdata/e14+gdata/v46+gdata/p73+gdata/v45+gdata/x77+gdata/fs38+gdata/ik11+gdata/oi10+gdata/xp65+gdata/g40+gdata/ol01+gdata/nm47+gdata/dk92+gdata/rv74+gdata/rq0
+#PBS -l wd
+#PBS -j oe
+#PBS -o /home/156/txs156/uom/OM2-emulator/runs/
+
+set -euo pipefail
+
+REPO=/home/156/txs156/uom/OM2-emulator
+# Start from no modules: ~/.bashrc loads conda/analysis3, cuda and openmpi/4.1.7,
+# and pet/2025.05 needs openmpi/4.1.5 (the first submission failed on this conflict).
+module purge
+module use /g/data/dk92/apps/Modules/modulefiles
+module load pet/2025.05
+export PYTHONUSERBASE=/g/data/v46/txs156/python-userbase
+
+cd "$REPO"
+COMMIT=${NOTEBOOK_COMMIT:-$(git rev-parse HEAD)}
+JOB=${PBS_JOBID%%.*}
+NOTEBOOK=${NOTEBOOK:-Emulator_intercomparison}
+INPUT=runs/${NOTEBOOK}_${JOB}.ipynb
+git show "${COMMIT}:notebooks/${NOTEBOOK}.ipynb" > "$INPUT"
+echo "Job ${PBS_JOBID} on $(hostname) at $(date); ${NOTEBOOK} from commit ${COMMIT}"
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+jupyter nbconvert --to notebook --execute \
+    --ExecutePreprocessor.timeout=-1 \
+    --ExecutePreprocessor.kernel_name=python3 \
+    --output-dir runs \
+    --output "${NOTEBOOK}_${JOB}_executed" \
+    "$INPUT"
+
+echo "Finished at $(date)"

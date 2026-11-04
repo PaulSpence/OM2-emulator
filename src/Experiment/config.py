@@ -516,6 +516,31 @@ class ExperimentConfig:
         """Write the config as JSON (e.g. next to a checkpoint)."""
         Path(path).write_text(json.dumps(self.to_dict(), indent=2, default=str))
 
+    @classmethod
+    def load(cls, path):
+        """The config written by save() (e.g. a training stage's run_dir/config.json), validated."""
+        raw = json.loads(Path(path).read_text())
+        sections = {
+            "data": DataConfig, "time": TimeConfig, "window": WindowConfig, "loss": LossConfig,
+            "model": ModelConfig, "train": TrainConfig, "eval": EvalConfig,
+            "ensemble": EnsembleConfig, "diffusion": DiffusionConfig,
+        }
+        values = {}
+        for name, value in raw.items():
+            if name == "data":
+                value = DataConfig(**{**value, "normalisation": NormalisationConfig(**value["normalisation"])})
+            elif name == "loss":
+                value = LossConfig(**{**value, "closures": {k: ClosureConfig(**c) for k, c in value["closures"].items()}})
+            elif name == "window" and value.get("rollout_schedule") is not None:
+                # JSON object keys are strings: epochs back to integers.
+                value = WindowConfig(**{**value, "rollout_schedule": {int(k): v for k, v in value["rollout_schedule"].items()}})
+            elif name == "time":
+                value = TimeConfig(**{k: tuple(v) if isinstance(v, list) else v for k, v in value.items()})
+            elif name in sections:
+                value = sections[name](**value)
+            values[name] = value
+        return cls(**values)
+
     def data_contract(self):
         """
         The settings that determine the cached normalised fields.

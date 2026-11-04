@@ -62,9 +62,18 @@ from .intercomparison import (
     plot_basin_content,
     global_anomaly,
     intercomparison_summary,
+    seed_separation,
+    seed_spread,
     plot_intercomparison,
     plot_intercomparison_spectra,
     plot_intercomparison_transports,
+)
+from .longrun import (
+    balanced_year_forcing,
+    plot_long_control_spectra,
+    plot_long_controls,
+    reference_rms,
+    run_repeat_year_control,
 )
 from .losses import build_losses
 from .models import ForwardEmulator, build_model, count_parameters, load_trunk
@@ -106,10 +115,17 @@ __all__ = [
     "plot_basin_content",
     "global_anomaly",
     "intercomparison_summary",
+    "seed_separation",
+    "seed_spread",
     "plot_intercomparison",
     "plot_intercomparison_spectra",
     "plot_intercomparison_transports",
     "load_trunk",
+    "balanced_year_forcing",
+    "plot_long_control_spectra",
+    "plot_long_controls",
+    "reference_rms",
+    "run_repeat_year_control",
     "ClosureConfig",
     "DataConfig",
     "EvalConfig",
