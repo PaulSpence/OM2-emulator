@@ -335,6 +335,15 @@ class DiffusionConfig:
     width_multiplier: float = 4
 
 
+# Fields removed from the code that saved configs may still hold: ExperimentConfig.load
+# drops them (any other unknown field is an error). {section: fields}
+RETIRED_FIELDS = {
+    # 21e807e: rollout-trained diffusion's free months use the evaluation sampler
+    # (sampler_steps). Training-only, so loading a trained stage without it is exact.
+    "diffusion": ("pushforward_sampler_steps",),
+}
+
+
 @dataclass
 class ExperimentConfig:
     data: DataConfig
@@ -520,6 +529,9 @@ class ExperimentConfig:
     def load(cls, path):
         """The config written by save() (e.g. a training stage's run_dir/config.json), validated."""
         raw = json.loads(Path(path).read_text())
+        for section, fields in RETIRED_FIELDS.items():
+            for field_name in fields:
+                raw.get(section, {}).pop(field_name, None)
         sections = {
             "data": DataConfig, "time": TimeConfig, "window": WindowConfig, "loss": LossConfig,
             "model": ModelConfig, "train": TrainConfig, "eval": EvalConfig,

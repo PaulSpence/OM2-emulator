@@ -1764,6 +1764,16 @@ def test_config_load_round_trip(synthetic_file, tmp_path):
     assert loaded.window.rollout_schedule == {0: 1, 3: [1, 2]}  # integer epochs
     assert loaded.loss.closures["heat"].enforce is True
 
+    # Configs saved before a field was retired still load; other unknown fields do not.
+    raw = json.loads((tmp_path / "config.json").read_text())
+    raw["diffusion"]["pushforward_sampler_steps"] = 4
+    (tmp_path / "old.json").write_text(json.dumps(raw))
+    assert ExperimentConfig.load(tmp_path / "old.json").to_dict() == cfg.to_dict()
+    raw["diffusion"]["not_a_field"] = 1
+    (tmp_path / "bad.json").write_text(json.dumps(raw))
+    with pytest.raises(TypeError, match="not_a_field"):
+        ExperimentConfig.load(tmp_path / "bad.json")
+
 
 def test_balanced_year_forcing_integrates_to_zero(data_and_cfg):
     from Experiment import balanced_year_forcing
