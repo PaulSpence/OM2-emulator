@@ -113,7 +113,7 @@ def fill_land(x, mask, dirichlet=None, index=None):
         nhwc = x.permute(0, 2, 3, 1).reshape(b, h * w, c)
         filled = nhwc.index_select(1, index).view(b, h, w, c).permute(0, 3, 1, 2)
     else:
-        filled = x.flatten(-2)[..., index].view_as(x)
+        filled = x.flatten(-2).index_select(-1, index).view_as(x)
     if dirichlet:
         channels = torch.zeros(x.shape[1], dtype=torch.bool, device=x.device)
         values = torch.zeros(x.shape[1], dtype=x.dtype, device=x.device)
