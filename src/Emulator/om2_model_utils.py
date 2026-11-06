@@ -216,10 +216,21 @@ def upsample_periodic_x(x, size):
     height, width = size
     scale = width // x.shape[-1]
     if scale * x.shape[-1] != width:
-        return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+        return _bilinear(x, size)
     x = F.pad(x, (1, 1, 0, 0), mode="circular")
-    x = F.interpolate(x, size=(height, width + 2 * scale), mode="bilinear", align_corners=False)
+    # x = F.interpolate(x, size=(height, width + 2 * scale), mode="bilinear", align_corners=False)
+    x = _bilinear(x, (height, width + 2 * scale))
     return x[..., scale:-scale]
+
+def _bilinear(x, size):
+    """
+    Helper function to disable amp for interpolate. Interpolate is kept in float32
+    because of precision issues (see pytorch #121324) which propagates and prevents
+    other operations from being float16. This should be safe for bilinear, but may
+    not be for other modes.
+    """
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
 
 
 class PartialConvStack(nn.Module):
