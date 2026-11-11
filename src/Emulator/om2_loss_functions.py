@@ -11,58 +11,6 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 
-def step_weight(weight, rollout_step, like):
-    """
-    Return a scalar tensor weight for the current rollout step.
-
-    ``weight`` may be either a scalar, applied to every rollout step, or a
-    sequence/tensor with one entry per rollout step. This lets later forecast
-    months be emphasized or de-emphasized without changing the rollout loop.
-    Per-step weights are normalised to have mean 1, so they do not need to sum
-    to 1 and do not change the overall loss scale just because the schedule has
-    larger numbers.
-    """
-    if torch.is_tensor(weight):
-        if weight.ndim == 0:
-            return weight.to(device=like.device, dtype=like.dtype)
-        if rollout_step is None:
-            raise ValueError("Per-step loss weights require rollout_step in the loss context")
-        if rollout_step >= weight.numel():
-            raise ValueError(
-                f"Per-step loss weights have length {weight.numel()}, "
-                f"but rollout_step={rollout_step} was requested"
-            )
-        flat_weight = weight.flatten().to(device=like.device, dtype=like.dtype)
-        normaliser = flat_weight.mean()
-        if float(normaliser.detach().cpu()) == 0.0:
-            raise ValueError("Per-step loss weights must have non-zero mean")
-        return flat_weight[rollout_step] / normaliser
-
-    if isinstance(weight, (list, tuple)):
-        if rollout_step is None:
-            raise ValueError("Per-step loss weights require rollout_step in the loss context")
-        if rollout_step >= len(weight):
-            raise ValueError(
-                f"Per-step loss weights have length {len(weight)}, "
-                f"but rollout_step={rollout_step} was requested"
-            )
-        normaliser = sum(weight) / len(weight)
-        if normaliser == 0.0:
-            raise ValueError("Per-step loss weights must have non-zero mean")
-        return like.new_tensor(weight[rollout_step] / normaliser)
-
-    return like.new_tensor(float(weight))
-
-
-def expand_ocean_mask(mask, like):
-    valid_mask = mask.to(device=like.device, dtype=like.dtype)
-    if valid_mask.ndim == 2:
-        valid_mask = valid_mask.unsqueeze(0).unsqueeze(0)
-    elif valid_mask.ndim == 3:
-        valid_mask = valid_mask.unsqueeze(1)
-    return valid_mask.expand_as(like)
-
-
 def squeeze_field_axes(field):
     """Drop singleton variable/channel axes, preserving batch and spatial axes."""
     while field.ndim > 3:
@@ -77,71 +25,60 @@ def squeeze_field_axes(field):
     return field
 
 
-def local_mse_loss(weight=1.0):
+def field_loss(*, pred_t, target_t, mask, area=None, method="mse", n_members=1, **_):
     """
-    Return a weighted, ocean-masked, AREA-WEIGHTED local MSE loss callable.
+    Ocean-masked, AREA-WEIGHTED mean of a per-cell error for one rollout step,
+    in z-score units. ``method`` chooses the per-cell error:
 
-    Each cell's squared error is weighted by its area (``area`` from the rollout
-    context, m^2), so the loss is an area mean over the ocean like every
-    evaluation metric, the per-variable RMSE logged in training, and the closure
-    terms. On the ACCESS-OM2 1-degree grid cell areas vary 17x (latitudinal
-    refinement near the equator, small cells near the poles): an unweighted
-    per-cell mean gave the regions poleward of 60 degrees ~27% of the loss for
-    ~10% of the ocean area. Without ``area`` in the context, every ocean cell
-    counts equally.
+      "mse"   squared error (pred_t - target_t)^2.
+
+      "crps"  fair CRPS of an ensemble. The batch holds ``n_members`` (from the
+              rollout context) consecutive members of each sample: pred_t is
+              (B * M, ...) and target_t repeats the truth for every member.
+              Per cell, the fair (unbiased in M) CRPS is
+
+                  mean_i |x_i - y|  -  sum_{i,j} |x_i - x_j| / (2 M (M - 1))
+
+              (Ferro 2014; used for ensemble training by e.g. NeuralGCM and
+              AIFS-CRPS). The first term pulls every member towards the truth,
+              the second pushes members apart, so the loss is minimised by
+              members drawn from the distribution of the truth, not by their
+              mean: sharp members are not penalised for unpredictable detail as
+              they are by MSE.
+
+    The per-cell error is then averaged over the ocean, each cell weighted by
+    its area (``area`` from the rollout context, m^2), like every evaluation
+    metric, the per-variable RMSE logged in training, and the closure terms. On
+    the ACCESS-OM2 1-degree grid cell areas vary 17x (latitudinal refinement
+    near the equator, small cells near the poles): an unweighted per-cell mean
+    gave the regions poleward of 60 degrees ~27% of the loss for ~10% of the
+    ocean area. Without ``area`` every ocean cell counts equally.
+
+    Called with the whole rollout context (``loss(**context)``) and ``method``
+    fixed in advance, e.g. ``partial(field_loss, method="crps")``; context
+    entries it does not use are absorbed by ``**_``. The loss weight is applied
+    by the caller.
     """
-
-    def loss_fn(*, pred_t, target_t, mask, rollout_step=None, area=None, **_):
-        current_weight = step_weight(weight, rollout_step, pred_t)
-        if current_weight == 0.0:
-            return pred_t.new_zeros(())
-        step_err = (pred_t - target_t) ** 2
-        cell_weight = expand_ocean_mask(mask, step_err)
-        if area is not None:
-            cell_weight = cell_weight * area.to(device=step_err.device, dtype=step_err.dtype)
-        loss = (step_err * cell_weight).sum() / cell_weight.sum().clamp_min(1e-12)
-        return current_weight * loss
-
-    return loss_fn
-
-
-def crps_loss(weight=1.0):
-    """
-    Return a weighted fair-CRPS loss for an ensemble, area-weighted over the
-    ocean, in z-score units.
-
-    The batch holds ``n_members`` (from the rollout context) consecutive
-    members of each sample: pred_t is (B * M, ...) and target_t repeats the
-    truth for every member. Per cell, the fair (unbiased in M) CRPS is
-
-        mean_i |x_i - y|  -  sum_{i,j} |x_i - x_j| / (2 M (M - 1))
-
-    (Ferro 2014; used for ensemble training by e.g. NeuralGCM and AIFS-CRPS).
-    The first term pulls every member towards the truth, the second pushes
-    members apart, so the loss is minimised by members drawn from the
-    distribution of the truth, not by their mean: sharp members are not
-    penalised for unpredictable detail as they are by MSE.
-    """
-
-    def loss_fn(*, pred_t, target_t, mask, n_members=1, rollout_step=None, area=None, **_):
-        current_weight = step_weight(weight, rollout_step, pred_t)
-        if current_weight == 0.0:
-            return pred_t.new_zeros(())
+    if method == "mse":
+        error = (pred_t - target_t) ** 2                               # (B, P, H, W)
+    elif method == "crps":
         m = int(n_members)
         if m < 2:
-            raise ValueError("crps_loss needs an ensemble: n_members >= 2 in the rollout context")
+            raise ValueError("field_loss(method='crps') needs an ensemble: n_members >= 2 in the rollout context")
         b = pred_t.shape[0] // m
         members = pred_t.reshape(b, m, *pred_t.shape[1:])
         truth = target_t.reshape(b, m, *target_t.shape[1:])[:, 0]
         skill = (members - truth[:, None]).abs().mean(dim=1)
         spread = (members[:, :, None] - members[:, None]).abs().sum(dim=(1, 2)) / (m * (m - 1))
-        crps = skill - 0.5 * spread                                   # (B, P, H, W)
-        cell_weight = expand_ocean_mask(mask, crps)
-        if area is not None:
-            cell_weight = cell_weight * area.to(device=crps.device, dtype=crps.dtype)
-        return current_weight * (crps * cell_weight).sum() / cell_weight.sum().clamp_min(1e-12)
+        error = skill - 0.5 * spread                                    # (B, P, H, W)
+    else:
+        raise ValueError(f"Unknown field_loss method {method!r}: use 'mse' or 'crps'")
 
-    return loss_fn
+    # Area-weighted mean over the ocean. Ocean mask (H, W), 1 = ocean, broadcast to error's (B, P, H, W).
+    cell_weight = mask.to(device=error.device, dtype=error.dtype).expand_as(error)
+    if area is not None:
+        cell_weight = cell_weight * area.to(device=error.device, dtype=error.dtype)
+    return (error * cell_weight).sum() / cell_weight.sum().clamp_min(1e-12)
 
 EARTH_RADIUS_KM = 6371.0
 # Rows used for zonal spectra. North of ~65N the ACCESS-OM2 tripole grid's
@@ -154,37 +91,45 @@ SPECTRAL_BANDS_PER_DECADE = 8
 def zonal_wavenumber_bands(latitude, n_lon, latitudes=SPECTRUM_LATITUDES,
                            bands_per_decade=SPECTRAL_BANDS_PER_DECADE):
     """
-    Assign every (latitude row, zonal harmonic) to a band of PHYSICAL zonal
-    wavenumber k (cycles/km), so a band means the same scale at 1 deg and
-    1/10 deg.
-
-    A row at latitude phi is a circle of length L = 2*pi*R*cos(phi), so zonal
-    harmonic n (n = 1 .. n_lon // 2; the zonal mean n = 0 is excluded) has
-    k = n / L. Bands are log-spaced from the smallest to the largest k present;
-    bands no (row, harmonic) falls in are dropped.
+    Sort every (latitude row, zonal harmonic) into bands of PHYSICAL zonal
+    wavenumber k (cycles/km), so a band is the same length scale at every
+    latitude and at every resolution (1 deg or 1/10 deg).
 
     Returns (rows, band, power_weight, k_band):
-      rows          latitude row indices used;
-      band          the band of each (row, harmonic), flattened row-major;
-      power_weight  (rows, harmonics): multiplies |rfft|^2 to give each
-                    (row, harmonic)'s share of the zonal variance, weighted by
-                    cos(latitude) (the row's share of the area). Harmonics
-                    below Nyquist count twice: rfft keeps one of each +/-n pair;
-      k_band        each band's central wavenumber (cycles/km); band edges are
-                    a factor 10**(1/bands_per_decade) apart.
+      rows          indices of the latitude rows used (those within ``latitudes``);
+      band          (rows * harmonics,) band number of each (row, harmonic),
+                    flattened row by row;
+      power_weight  (rows, harmonics): multiplies |rfft|^2 so that it sums to
+                    the row's variance, times cos(latitude) (the row's area share);
+      k_band        (n_bands,) central wavenumber of each band (cycles/km).
     """
     latitude = np.asarray(latitude, dtype=float)
+
+    # Latitude rows used (north of ~65N the tripole grid's rows are not circles of latitude).
     rows = np.flatnonzero((latitude >= latitudes[0]) & (latitude <= latitudes[1]))
     if rows.size == 0:
         raise ValueError(f"No latitude rows within {latitudes} for the zonal spectrum")
     cos_lat = np.cos(np.deg2rad(latitude[rows]))
-    harmonics = np.arange(1, n_lon // 2 + 1)
-    log_k = np.log10(harmonics[None, :] / (2 * np.pi * EARTH_RADIUS_KM * cos_lat[:, None]))
+
+    # Physical wavenumber of every (row, harmonic). A row is a circle of length 2 pi R cos(lat),
+    # and harmonic n (n waves around it) has k = n / length. rfftfreq(n_lon, d=1/n_lon) lists the
+    # harmonics rfft returns, 0 .. n_lon // 2; harmonic 0 is the zonal mean, which is dropped.
+    row_length_km = 2 * np.pi * EARTH_RADIUS_KM * cos_lat              # (rows,)
+    harmonics = np.fft.rfftfreq(n_lon, d=1.0 / n_lon)[1:]              # (harmonics,)
+    k = harmonics[None, :] / row_length_km[:, None]                    # (rows, harmonics)
+
+    # Bands: equal steps in log10(k), bands_per_decade of them per factor of 10, counted from the
+    # smallest k. Then renumber them 0, 1, 2, ..., skipping any band no (row, harmonic) falls in.
+    log_k = np.log10(k)
     band = np.floor((log_k - log_k.min()) * bands_per_decade).astype(int)
     used, band = np.unique(band.ravel(), return_inverse=True)
-    k_band = 10.0 ** (log_k.min() + (used + 0.5) / bands_per_decade)
-    one_sided = np.where(harmonics < n_lon / 2, 2.0, 1.0)
-    power_weight = cos_lat[:, None] * one_sided[None, :] / n_lon**2
+    k_band = 10.0 ** (log_k.min() + (used + 0.5) / bands_per_decade)  # band centres
+
+    # Parseval: sum_n |rfft_n|^2 / n_lon^2 is the row's variance, once every harmonic below
+    # Nyquist is counted twice (rfft returns n but not its mirror image -n, which has the same
+    # power). Times cos(lat), the row's share of the area.
+    counted_twice = np.where(harmonics < n_lon / 2, 2.0, 1.0)
+    power_weight = cos_lat[:, None] * counted_twice[None, :] / n_lon**2
     return rows, band, power_weight, k_band
 
 
@@ -247,17 +192,17 @@ def spectral_loss(weight=1.0, *, latitude):
         floor = 1.0e-8 * target_energy.sum(-1, keepdim=True) + 1.0e-20
         return (torch.log10(pred_energy + floor) - torch.log10(target_energy + floor)).square().mean()
 
-    def loss_fn(*, pred_t, target_t, mask, rollout_step=None, **_):
-        current_weight = step_weight(weight, rollout_step, pred_t)
-        if current_weight == 0.0:
+    def loss_fn(*, pred_t, target_t, mask, **_):
+        if weight == 0.0:
             return pred_t.new_zeros(())
 
-        valid_mask = expand_ocean_mask(mask, pred_t)
+        # Ocean mask (H, W), 1 = ocean, broadcast to pred_t's (B, P, H, W)
+        valid_mask = mask.to(device=pred_t.device, dtype=pred_t.dtype).expand_as(pred_t)
         if torch.is_grad_enabled() and pred_t.requires_grad:
             loss = checkpoint(log_band_energy_mse, pred_t, target_t, valid_mask, use_reentrant=False)
         else:
             loss = log_band_energy_mse(pred_t, target_t, valid_mask)
-        return current_weight * loss
+        return weight * loss
 
     return loss_fn
 
@@ -347,10 +292,10 @@ def budget_closure_loss(
         Multiplying by std_t (and only std_t) converts z-scores back to physical
         anomalies so both sides of the budget are comparable.
 
-    Note the contrast with `local_mse_loss` / `spectral_loss`: those are fitting
+    Note the contrast with `field_loss` / `spectral_loss`: those are fitting
     objectives, not conservation laws, so they deliberately stay in z-score
     space, where every month and every unit of ocean area is weighted roughly
-    equally (local_mse_loss is area-weighted).
+    equally (field_loss is area-weighted).
     """
     name = "global_closure_loss" if budget is None else f"{budget} closure loss"
 
@@ -371,14 +316,12 @@ def budget_closure_loss(
         forcing_std=None,
         closure_std=None,
         initial_forcing=None,
-        rollout_step=None,
         **_,
     ):
         # ohc_mean / forcing_mean may still arrive via the rollout context; they
         # are swallowed by **_ because the anomaly closure never adds the
         # climatological mean back (see the docstring above).
-        current_weight = step_weight(weight, rollout_step, pred_t)
-        if current_weight == 0.0:
+        if weight == 0.0:
             return pred_t.new_zeros(())
 
         if budget is None:
@@ -486,7 +429,7 @@ def budget_closure_loss(
             flux_integral_global.detach().abs().mean(),
             content_change_global.detach().abs().mean(),
         ).clamp_min(min_scale)
-        return current_weight * ((residual / scale) ** 2).mean()
+        return weight * ((residual / scale) ** 2).mean()
 
     return loss_fn
 

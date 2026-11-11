@@ -12,7 +12,7 @@
 # checkpointing modes, bfloat16, positional channels, pointwise-linear layers),
 # all off by default in Samudra.
 """
-The Samudra architecture as a backbone for ForwardEmulator (ModelConfig.arch =
+The Samudra architecture as the tendency network of ForwardEmulator (ModelConfig.arch =
 "samudra"), so it can be compared with this package's UNet on the same data,
 losses, residual update and budget constraint.
 

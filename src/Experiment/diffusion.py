@@ -34,7 +34,6 @@ from Emulator import UNet
 from .config import rollout_spec
 from .constraints import build_constraint
 from .data import gather_windows
-from .models import dirichlet_channels
 from .training import check_finite
 
 
@@ -131,14 +130,10 @@ def build_diffusion(cfg, data, mean_model, sigma_data_batches=4):
     n_prior, p, c = cfg.window.n_prior, data.n_prognostic, data.n_forcing
     # Denoiser inputs: noisy residual (P), prior states (n_prior * P), forcing (C), mean (P), noise level (1).
     in_channels = p + n_prior * p + c + p + 1
-    # The prior/forcing channels sit after the P residual channels.
-    dirichlet = {channel + p: value for channel, value in dirichlet_channels(cfg).items()}
     denoiser = UNet(
         input_channel_count=in_channels,
         output_channel_count=p,
-        padding_mode=cfg.model.padding_mode,
         width_multiplier=cfg.diffusion.width_multiplier,
-        dirichlet=dirichlet,
     )
     diffusion = ResidualDiffusion(mean_model, denoiser, p, cfg.diffusion)
     diffusion.sigma_data.fill_(residual_rms(mean_model, data, sigma_data_batches))

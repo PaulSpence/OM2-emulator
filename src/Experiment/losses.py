@@ -14,7 +14,9 @@ so ``step_weights`` shifts emphasis between lead times without changing the
 overall size of the loss.
 """
 
-from Emulator import budget_closure_loss, crps_loss, local_mse_loss, spectral_loss
+from functools import partial
+
+from Emulator import budget_closure_loss, field_loss, spectral_loss
 
 from .config import CLOSURE_SUFFIX, _is_active
 
@@ -50,9 +52,9 @@ def closure_std_fields(cfg, data):
 # Fitting terms by name: (cfg, data) -> callable(**rollout_context) with unit
 # weight. "<budget>_closure" terms are built by closure_loss.
 LOSS_TERMS = {
-    "local_mse": lambda cfg, data: local_mse_loss(weight=1.0),
+    "local_mse": lambda cfg, data: partial(field_loss, method="mse"),
     "spectral": lambda cfg, data: spectral_loss(weight=1.0, latitude=data.fields["latitude"]),
-    "crps": lambda cfg, data: crps_loss(weight=1.0),
+    "crps": lambda cfg, data: partial(field_loss, method="crps"),
 }
 
 

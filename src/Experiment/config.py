@@ -31,8 +31,6 @@ KNOWN_NORMALISATION_STRATEGIES = (
     "Global_in_time",
 )
 KNOWN_ARCHITECTURES = ("unet", "samudra")
-KNOWN_OUTPUT_HEADS = (None, "spatial_residual")
-KNOWN_LATENT_PROCESSORS = (None, "latent_residual")
 # Fitting terms. Every budget in LossConfig.closures adds a "<budget>_closure" term.
 KNOWN_LOSS_TERMS = ("local_mse", "spectral", "crps")
 # How the emulator turns one state into the next (see ExperimentConfig.paradigm).
@@ -97,16 +95,6 @@ class DataConfig:
     forcing: list = field(
         default_factory=lambda: ["total_surface_heat_flx", "tau_x", "tau_y"]
     )
-    # Land boundary condition per variable, applied to the model's input
-    # channels (see "Land boundary conditions" in src/Emulator/om2_model_utils.py
-    # for why). Variables not listed are Neumann: land takes the nearest ocean
-    # value (no flux across the coast), right for tracers such as heat and
-    # freshwater content and neutral for the rest. Set velocity components to
-    # "dirichlet" (land held at z = 0, i.e. no normal flow), e.g.
-    #   {"u": "dirichlet", "v": "dirichlet"}
-    # or give a value in z-score units: {"u": ["dirichlet", 0.0]}.
-    # Hidden layers always use the Neumann fill.
-    boundary_conditions: dict = field(default_factory=dict)
     # Land mask: cells where this variable is NaN at the first time are land.
     mask_variable: str = "total_surface_heat_flx"
     area_variable: str = "area_t"
@@ -225,25 +213,11 @@ class ModelConfig:
     # "unet": this package's mask-aware UNet. "samudra": the Samudra ConvNeXt
     # U-Net (Emulator.samudra_unet), sized by samudra_ch_width / samudra_dilation.
     arch: str = "unet"
-    # North/south edge padding of every partial convolution (longitude is
-    # always periodic; see PartialConv2d).
-    padding_mode: str = "zeros"
     # UNet channel widths scale with the number of input channels
     # (n_prior * prognostic + forcing): width_multiplier x inputs at 1/2
     # resolution, doubling at each deeper level. >= 2 lets the first ReLU layer
     # carry every signed input; memory grows ~linearly with it.
     width_multiplier: float = 4
-    # NHWC memory layout: faster fp16 convolutions on the V100's tensor cores
-    # (use with train.precision="16-mixed"). Same results.
-    channels_last: bool = False
-    # Full-resolution learned correction of the prediction (the former ResNet
-    # notebook): None or "spatial_residual".
-    output_head: str | None = None
-    output_head_hidden_channels: int = 16
-    output_head_residual_scale: float = 1.0
-    # Residual refinement of the UNet bottleneck: None or "latent_residual".
-    latent_processor: str | None = None
-    latent_residual_scale: float = 0.1
     # arch="samudra": channel width and dilation per level. Samudra's published
     # defaults ([200, 250, 300, 400], [1, 2, 4, 8]) are about 127 million
     # parameters; scale the widths down for a size-matched comparison.
@@ -341,6 +315,17 @@ RETIRED_FIELDS = {
     # 21e807e: rollout-trained diffusion's free months use the evaluation sampler
     # (sampler_steps). Training-only, so loading a trained stage without it is exact.
     "diffusion": ("pushforward_sampler_steps",),
+    # Land filling (Neumann/Dirichlet) replaced by partial convolutions again. NOT exact:
+    # a stage trained with land filling behaves differently under partial convolutions.
+    "data": ("boundary_conditions",),
+    # Refinement modules (latent_residual bottleneck, spatial_residual output head) removed.
+    # Exact for every saved run: all had both switched off (None).
+    "model": ("output_head", "output_head_hidden_channels", "output_head_residual_scale",
+              "latent_processor", "latent_residual_scale",
+              # South-edge padding is always zeros now; every saved run used "zeros", so exact.
+              "padding_mode",
+              # Always channels-last now; every saved run used True, so exact.
+              "channels_last"),
 }
 
 
@@ -381,10 +366,6 @@ class ExperimentConfig:
                 f"Unknown normalisation strategy {d.normalisation.strategy!r}; "
                 f"use one of {KNOWN_NORMALISATION_STRATEGIES}"
             )
-        for name, condition in d.boundary_conditions.items():
-            if name not in (*d.prognostic, *d.forcing):
-                raise ValueError(f"data.boundary_conditions: {name!r} is not a prognostic or forcing variable")
-            _dirichlet_value(name, condition)  # raises on an invalid condition
         if d.mask_variable not in (*d.prognostic, *d.forcing):
             raise ValueError(f"mask_variable {d.mask_variable!r} must be a prognostic or forcing variable")
 
@@ -447,21 +428,11 @@ class ExperimentConfig:
 
         if m.arch not in KNOWN_ARCHITECTURES:
             raise ValueError(f"Unknown arch {m.arch!r}; use {KNOWN_ARCHITECTURES}")
-        if m.output_head not in KNOWN_OUTPUT_HEADS:
-            raise ValueError(f"Unknown output_head {m.output_head!r}; use {KNOWN_OUTPUT_HEADS}")
-        if m.latent_processor not in KNOWN_LATENT_PROCESSORS:
-            raise ValueError(f"Unknown latent_processor {m.latent_processor!r}; use {KNOWN_LATENT_PROCESSORS}")
         if m.arch == "samudra":
-            if m.latent_processor is not None or m.output_head is not None:
-                raise ValueError("arch='samudra' supports neither latent_processor nor output_head")
-            if any(_dirichlet_value(n, c) is not None for n, c in d.boundary_conditions.items()):
-                raise ValueError("arch='samudra' does not fill land, so it has no Dirichlet boundary conditions")
             if len(m.samudra_ch_width) != len(m.samudra_dilation) or len(m.samudra_ch_width) < 2:
                 raise ValueError("model.samudra_ch_width and samudra_dilation need one entry per level (at least 2)")
         if m.width_multiplier < 1:
             raise ValueError("model.width_multiplier must be >= 1")
-        if m.padding_mode not in ("zeros", "replicate", "reflect", "circular"):
-            raise ValueError(f"Unknown padding_mode {m.padding_mode!r}")
 
         if tr.batch_size < 1 or tr.accumulate_grad_batches < 1:
             raise ValueError("train.batch_size and train.accumulate_grad_batches must be >= 1")
@@ -480,8 +451,6 @@ class ExperimentConfig:
             raise ValueError("The 'crps' loss term needs paradigm='crps_ensemble' (an ensemble to score)")
         if self.paradigm == "crps_ensemble" and not crps_active:
             raise ValueError("paradigm='crps_ensemble' needs an active 'crps' loss term")
-        if self.paradigm == "crps_ensemble" and m.output_head is not None:
-            raise ValueError("paradigm='crps_ensemble' does not support model.output_head (it would see the noise)")
         if self.paradigm == "crps_ensemble" and _is_active(lo.terms.get("local_mse", 0)):
             raise ValueError("paradigm='crps_ensemble': drop 'local_mse' (it pulls every member to the mean)")
         if df.sampler_steps < 1 or not 0 < df.sigma_min < df.sigma_max or df.rho <= 0:
@@ -576,20 +545,6 @@ class ExperimentConfig:
     def data_hash(self, file_stamp=""):
         payload = json.dumps(self.data_contract(), sort_keys=True, default=str) + file_stamp
         return hashlib.sha1(payload.encode()).hexdigest()[:12]
-
-
-def _dirichlet_value(name, condition):
-    """The Dirichlet value (z-score units) for a boundary condition, or None for Neumann."""
-    if condition == "neumann":
-        return None
-    if condition == "dirichlet":
-        return 0.0
-    if isinstance(condition, (list, tuple)) and len(condition) == 2 and condition[0] == "dirichlet":
-        return float(condition[1])
-    raise ValueError(
-        f"data.boundary_conditions[{name!r}] = {condition!r}: use 'neumann', 'dirichlet' "
-        "or ['dirichlet', value]"
-    )
 
 
 def _is_active(weight):

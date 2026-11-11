@@ -114,7 +114,6 @@ def make_cfg(path, tmp_path, **overrides):
         ),
         window=WindowConfig(n_prior=2, posterior_steps=4, rollout_steps=4),
         loss=LossConfig(terms={"local_mse": 1.0, "spectral": 0.0, "heat_closure": 0.1}),
-        model=ModelConfig(padding_mode="zeros"),
         train=TrainConfig(batch_size=8, max_epochs=1, gpu_check=False),
         eval=EvalConfig(snapshot_periods=["2004-06"]),
     )
@@ -258,7 +257,6 @@ def test_split_outside_time_axis_raises(synthetic_file, tmp_path):
         (dict(window=WindowConfig(rollout_steps=13, posterior_steps=12)), "rollout_steps"),
         (dict(loss=LossConfig(terms={"local_mse": 0.0})), "at least one loss term"),
         (dict(loss=LossConfig(terms={"mae": 1.0})), "Unknown loss terms"),
-        (dict(model=ModelConfig(output_head="resnet")), "Unknown output_head"),
         (dict(window=WindowConfig(rollout_schedule={5: 4})), "epoch 0"),
         (dict(window=WindowConfig(rollout_steps=[10, 4], posterior_steps=12)), "at most posterior_steps"),
         (dict(window=WindowConfig(rollout_schedule={0: 1, 3: [10, 4]}, posterior_steps=12)), "more than posterior"),
@@ -280,15 +278,9 @@ def test_config_rejects_variable_in_both_roles(synthetic_file, tmp_path):
 # Model and losses
 # =============================================================================
 
-@pytest.mark.parametrize("output_head", [None, "spatial_residual"])
-@pytest.mark.parametrize("latent_processor", [None, "latent_residual"])
-def test_model_options_forward_backward(data_and_cfg, output_head, latent_processor):
+def test_model_forward_backward(data_and_cfg):
     data, cfg = data_and_cfg
-    cfg.model.output_head, cfg.model.latent_processor = output_head, latent_processor
-    try:
-        model = build_model(cfg, data)
-    finally:
-        cfg.model.output_head, cfg.model.latent_processor = None, None
+    model = build_model(cfg, data)
     prior = torch.randn(2, cfg.window.n_prior * data.n_prognostic, H, W, requires_grad=True)
     out = model(prior, torch.randn(2, data.n_forcing, H, W), data.fields["mask"])
     assert out.shape == (2, data.n_prognostic, H, W) and out.dtype == torch.float32
@@ -623,13 +615,13 @@ def test_plot_scales_are_automatic(data_and_cfg):
 def test_unet_widths_scale_with_input_channels(synthetic_file, tmp_path):
     for cfg in (make_cfg(synthetic_file, tmp_path), two_prognostic_cfg(synthetic_file, tmp_path)):
         data = build_data(cfg, verbose=False)
-        unet = build_model(cfg, data).backbone
+        unet = build_model(cfg, data).tendency_network
         in_ch = cfg.window.n_prior * data.n_prognostic + data.n_forcing
         width1 = cfg.model.width_multiplier * in_ch
         assert unet.enc1.conv.in_channels == in_ch
         assert unet.enc1.conv.out_channels == width1
         assert unet.enc2.conv.out_channels == 2 * width1
-        assert unet.latent_channel_count == unet.enc3.out_channels == 4 * width1
+        assert unet.enc3c.conv.out_channels == 4 * width1  # bottleneck
         assert unet.dec3.conv.in_channels == width1  # no raw-input skip at full resolution
         assert unet.dec3.conv.out_channels == data.n_prognostic
 
@@ -639,13 +631,13 @@ def test_width_multiplier_must_be_positive(synthetic_file, tmp_path):
         make_cfg(synthetic_file, tmp_path, model=ModelConfig(width_multiplier=0))
 
 
-def test_zero_backbone_output_persists_last_state(data_and_cfg):
-    """The emulator predicts the change: a backbone that outputs 0 persists the last prior state."""
+def test_zero_tendency_output_persists_last_state(data_and_cfg):
+    """The emulator predicts the change: a tendency network that outputs 0 persists the last prior state."""
     data, cfg = data_and_cfg
     model = build_model(cfg, data)
     with torch.no_grad():
-        model.backbone.dec3.conv.weight.zero_()
-        model.backbone.dec3.conv.bias.zero_()
+        model.tendency_network.dec3.conv.weight.zero_()
+        model.tendency_network.dec3.conv.bias.zero_()
     prior = torch.randn(2, cfg.window.n_prior * data.n_prognostic, H, W)
     out = model(prior, torch.randn(2, data.n_forcing, H, W), data.fields["mask"])
     torch.testing.assert_close(out, prior[:, -data.n_prognostic :])
@@ -657,33 +649,42 @@ def test_zero_backbone_output_persists_last_state(data_and_cfg):
 # checkpointing, channels_last, compile
 # =============================================================================
 
+def _reference_partial_conv(layer, x, mask):
+    """The original PartialConv2d forward (mask, convolve, where(renormalise, 0)), with its padding."""
+    p = layer.padding
+    padded = []
+    for t in (x, mask):
+        fold = torch.flip(t[..., -p:, :], dims=(-2, -1))                                # north: tripole fold
+        t = torch.cat([torch.nn.functional.pad(t, (0, 0, p, 0)), fold], dim=-2)          # south: zeros
+        padded.append(torch.nn.functional.pad(t, (p, p, 0, 0), mode="circular"))         # longitude wraps
+    x, mask = padded
+    out = layer.conv(x * mask)
+    mask_sum = layer.mask_conv(mask)
+    out = torch.where(mask_sum > 0, out * (layer.kernel_area / (mask_sum + layer.eps)), torch.zeros_like(out))
+    return out, (mask_sum > 0).float()
+
+
 @pytest.mark.parametrize("kernel_size,stride,padding", [(3, 1, 1), (4, 2, 1), (7, 1, 3)])
-def test_mask_aware_conv_fills_land_then_convolves(kernel_size, stride, padding):
-    """No renormalisation: the output is an ordinary convolution of the land-filled, padded input."""
+def test_partial_conv_matches_original(kernel_size, stride, padding):
     from Emulator import PartialConv2d
-    from Emulator.om2_model_utils import fill_land
 
     torch.manual_seed(0)
-    layer = PartialConv2d(5, 6, kernel_size, stride, padding, padding_mode="zeros")
+    layer = PartialConv2d(5, 6, kernel_size, stride, padding)
     x = torch.randn(3, 5, H, W)
     mask = (torch.rand(1, 1, H, W) > 0.3).float()
-    expected = layer.conv(layer._pad(fill_land(x, mask)))
-    for m in (mask, mask.expand(3, 1, H, W)):  # shared (1, 1, H, W) or per-sample copies of one mask
+    expected, expected_mask = _reference_partial_conv(layer, x, mask.expand(3, 1, H, W))
+    for m in (mask, mask.expand(3, 1, H, W)):  # shared (1, 1, H, W) or per-sample mask
         out, new_mask = layer(x, m)
         torch.testing.assert_close(out, expected)
-    if stride == 1:
-        assert new_mask is m  # land is refilled at every layer, not dilated
-    else:
-        # A coarse cell is ocean if any fine cell in it is ocean.
-        torch.testing.assert_close(new_mask[:1], torch.nn.functional.adaptive_max_pool2d(mask, out.shape[-2:]))
+        torch.testing.assert_close(new_mask.expand_as(expected_mask), expected_mask)
 
 
 def test_output_ignores_input_values_on_land():
-    """Land inputs are overwritten (Neumann or Dirichlet) before every layer, so they cannot affect the output."""
+    """The first layer multiplies the input by the mask, so land values cannot affect the output."""
     from Emulator import UNet
 
     torch.manual_seed(0)
-    unet = UNet(input_channel_count=3, output_channel_count=2, padding_mode="zeros", dirichlet={1: 0.5}).eval()
+    unet = UNet(input_channel_count=3, output_channel_count=2).eval()
     mask = (torch.rand(1, 1, H, W) > 0.3).float()
     x = torch.randn(2, 3, H, W)
     noise_on_land = torch.randn_like(x) * 100 * (1 - mask)
@@ -691,52 +692,17 @@ def test_output_ignores_input_values_on_land():
         torch.testing.assert_close(unet(x + noise_on_land, mask), unet(x, mask))
 
 
-def test_nearest_ocean_index_wraps_in_longitude():
-    from Emulator.om2_model_utils import nearest_ocean_index
+def test_three_3x3_partial_convs_grow_the_mask_like_a_7x7():
+    """The UNet's bottleneck and first decoder layer (three 3x3 layers each) see the same window as one 7x7."""
+    from Emulator import PartialConv2d
 
-    mask = torch.zeros(4, 10)
-    mask[2, 9] = 1.0  # one ocean cell, in the last column
-    mask[0, 5] = 1.0
-    index = nearest_ocean_index(mask).reshape(4, 10)
-    assert index[2, 9] == 2 * 10 + 9 and index[0, 5] == 5        # ocean cells map to themselves
-    assert index[2, 0] == 2 * 10 + 9                             # nearest across the seam, one cell away
-    assert index[0, 4] == 5                                      # nearest within the row
-
-
-def test_fill_land_neumann_and_dirichlet():
-    from Emulator.om2_model_utils import fill_land
-
-    mask = torch.tensor([[1.0, 0.0, 0.0, 1.0, 1.0]])  # (1, 5): land at columns 1-2
-    x = torch.tensor([[[[1.0, -7.0, -7.0, 4.0, 5.0]], [[2.0, -7.0, -7.0, 6.0, 8.0]]]])  # (1, 2, 1, 5)
-    out = fill_land(x, mask, dirichlet={1: 0.25})
-    torch.testing.assert_close(out[0, 0, 0], torch.tensor([1.0, 1.0, 4.0, 4.0, 5.0]))    # Neumann: nearest ocean value
-    torch.testing.assert_close(out[0, 1, 0], torch.tensor([2.0, 0.25, 0.25, 6.0, 8.0]))  # Dirichlet: fixed on land
-    torch.testing.assert_close(out[..., [0, 3, 4]], x[..., [0, 3, 4]])                  # ocean untouched
-
-
-def test_boundary_conditions_map_to_input_channels(synthetic_file, tmp_path):
-    """Dirichlet variables mark every input channel that carries them: each prior level, or the forcing slot."""
-    from Experiment.models import dirichlet_channels
-
-    cfg = two_prognostic_cfg(synthetic_file, tmp_path)  # prognostic [OHC, tau_x], forcing [heat flux, tau_y], n_prior 2
-    cfg.data.boundary_conditions = {"tau_x": "dirichlet", "tau_y": ["dirichlet", 0.5], "ocean_heat_content_2d": "neumann"}
-    cfg.validate()
-    expected = {1: 0.0, 3: 0.0, 5: 0.5}  # tau_x at prior levels 0 and 1; tau_y is forcing channel 1 after 4 prior channels
-    assert dirichlet_channels(cfg) == expected
-    data = build_data(cfg, verbose=False)
-    assert build_model(cfg, data).backbone.enc1.dirichlet == expected
-    assert build_model(cfg, data).backbone.dec2.dirichlet == {}  # hidden layers are always Neumann
-
-
-@pytest.mark.parametrize("conditions,message", [
-    ({"not_a_variable": "dirichlet"}, "not a prognostic or forcing variable"),
-    ({"tau_x": "robin"}, "use 'neumann', 'dirichlet'"),
-])
-def test_invalid_boundary_conditions_are_rejected(synthetic_file, tmp_path, conditions, message):
-    cfg = make_cfg(synthetic_file, tmp_path)
-    cfg.data.boundary_conditions = conditions
-    with pytest.raises(ValueError, match=message):
-        cfg.validate()
+    mask = (torch.rand(1, 1, H, W, generator=torch.Generator().manual_seed(1)) > 0.85).float()
+    _, mask7 = PartialConv2d(2, 2, kernel_size=7, padding=3)(torch.randn(1, 2, H, W), mask)
+    x, mask3 = torch.randn(2, 2, H, W), mask
+    for layer in (PartialConv2d(2, 4), PartialConv2d(4, 4), PartialConv2d(4, 3)):
+        x, mask3 = layer(x, mask3)
+    assert x.shape == (2, 3, H, W)
+    torch.testing.assert_close(mask3, mask7)
 
 
 def test_unet_has_no_large_kernels(data_and_cfg):
@@ -792,18 +758,6 @@ def test_checkpointed_training_runs(synthetic_file, tmp_path):
     module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
     build_trainer(cfg).fit(module, data.train_dl, data.valid_dl)
     assert len(module.rmse_history) > 0
-
-
-def test_channels_last_gives_same_output(synthetic_file, tmp_path):
-    outputs = []
-    prior = torch.randn(2, 2, H, W)
-    forcing = torch.randn(2, len(FORCING), H, W)
-    for channels_last in (False, True):
-        cfg = make_cfg(synthetic_file, tmp_path, model=ModelConfig(channels_last=channels_last))
-        data = build_data(cfg, verbose=False)
-        model = build_model(cfg, data)  # same seed -> same weights
-        outputs.append(model(prior, forcing, data.fields["mask"]))
-    torch.testing.assert_close(outputs[0], outputs[1], rtol=1e-4, atol=1e-5)
 
 
 def test_compiled_model_keeps_plain_state_dict(data_and_cfg):
@@ -1039,19 +993,34 @@ def test_leading_growth_mode_runs_on_the_emulator(data_and_cfg):
 # =============================================================================
 
 def test_padding_follows_the_tripolar_grid():
-    """Ghost rows above the top row are the top rows reversed in x; x wraps; the south edge is zero."""
+    """
+    Ghost rows above the top row are the top rows reversed in x; x wraps; the south edge is zero.
+
+    Checked through forward: a 5x5 kernel (padding 2) whose only nonzero weight is a 1 at
+    (row a, column b) outputs the padded field shifted by (a - 2, b - 2), so ghost cells show up
+    in the output. All ocean, so the renormalisation factor is 1 except in output rows 0-1,
+    whose windows include the two zero (land) rows padded below the south edge.
+    """
     from Emulator import PartialConv2d
 
-    layer = PartialConv2d(1, 1, kernel_size=5, padding=2, padding_mode="zeros")
-    t = torch.arange(6 * 8, dtype=torch.float32).reshape(1, 1, 6, 8)
-    padded = layer._pad(t)                      # (1, 1, 10, 12)
-    interior = padded[..., 2:-2]
-    torch.testing.assert_close(interior[..., 2:-2, :], t)                           # original field
-    torch.testing.assert_close(interior[..., -2, :], torch.flip(t[..., -1, :], dims=(-1,)))  # first ghost row
-    torch.testing.assert_close(interior[..., -1, :], torch.flip(t[..., -2, :], dims=(-1,)))  # second ghost row
-    assert (interior[..., :2, :] == 0).all()                                        # south edge
-    torch.testing.assert_close(padded[..., :2], padded[..., -4:-2])                 # x wraps
-    torch.testing.assert_close(padded[..., -2:], padded[..., 2:4])
+    layer = PartialConv2d(1, 1, kernel_size=5, padding=2)
+    t = torch.arange(1, 6 * 8 + 1, dtype=torch.float32).reshape(1, 1, 6, 8)  # from 1: zeros come only from padding
+    mask = torch.ones(1, 1, 6, 8)
+    out = {}
+    for a, b in [(4, 2), (0, 2), (2, 4), (2, 0)]:
+        with torch.no_grad():
+            layer.conv.weight.zero_()
+            layer.conv.bias.zero_()
+            layer.conv.weight[0, 0, a, b] = 1.0
+            out[a, b], _ = layer(t, mask)
+    # Looking 2 rows north from the top two rows lands on the fold: the top rows, reversed in x.
+    torch.testing.assert_close(out[4, 2][..., 4, :], torch.flip(t[..., 5, :], dims=(-1,)))
+    torch.testing.assert_close(out[4, 2][..., 5, :], torch.flip(t[..., 4, :], dims=(-1,)))
+    # Looking 2 rows south from the bottom two rows lands on the zero rows.
+    assert (out[0, 2][..., :2, :] == 0).all()
+    # Looking 2 columns east or west wraps around in longitude (rows 2-5, where the factor is 1).
+    torch.testing.assert_close(out[2, 4][..., 2:, :], torch.roll(t, -2, dims=-1)[..., 2:, :])
+    torch.testing.assert_close(out[2, 0][..., 2:, :], torch.roll(t, 2, dims=-1)[..., 2:, :])
 
 
 @pytest.mark.parametrize("kernel_size,stride,padding", [(3, 1, 1), (4, 2, 1)])
@@ -1060,15 +1029,14 @@ def test_partial_conv_respects_the_grid_symmetry(kernel_size, stride, padding):
     from Emulator import PartialConv2d
 
     torch.manual_seed(0)
-    layer = PartialConv2d(3, 4, kernel_size, stride, padding, padding_mode="zeros")
+    layer = PartialConv2d(3, 4, kernel_size, stride, padding)
     x = torch.randn(2, 3, H, W)
-    # All ocean: this tests the grid topology; ties in the nearest-ocean land
-    # fill are broken by scan order, which a roll changes.
-    mask = torch.ones(1, 1, H, W)
+    mask = (torch.rand(1, 1, H, W) > 0.3).float()
     shift = W // 2
     out, new_mask = layer(x, mask)
     out_rolled, mask_rolled = layer(torch.roll(x, shift, dims=-1), torch.roll(mask, shift, dims=-1))
     torch.testing.assert_close(out_rolled, torch.roll(out, shift // stride, dims=-1))
+    torch.testing.assert_close(mask_rolled, torch.roll(new_mask, shift // stride, dims=-1))
 
 
 def test_periodic_upsampling_matches_interpolating_a_tiled_field():
@@ -1081,14 +1049,14 @@ def test_periodic_upsampling_matches_interpolating_a_tiled_field():
 
 
 def test_unet_respects_the_grid_symmetry():
-    """The whole backbone has no seam: rolling inputs and mask by half the width rolls the output by half."""
+    """The whole UNet has no seam: rolling inputs and mask by half the width rolls the output by half."""
     from Emulator import UNet
 
     torch.manual_seed(0)
     h, w = 16, 32  # width divisible by 8 so the half-width roll is exact at every UNet level
-    unet = UNet(input_channel_count=3, output_channel_count=2, padding_mode="zeros").eval()
+    unet = UNet(input_channel_count=3, output_channel_count=2).eval()
     x = torch.randn(1, 3, h, w)
-    mask = torch.ones(1, 1, h, w)  # all ocean: see test_partial_conv_respects_the_grid_symmetry
+    mask = (torch.rand(1, 1, h, w) > 0.3).float()
     with torch.no_grad():
         out = unet(x, mask)
         out_rolled = unet(torch.roll(x, w // 2, dims=-1), torch.roll(mask, w // 2, dims=-1))
@@ -1267,49 +1235,17 @@ def test_rmse_by_epoch_draws_baselines():
     plt.close(fig)
 
 
-# =============================================================================
-# Cached land levels and channels_last fill
-# =============================================================================
-
-def test_unet_caches_land_levels_until_the_mask_changes():
-    from Emulator import UNet
-
-    torch.manual_seed(0)
-    unet = UNet(input_channel_count=3, output_channel_count=2, padding_mode="zeros").eval()
-    mask = (torch.rand(H, W) > 0.3).float()
-    x = torch.randn(2, 3, H, W)
-    with torch.no_grad():
-        out = unet(x, mask[None, None])
-        assert unet.land_levels(mask[None, None]) is unet.land_levels(mask)  # one entry for the mask and its views
-        mask[0, :5] = 1 - mask[0, :5]  # in-place edit: the cached levels must be recomputed
-        edited = unet(x, mask[None, None])
-        unet._land_cache.clear()
-        torch.testing.assert_close(edited, unet(x, mask[None, None]))
-    assert not torch.equal(out, edited)
-    assert [m.shape[-2:] for m, _ in unet.land_levels(mask)] == [(H, W), (H // 2, W // 2), (H // 4, W // 4)]
-
-
-def test_fill_land_keeps_channels_last():
-    from Emulator.om2_model_utils import fill_land
-
-    torch.manual_seed(0)
-    mask = (torch.rand(1, 1, H, W) > 0.3).float()
-    x = torch.randn(2, 5, H, W)
-    x_cl = x.contiguous(memory_format=torch.channels_last)
-    out_cl = fill_land(x_cl, mask, dirichlet={2: 0.5})
-    assert out_cl.is_contiguous(memory_format=torch.channels_last)
-    torch.testing.assert_close(out_cl, fill_land(x, mask, dirichlet={2: 0.5}))
-
-
 def test_local_mse_is_area_weighted():
     """Each cell's squared error counts in proportion to its area; without area every ocean cell counts equally."""
-    from Emulator import local_mse_loss
+    from functools import partial
+
+    from Emulator import field_loss
 
     g = torch.Generator().manual_seed(4)
     mask = (torch.rand(H, W, generator=g) > 0.3).float()
     area = torch.rand(H, W, generator=g) * 1e10 + 1e9
     pred, target = torch.randn(2, 3, H, W, generator=g), torch.randn(2, 3, H, W, generator=g)
-    loss_fn = local_mse_loss(weight=1.0)
+    loss_fn = partial(field_loss, method="mse")
 
     weights = (mask * area).expand(2, 3, H, W)
     expected = (((pred - target) ** 2) * weights).sum() / weights.sum()
@@ -1317,6 +1253,14 @@ def test_local_mse_is_area_weighted():
 
     unweighted = (((pred - target) ** 2) * mask).sum() / (mask.sum() * 6)
     torch.testing.assert_close(loss_fn(pred_t=pred, target_t=target, mask=mask, rollout_step=0), unweighted)
+
+
+def test_field_loss_rejects_unknown_method():
+    from Emulator import field_loss
+
+    x = torch.zeros(1, 1, H, W)
+    with pytest.raises(ValueError, match="Unknown field_loss method"):
+        field_loss(pred_t=x, target_t=x, mask=torch.ones(H, W), method="mae")
 
 
 # =============================================================================
@@ -1369,9 +1313,11 @@ def test_skill_test_closes_the_global_budget_every_month(data_and_cfg):
 
 
 def test_crps_loss_values():
-    from Emulator import crps_loss
+    from functools import partial
 
-    loss = crps_loss(weight=1.0)
+    from Emulator import field_loss
+
+    loss = partial(field_loss, method="crps")
     mask = torch.ones(2, 2)
     target = torch.zeros(2, 1, 2, 2)  # one sample, two members
     spread_members = torch.cat([torch.full((1, 1, 2, 2), 1.0), torch.full((1, 1, 2, 2), 3.0)])
@@ -1421,7 +1367,7 @@ def test_crps_ensemble_branch_starts_from_the_trunk_and_trains(synthetic_file, t
     trainer = build_trainer(ens_cfg)
     trainer.fit(module, data.train_dl, data.valid_dl)
     assert torch.isfinite(trainer.callback_metrics["train_crps"])
-    noise_weights = ens.backbone.enc1.conv.weight[:, -ens_cfg.ensemble.noise_channels:]
+    noise_weights = ens.tendency_network.enc1.conv.weight[:, -ens_cfg.ensemble.noise_channels:]
     assert noise_weights.abs().sum() > 0  # training switched the noise on
 
     skill = run_skill_test(ens_cfg, ens, data, members=3)
@@ -1625,7 +1571,7 @@ def test_samudra_architecture_trains_in_the_pipeline(synthetic_file, tmp_path):
                    model=ModelConfig(arch="samudra", samudra_ch_width=[8, 12], samudra_dilation=[1, 2]))
     data = build_data(cfg, verbose=False)
     model = build_model(cfg, data)
-    assert type(model.backbone).__name__ == "SamudraUNet"
+    assert type(model.tendency_network).__name__ == "SamudraUNet"
     trainer = build_trainer(cfg)
     trainer.fit(build_module(cfg, model, build_losses(cfg, data), data), data.train_dl, data.valid_dl)
     assert torch.isfinite(trainer.callback_metrics["val_loss"])
@@ -1637,7 +1583,6 @@ def test_samudra_architecture_trains_in_the_pipeline(synthetic_file, tmp_path):
 @pytest.mark.parametrize(
     "model, message",
     [
-        (dict(arch="samudra", latent_processor="latent_residual"), "neither latent_processor"),
         (dict(arch="samudra", samudra_ch_width=[8, 12], samudra_dilation=[1]), "one entry per level"),
         (dict(arch="samudra", samudra_ch_width=[8], samudra_dilation=[1]), "at least 2"),
     ],
@@ -1767,6 +1712,10 @@ def test_config_load_round_trip(synthetic_file, tmp_path):
     # Configs saved before a field was retired still load; other unknown fields do not.
     raw = json.loads((tmp_path / "config.json").read_text())
     raw["diffusion"]["pushforward_sampler_steps"] = 4
+    raw["data"]["boundary_conditions"] = {}
+    raw["model"]["latent_processor"] = None
+    raw["model"]["padding_mode"] = "zeros"
+    raw["model"]["channels_last"] = True
     (tmp_path / "old.json").write_text(json.dumps(raw))
     assert ExperimentConfig.load(tmp_path / "old.json").to_dict() == cfg.to_dict()
     raw["diffusion"]["not_a_field"] = 1
