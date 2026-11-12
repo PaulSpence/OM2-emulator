@@ -155,7 +155,8 @@ def run_repeat_year_control(cfg, model, data, first_month="1990-05", years=1000,
         },
         coords={"step": np.arange(1, n_steps + 1), "member": np.arange(members), "variable": names,
                 "decade": np.arange(1, decades.shape[0] + 1),
-                "latitude": f["latitude"], "longitude": f["longitude"]},
+                "latitude": f["latitude"], "longitude": f["longitude"],
+                "row_length_km": ("latitude", f["row_length_km"])},
     )
     if annual:
         ds["annual_mean"] = (("snapshot_year", "variable", "latitude", "longitude"),
@@ -243,7 +244,7 @@ def plot_long_control_spectra(controls):
             colours = plt.cm.viridis(np.linspace(0, 0.9, len(years)))
             for year, colour in zip(years, colours):
                 field = ds["annual_mean"].sel(snapshot_year=year, variable=variable).expand_dims(time=[0])
-                k, psd = zonal_spectrum(field.values, field["latitude"].values)
+                k, psd = zonal_spectrum(field.values, field["row_length_km"].values)
                 ax.loglog(k, psd, color=colour, lw=1.4, label=f"year {year}")
             ax.set_title(f"{name}: {variable}", fontsize=10)
             ax.set_xlabel("zonal wavenumber (cycles/km)")

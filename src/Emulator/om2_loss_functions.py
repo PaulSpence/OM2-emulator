@@ -79,37 +79,54 @@ def field_loss(*, pred_t, target_t, mask, area, method="mse", n_members=1, **_):
     return (error * cell_weight).sum() / cell_weight.sum().clamp_min(1e-12)
 
 EARTH_RADIUS_KM = 6371.0
-# Rows used for zonal spectra. North of ~65N the ACCESS-OM2 tripole grid's
-# nominal longitude is not a true longitude, so a row there is not a circle of
-# latitude and its FFT has no clean physical wavenumber.
-SPECTRUM_LATITUDES = (-65.0, 60.0)
 SPECTRAL_BANDS_PER_DECADE = 8
 
 
-def zonal_wavenumber_bands(latitude, n_lon):
+def grid_row_length_km(geolat, geolon):
     """
-    Sort every (latitude row, zonal harmonic) into bands of PHYSICAL zonal
-    wavenumber k (cycles/km), so a band is the same length scale at every
-    latitude and at every resolution (1 deg or 1/10 deg).
+    Length (km) of every grid row, (H, W) cell-centre coordinates -> (H,).
 
-    Returns (rows, band, power_weight, k_band):
-      rows          indices of the latitude rows used (those within SPECTRUM_LATITUDES);
+    A row runs all the way round (longitude is periodic), so its length is the
+    sum of the great-circle distances between neighbouring cell centres,
+    including the last cell to the first. On a latitude-longitude row this is
+    2 pi R cos(latitude). On the ACCESS-OM2 tripole grid north of ~65N it is
+    not: a row there is a closed curve round the two grid poles, thousands of
+    km long even at the top row (where 2 pi R cos(89.8 deg) would give 160 km).
+    geolat and geolon must be defined over land too (the grid file, not a
+    land-masked copy).
+    """
+    lat = np.deg2rad(np.asarray(geolat, dtype=float))
+    lon = np.deg2rad(np.asarray(geolon, dtype=float))
+    if not (np.isfinite(lat).all() and np.isfinite(lon).all()):
+        raise ValueError("grid_row_length_km needs geolat and geolon at every cell, land included")
+    lat_next, lon_next = np.roll(lat, -1, axis=-1), np.roll(lon, -1, axis=-1)
+    # Haversine distance between each cell and its eastern neighbour.
+    h = np.sin((lat_next - lat) / 2) ** 2 + np.cos(lat) * np.cos(lat_next) * np.sin((lon_next - lon) / 2) ** 2
+    return (2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(np.clip(h, 0.0, 1.0)))).sum(axis=-1)
+
+
+def zonal_wavenumber_bands(row_length_km, n_lon):
+    """
+    Sort every (grid row, along-row harmonic) into bands of PHYSICAL wavenumber
+    k (cycles/km), so a band is the same length scale in every row and at every
+    resolution (1 deg or 1/10 deg). Every row is used, the tripole rows of the
+    Arctic included: a grid row is periodic everywhere, and its true length
+    (grid_row_length_km) gives its harmonics a physical wavenumber.
+
+    Returns (band, power_weight, k_band):
       band          (rows * harmonics,) band number of each (row, harmonic),
                     flattened row by row;
       power_weight  (rows, harmonics): multiplies |rfft|^2 so that it sums to
-                    the row's variance, times cos(latitude) (the row's area share);
+                    the row's variance, times the row's length / 2 pi R (its
+                    area share; cos(latitude) on a latitude-longitude row);
       k_band        (n_bands,) central wavenumber of each band (cycles/km).
     """
-    latitude = np.asarray(latitude, dtype=float)
+    row_length_km = np.asarray(row_length_km, dtype=float)              # (rows,)
+    length_share = row_length_km / (2 * np.pi * EARTH_RADIUS_KM)        # cos(latitude) on a lat-lon row
 
-    # Latitude rows used (north of ~65N the tripole grid's rows are not circles of latitude).
-    rows = np.flatnonzero((latitude >= SPECTRUM_LATITUDES[0]) & (latitude <= SPECTRUM_LATITUDES[1]))
-    cos_lat = np.cos(np.deg2rad(latitude[rows]))
-
-    # Physical wavenumber of every (row, harmonic). A row is a circle of length 2 pi R cos(lat),
-    # and harmonic n (n waves around it) has k = n / length. rfftfreq(n_lon, d=1/n_lon) lists the
-    # harmonics rfft returns, 0 .. n_lon // 2; harmonic 0 is the zonal mean, which is dropped.
-    row_length_km = 2 * np.pi * EARTH_RADIUS_KM * cos_lat              # (rows,)
+    # Physical wavenumber of every (row, harmonic): harmonic n (n waves along the row) has
+    # k = n / row length. rfftfreq(n_lon, d=1/n_lon) lists the harmonics rfft returns,
+    # 0 .. n_lon // 2; harmonic 0 is the row mean, which is dropped.
     harmonics = np.fft.rfftfreq(n_lon, d=1.0 / n_lon)[1:]              # (harmonics,)
     k = harmonics[None, :] / row_length_km[:, None]                    # (rows, harmonics)
 
@@ -122,24 +139,29 @@ def zonal_wavenumber_bands(latitude, n_lon):
 
     # Parseval: sum_n |rfft_n|^2 / n_lon^2 is the row's variance, once every harmonic below
     # Nyquist is counted twice (rfft returns n but not its mirror image -n, which has the same
-    # power). Times cos(lat), the row's share of the area.
+    # power). Times the row's length share, i.e. its share of the area.
     counted_twice = np.where(harmonics < n_lon / 2, 2.0, 1.0)
-    power_weight = cos_lat[:, None] * counted_twice[None, :] / n_lon**2
-    return rows, band, power_weight, k_band
+    power_weight = length_share[:, None] * counted_twice[None, :] / n_lon**2
+    return band, power_weight, k_band
 
 
-def spectral_loss(*, latitude, n_lon):
+def spectral_loss(*, row_length_km, n_lon):
     """
-    Return the spectral loss for a grid with these row latitudes and n_lon
-    longitudes: the mean squared difference in log10 ENERGY per physical
-    zonal-wavenumber band, per sample and variable.
+    Return the spectral loss for a grid with these row lengths and n_lon cells
+    per row: the mean squared difference in log10 ENERGY per physical
+    wavenumber band, per sample and variable.
 
-    For every latitude row in SPECTRUM_LATITUDES the ocean-masked field
-    (land = 0) is Fourier transformed along longitude, which is periodic. The
-    power of each harmonic is summed into log-spaced bands of physical zonal
-    wavenumber (zonal_wavenumber_bands), weighting rows by cos(latitude) so the
-    band energies add up to the area-weighted zonal variance. The loss compares
-    log energies band by band.
+    Every grid row of the ocean-masked field (land = 0) is Fourier transformed
+    along the row, which is periodic. The power of each harmonic is summed into
+    log-spaced bands of physical wavenumber (zonal_wavenumber_bands), weighting
+    rows by their length (their area share), so the band energies add up to the
+    area-weighted along-row variance. The loss compares log energies band by
+    band.
+
+    Every row is used, the Arctic tripole rows included. Leaving them out (as
+    the loss did before) left the grid-scale structure there unconstrained, and
+    that is where the UNet controls blew up: a pattern 1-2 cells wide on the
+    top rows, at the tripole fold, grew ~30% a year.
 
     Why this form. The skill-test spectra showed two failures over long
     rollouts: large scales losing energy (the MSE fit damps anomalies, i.e.
@@ -152,26 +174,24 @@ def spectral_loss(*, latitude, n_lon):
     the amplitude of every individual 2-D Fourier mode: noisy, and its FFT ran
     across the non-periodic north/south edges.)
 
-    ``latitude``: the grid's 1-D nominal latitude (degrees), which sets each
-    row's length and so its physical wavenumbers. ``n_lon``: number of
-    longitudes.
+    ``row_length_km``: (H,) the length of every grid row (grid_row_length_km),
+    which sets its physical wavenumbers. ``n_lon``: cells per row.
 
     The returned loss is called with the whole rollout context
     (``loss(**context)``); the loss weight is applied by the caller.
     """
     # The grid's band layout (see zonal_wavenumber_bands), computed once. The tensors are
     # moved to the field's device at every call: a few hundred kB, negligible next to the network.
-    rows, band, power_weight, k_band = zonal_wavenumber_bands(latitude, n_lon)
-    rows, band = torch.as_tensor(rows), torch.as_tensor(band)
+    band, power_weight, k_band = zonal_wavenumber_bands(row_length_km, n_lon)
+    band = torch.as_tensor(band)
     power_weight = torch.as_tensor(power_weight, dtype=torch.float32)
 
     def log_band_energy_mse(pred_t, target_t, mask):
         device = pred_t.device
-        # Prediction and truth side by side with land set to 0, only the rows used: (2, B, P, rows, n_lon).
+        # Prediction and truth side by side with land set to 0: (2, B, P, rows, n_lon).
         # In float32: half-precision FFTs need power-of-two sizes.
         fields = torch.stack([pred_t.float(), target_t.float()]) * mask.to(device, torch.float32)
-        fields = fields[..., rows.to(device), :]
-        # Power of every zonal harmonic except the zonal mean, as its share of the area-weighted variance.
+        # Power of every along-row harmonic except the row mean, as its share of the area-weighted variance.
         power = torch.fft.rfft(fields, dim=-1).abs().square()[..., 1:] * power_weight.to(device)
         # Energy per wavenumber band: add up the power of every (row, harmonic) in it. (2, B, P, n_bands)
         energy = power.new_zeros(*power.shape[:-2], k_band.size).index_add(-1, band.to(device), power.flatten(-2))

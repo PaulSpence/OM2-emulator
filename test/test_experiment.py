@@ -86,6 +86,9 @@ def synthetic_file(tmp_path_factory):
             "tau_x": (dims, field(0.0, 0.05, 0.02)),
             "tau_y": (dims, field(0.0, 0.03, 0.02)),
             "area_t": (dims, np.repeat(rng.uniform(1e9, 1e10, (1, H, W)), n_time, 0).astype(np.float32)),
+            # Cell-centre coordinates at every cell, land included (a latitude-longitude grid).
+            "geolat_t": (("yt_ocean", "xt_ocean"), np.repeat(np.linspace(-70, 80, H)[:, None], W, 1).astype(np.float32)),
+            "geolon_t": (("yt_ocean", "xt_ocean"), np.repeat((-280 + 360 / W * np.arange(W))[None, :], H, 0).astype(np.float32)),
         },
         coords={"time": times, "yt_ocean": np.linspace(-70, 80, H), "xt_ocean": np.linspace(-280, 79, W)},
     )
@@ -812,23 +815,24 @@ def test_rollout_steps_in_memory_must_be_non_negative(synthetic_file, tmp_path):
         make_cfg(synthetic_file, tmp_path, train=TrainConfig(rollout_steps_in_memory=-1))
 
 
-SPECTRUM_LAT = np.linspace(-70, 80, H)  # the synthetic grid's latitudes
+# Row lengths of a latitude-longitude grid with the synthetic grid's latitudes: 2 pi R cos(latitude).
+ROW_LENGTH_KM = 2 * np.pi * 6371.0 * np.cos(np.deg2rad(np.linspace(-70, 80, H)))
 
 
 def _reference_band_energy(field, mask):
     """Band energies by explicit loops over rows and harmonics (no index_add)."""
     from Emulator import zonal_wavenumber_bands
 
-    rows, band, _, k = zonal_wavenumber_bands(SPECTRUM_LAT, field.shape[-1])
+    band, _, k = zonal_wavenumber_bands(ROW_LENGTH_KM, field.shape[-1])
     n_lon, n_harmonics = field.shape[-1], field.shape[-1] // 2
     spectrum = torch.fft.rfft(field * mask, dim=-1)
     energy = [field.new_zeros(field.shape[:-2]) for _ in range(k.size)]
-    for i, row in enumerate(rows):
-        cos_lat = np.cos(np.deg2rad(SPECTRUM_LAT[row]))
+    for row in range(field.shape[-2]):
+        share = ROW_LENGTH_KM[row] / (2 * np.pi * 6371.0)
         for n in range(1, n_harmonics + 1):
             pair = 2.0 if n < n_lon / 2 else 1.0  # +n and -n; Nyquist is alone
-            power = spectrum[..., row, n].abs() ** 2 * (cos_lat * pair / n_lon**2)
-            energy[band[i * n_harmonics + n - 1]] = energy[band[i * n_harmonics + n - 1]] + power
+            power = spectrum[..., row, n].abs() ** 2 * (share * pair / n_lon**2)
+            energy[band[row * n_harmonics + n - 1]] = energy[band[row * n_harmonics + n - 1]] + power
     return torch.stack(energy, dim=-1)
 
 
@@ -848,7 +852,7 @@ def test_spectral_loss_is_log_band_energy_mse_with_checkpointing():
 
     expected = reference(pred)
     (expected_grad,) = torch.autograd.grad(expected, pred)
-    loss = spectral_loss(latitude=SPECTRUM_LAT, n_lon=W)(pred_t=pred, target_t=target, mask=mask, rollout_step=0)
+    loss = spectral_loss(row_length_km=ROW_LENGTH_KM, n_lon=W)(pred_t=pred, target_t=target, mask=mask, rollout_step=0)
     (grad,) = torch.autograd.grad(loss, pred)
     torch.testing.assert_close(loss, expected)
     torch.testing.assert_close(grad, expected_grad)
@@ -858,7 +862,7 @@ def test_spectral_loss_ignores_phase_and_penalises_lost_energy():
     """Shifting a field in longitude costs nothing; halving its amplitude costs (log10 1/4)^2 in every band."""
     from Emulator import spectral_loss
 
-    loss_fn = spectral_loss(latitude=SPECTRUM_LAT, n_lon=W)
+    loss_fn = spectral_loss(row_length_km=ROW_LENGTH_KM, n_lon=W)
     mask = torch.ones(H, W)
     target = torch.randn(2, 1, H, W, generator=torch.Generator().manual_seed(4))
     shifted = torch.roll(target, shifts=7, dims=-1)  # longitude is periodic
@@ -874,24 +878,36 @@ def test_spectral_loss_runs_in_half_precision_on_any_grid_size():
     from Emulator import spectral_loss
 
     pred = torch.randn(1, 2, H, W).half()
-    loss = spectral_loss(latitude=SPECTRUM_LAT, n_lon=W)(pred_t=pred, target_t=pred.float() * 2, mask=torch.ones(H, W),
+    loss = spectral_loss(row_length_km=ROW_LENGTH_KM, n_lon=W)(pred_t=pred, target_t=pred.float() * 2, mask=torch.ones(H, W),
                                                          rollout_step=0)
     assert loss.dtype == torch.float32 and torch.isfinite(loss)
 
 
 def test_wavenumber_bands_are_physical_across_resolutions():
-    """Rows south of the tripole only, and the same bands (same k) at 1 deg and 1/4 deg."""
+    """Every row is used, and the same bands (same k) at 1 deg and 1/4 deg."""
     from Emulator import zonal_wavenumber_bands
 
     coarse_lat, fine_lat = np.arange(-77.5, 90, 1.0), np.arange(-77.875, 90, 0.25)
-    rows, band, weight, k_coarse = zonal_wavenumber_bands(coarse_lat, 360)
-    assert coarse_lat[rows].min() >= -65 and coarse_lat[rows].max() <= 60
-    assert band.size == rows.size * 180 and band.max() == k_coarse.size - 1
-    _, _, _, k_fine = zonal_wavenumber_bands(fine_lat, 1440)
+    length = lambda lat: 2 * np.pi * 6371.0 * np.cos(np.deg2rad(lat))
+    band, weight, k_coarse = zonal_wavenumber_bands(length(coarse_lat), 360)
+    assert band.size == coarse_lat.size * 180 and band.max() == k_coarse.size - 1
+    _, _, k_fine = zonal_wavenumber_bands(length(fine_lat), 1440)
     # Both grids have a row at 0.125 deg of the equator, so the band edges coincide;
     # the 1/4 deg grid adds bands at higher k.
     torch.testing.assert_close(torch.tensor(k_fine[: k_coarse.size]), torch.tensor(k_coarse), rtol=1e-3, atol=0)
     assert k_fine.size > k_coarse.size
+
+
+def test_grid_row_length_is_the_circle_of_latitude_on_a_lat_lon_grid():
+    """Row length summed round the row = 2 pi R cos(lat) on a lat-lon grid; land-masked coordinates are refused."""
+    from Emulator import grid_row_length_km
+
+    lat, lon = np.arange(-77.5, 90, 1.0), np.arange(-279.5, 80, 1.0)
+    geolat, geolon = np.meshgrid(lat, lon, indexing="ij")
+    np.testing.assert_allclose(grid_row_length_km(geolat, geolon), 2 * np.pi * 6371.0 * np.cos(np.deg2rad(lat)), rtol=1e-4)
+    geolat[3, 5] = np.nan
+    with pytest.raises(ValueError, match="land included"):
+        grid_row_length_km(geolat, geolon)
 
 
 def test_training_with_spectral_loss(data_and_cfg):
@@ -926,15 +942,15 @@ def test_skill_diagnostics_and_spectra(synthetic_file, tmp_path):
     assert list(summary.index) == TWO_PROGNOSTIC
     assert np.isfinite(summary["amplitude_ratio_last_year"]).all()
 
-    # Parseval: PSD integrated over the bands = area-weighted mean zonal variance (zonal mean removed).
+    # Parseval: PSD integrated over the bands = length-weighted mean along-row variance (row mean
+    # removed), over every row.
     anomaly = skill[f"{name}_truth_anom"].fillna(0.0)
-    k, psd = zonal_spectrum(anomaly.values, anomaly["latitude"].values)
+    k, psd = zonal_spectrum(anomaly.values, anomaly["row_length_km"].values)
     half = 0.5 / 8
-    band_rows = (anomaly.latitude >= -65) & (anomaly.latitude <= 60)
-    a = anomaly.where(band_rows, drop=True)
-    zonal_var = ((a - a.mean("longitude")) ** 2).mean("longitude").mean("time")
-    cos_lat = np.cos(np.deg2rad(a.latitude))
-    expected = float((zonal_var * cos_lat).sum() / cos_lat.sum())
+    zonal_var = ((anomaly - anomaly.mean("longitude")) ** 2).mean("longitude").mean("time")
+    length = anomaly["row_length_km"]
+    np.testing.assert_allclose(length, ROW_LENGTH_KM, rtol=1e-2)  # from the file's geolat_t, geolon_t (18 deg chords)
+    expected = float((zonal_var * length).sum() / length.sum())
     np.testing.assert_allclose((psd * k * (10**half - 10**-half)).sum(), expected, rtol=1e-4)
 
     for fig in (plot_skill_diagnostics(skill, TWO_PROGNOSTIC), plot_spectra(skill, TWO_PROGNOSTIC)):

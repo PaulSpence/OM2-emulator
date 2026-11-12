@@ -17,7 +17,7 @@ import torch
 import xarray as xr
 
 from Emulator import zonal_wavenumber_bands
-from Emulator.om2_loss_functions import SPECTRAL_BANDS_PER_DECADE
+from Emulator.om2_loss_functions import EARTH_RADIUS_KM, SPECTRAL_BANDS_PER_DECADE
 
 from .config import rollout_spec
 from .constraints import build_constraint
@@ -150,7 +150,8 @@ def _as_dataset(arrays, time_coord, data, time_dim="time"):
     """{name: (N, P, H, W) tensor} -> Dataset with one variable per (name, prognostic variable)."""
     f = data.fields
     land = f["mask"].numpy() == 0
-    coords = {time_dim: time_coord, "latitude": f["latitude"], "longitude": f["longitude"]}
+    coords = {time_dim: time_coord, "latitude": f["latitude"], "longitude": f["longitude"],
+              "row_length_km": ("latitude", f["row_length_km"])}
     variables = {}
     for suffix, values in arrays.items():
         for p, name in enumerate(f["prognostic_names"]):
@@ -212,7 +213,8 @@ def run_skill_test(cfg, model, data, members=None):
             ens[..., land] = np.nan
             ds[f"{name}_ens_anom"] = xr.DataArray(
                 ens, dims=("member", "time", "latitude", "longitude"),
-                coords={"time": time, "latitude": f["latitude"], "longitude": f["longitude"]},
+                coords={"time": time, "latitude": f["latitude"], "longitude": f["longitude"],
+                        "row_length_km": ("latitude", f["row_length_km"])},
                 attrs={"units": f["prognostic_units"][p]},
             )
     ds.attrs["description"] = f"Skill test seeded at {cfg.time.test[0]}, {len(targets)} months, {members} member(s)"
@@ -438,18 +440,20 @@ def skill_summary(skill, variables, acc_threshold=0.5):
     return pd.DataFrame(rows).set_index("variable")
 
 
-def zonal_spectrum(anomaly, latitude):
+def zonal_spectrum(anomaly, row_length_km):
     """
-    Time-mean zonal power spectral density of an anomaly (time, latitude, longitude) array, land NaN
-    or 0, against physical zonal wavenumber, on the same bands as the spectral loss
-    (zonal_wavenumber_bands). Returns (k in cycles/km, PSD in units^2 km). PSD is the area-weighted
-    mean zonal variance per unit k, so it reads the same at 1 deg and 1/10 deg.
+    Time-mean along-row power spectral density of an anomaly (time, latitude, longitude) array, land
+    NaN or 0, against physical wavenumber, on the same bands as the spectral loss
+    (zonal_wavenumber_bands), over every grid row (row_length_km: (latitude,), grid_row_length_km).
+    Returns (k in cycles/km, PSD in units^2 km). PSD is the area-weighted mean along-row variance per
+    unit k, so it reads the same at 1 deg and 1/10 deg.
     """
-    rows, band, power_weight, k = zonal_wavenumber_bands(latitude, anomaly.shape[-1])
-    x = np.nan_to_num(np.asarray(anomaly, dtype=float))[:, rows, :]
-    # Power of every (row, harmonic), time-mean, without the zonal mean; then summed into the bands.
+    band, power_weight, k = zonal_wavenumber_bands(row_length_km, anomaly.shape[-1])
+    x = np.nan_to_num(np.asarray(anomaly, dtype=float))
+    # Power of every (row, harmonic), time-mean, without the row mean; then summed into the bands.
     power = (np.abs(np.fft.rfft(x, axis=-1)) ** 2).mean(0)[:, 1:] * power_weight
-    energy = np.bincount(band, power.ravel(), minlength=k.size) / np.cos(np.deg2rad(np.asarray(latitude)[rows])).sum()
+    length_share = np.asarray(row_length_km, dtype=float) / (2 * np.pi * EARTH_RADIUS_KM)
+    energy = np.bincount(band, power.ravel(), minlength=k.size) / length_share.sum()
     # Energy per band / band width in k = density.
     half = 0.5 / SPECTRAL_BANDS_PER_DECADE
     return k, energy / (k * (10.0**half - 10.0**-half))

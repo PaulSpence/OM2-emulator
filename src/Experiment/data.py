@@ -25,7 +25,9 @@ import torch
 import xarray as xr
 from torch.utils.data import DataLoader
 
-CACHE_FORMAT_VERSION = 3  # 3: month_seconds and global integrals for the budget constraint
+from Emulator import grid_row_length_km
+
+CACHE_FORMAT_VERSION = 4  # 3: month_seconds and global integrals for the budget constraint; 4: row_length_km
 
 
 # =============================================================================
@@ -147,6 +149,16 @@ def build_fields(cfg):
         mean_global = (prognostic_mean.double() * torch.as_tensor(area_np)).sum(dim=(-2, -1))
         latitude = np.asarray(like["latitude"].values)
         longitude = np.asarray(like["longitude"].values)
+        if d.grid_path is None:
+            geolat, geolon = ds["geolat_t"].values, ds["geolon_t"].values
+
+    if d.grid_path is not None:
+        with xr.open_dataset(d.grid_path) as grid:
+            geolat, geolon = grid["geolat_t"].values, grid["geolon_t"].values
+    # Length of every grid row (km), for the spectral loss and the spectra.
+    row_length_km = grid_row_length_km(geolat, geolon)
+    if row_length_km.shape != latitude.shape:
+        raise ValueError(f"The grid's {row_length_km.size} rows do not match the data's {latitude.size}")
 
     return {
         "format_version": CACHE_FORMAT_VERSION,
@@ -163,6 +175,7 @@ def build_fields(cfg):
         "months": months,
         "latitude": latitude,
         "longitude": longitude,
+        "row_length_km": row_length_km,      # (H,) km, length of every grid row (all the way round)
         "prognostic_names": list(d.prognostic),
         "prognostic_units": units,
         "forcing_names": list(d.forcing),

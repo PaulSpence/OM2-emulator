@@ -86,6 +86,11 @@ class DataConfig:
     # Land mask: cells where this variable is NaN at the first time are land.
     mask_variable: str = "total_surface_heat_flx"
     area_variable: str = "area_t"
+    # File with geolat_t and geolon_t at every T cell, land included (the row lengths of the
+    # spectral loss and spectra, Emulator.grid_row_length_km). None -> the data file itself; the
+    # ACCESS-OM2 emulator files mask them over land, so give the grid file, e.g.
+    # /g/data/ik11/grids/ocean_grid_10.nc for 1 deg.
+    grid_path: str | None = None
     normalisation: NormalisationConfig = field(default_factory=NormalisationConfig)
     # Where the normalised fields are cached. None -> "<data dir>/emulator_cache".
     # The cache file name includes a hash of every data setting, so changing
@@ -523,6 +528,7 @@ class ExperimentConfig:
             "forcing": list(d.forcing),
             "mask_variable": d.mask_variable,
             "area_variable": d.area_variable,
+            "grid_path": None if d.grid_path is None else str(Path(d.grid_path).resolve()),
             "normalisation": dataclasses.asdict(d.normalisation),
             "time_axis": list(self.time.time_axis),
         }
