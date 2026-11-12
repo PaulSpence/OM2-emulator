@@ -34,7 +34,7 @@ from .config import (
     WindowConfig,
 )
 from .constraints import GlobalBudgetConstraint, build_constraint
-from .data import ExperimentData, InitialMonthDataset, build_data, compute_normalisation, gather_windows
+from .data import ExperimentData, build_data, compute_normalisation, gather_windows
 from .evaluation import (
     check_known_closure,
     climatology_rmse,
@@ -93,7 +93,7 @@ from .plots import (
     prognostic_variables,
 )
 from .training import (
-    EmulatorModule, build_module, build_trainer, check_gpu, last_checkpoint, prepare_resume, read_metrics,
+    EmulatorModule, build_module, build_trainer, check_gpu, prepare_resume, read_metrics,
     training_minutes,
 )
 
@@ -137,7 +137,6 @@ __all__ = [
     "TrainConfig",
     "WindowConfig",
     "ExperimentData",
-    "InitialMonthDataset",
     "build_data",
     "gather_windows",
     "compute_normalisation",
@@ -175,7 +174,6 @@ __all__ = [
     "build_module",
     "build_trainer",
     "check_gpu",
-    "last_checkpoint",
     "prepare_resume",
     "read_metrics",
     "training_minutes",

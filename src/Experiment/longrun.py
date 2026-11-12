@@ -243,7 +243,7 @@ def plot_long_control_spectra(controls):
             colours = plt.cm.viridis(np.linspace(0, 0.9, len(years)))
             for year, colour in zip(years, colours):
                 field = ds["annual_mean"].sel(snapshot_year=year, variable=variable).expand_dims(time=[0])
-                k, psd = zonal_spectrum(field)
+                k, psd = zonal_spectrum(field.values, field["latitude"].values)
                 ax.loglog(k, psd, color=colour, lw=1.4, label=f"year {year}")
             ax.set_title(f"{name}: {variable}", fontsize=10)
             ax.set_xlabel("zonal wavenumber (cycles/km)")

@@ -213,7 +213,8 @@ def plot_spectra(skill, variables=None):
         units = skill[f"{variable}_truth_anom"].attrs.get("units", "")
         for ax, (label, period) in zip(row, periods.items()):
             for name, ls in (("truth", "-"), ("pred", "--")):
-                k, psd = zonal_spectrum(skill[f"{variable}_{name}_anom"].isel(time=period))
+                anomaly = skill[f"{variable}_{name}_anom"].isel(time=period)
+                k, psd = zonal_spectrum(anomaly.values, anomaly["latitude"].values)
                 style = _DIAGNOSTIC_STYLE["truth" if name == "truth" else "emulator"]
                 ax.loglog(k, psd, ls=ls, lw=2, color=style["color"], label=style["label"])
             dates = skill.time.isel(time=period).dt.strftime("%Y-%m").values

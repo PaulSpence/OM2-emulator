@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import torch
 import xarray as xr
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 CACHE_FORMAT_VERSION = 3  # 3: month_seconds and global integrals for the budget constraint
 
@@ -32,60 +32,31 @@ CACHE_FORMAT_VERSION = 3  # 3: month_seconds and global integrals for the budget
 # Normalisation statistics
 # =============================================================================
 
-def compute_normalisation(ds, variables, strategy, fit_period, mask_variable, area_variable, area_weight=True):
+def compute_normalisation(ds, variables, fit_period, mask_variable):
     """
-    Mean and std of each variable, as xarray Datasets on (time, latitude, longitude).
+    The monthly climatology of every variable: the mean and std of each grid
+    cell for each calendar month, fitted over fit_period (first and last month,
+    inclusive). Both are returned on ds's whole time axis: every month gets its
+    calendar month's values. Also returns the ocean mask: 1 where
+    mask_variable has data in the first month, 0 on land.
 
-    This is the statistics part of Data.build_normalisation (the PET-based
-    version used by the older notebooks), ported to plain xarray so it runs
-    without PyEarthTools. It must give identical numbers; the test suite checks
-    this. ``ds`` has already been reduced to the configured time axis.
-
-    Returns (mean, std, mask): mask is 1 over ocean and 0 over land, taken
-    from where ``mask_variable`` is NaN at the first time.
+    ds has dimensions (time, latitude, longitude). The numbers are the same as
+    the "Spatial_climatology" strategy of Data.build_normalisation (the
+    PyEarthTools version used by the older notebooks); the test suite checks
+    this.
     """
-    area = ds[area_variable]
-    stats = ds[list(variables)]
+    mask = xr.where(np.isnan(ds[mask_variable].isel(time=0)), 0, 1)
+    fit = ds[variables].where(mask == 1).sel(time=slice(*fit_period))
 
-    mask = xr.where(np.isnan(stats[mask_variable].isel(time=0)), 0, 1)
-    masked = stats.where(mask == 1)
-    if area_weight:
-        weight = area.where(mask == 1).fillna(0.0).load()
-    else:
-        weight = xr.ones_like(area).load()
+    # Mean and std of every cell for each calendar month, (month, latitude, longitude). The std is that of
+    # the anomalies from the monthly mean.
+    monthly_mean = fit.groupby("time.month").mean("time")
+    monthly_std = (fit.groupby("time.month") - monthly_mean).groupby("time.month").std("time")
 
-    rename_map = {k: v for k, v in {"yt_ocean": "latitude", "xt_ocean": "longitude"}.items() if k in masked.dims}
-    masked = masked.rename(rename_map)
-    weight = weight.rename(rename_map)
-
-    fit = masked.sel(time=slice(fit_period[0], fit_period[1]))
-    spatial = ("latitude", "longitude")
-    month_indexer = xr.DataArray(
-        masked.time.dt.month.values, coords={"time": masked.time.values}, dims="time"
-    )
-
-    if strategy == "Global_in_time":
-        mean = ((fit * weight).sum(dim=spatial, skipna=True) / weight.sum()).mean("time")
-        std = (fit.std("time") * weight).sum(dim=spatial, skipna=True) / weight.sum()
-        std = std.drop_vars(["time"], errors="ignore")
-    elif strategy == "Spatial_in_time":
-        mean = fit.mean(dim="time", skipna=True)
-        std = fit.std(dim="time", skipna=True)
-    elif strategy == "Spatial_climatology":
-        monthly_mean = fit.groupby("time.month").mean(dim="time", skipna=True)
-        monthly_std = (fit.groupby("time.month") - monthly_mean).groupby("time.month").std(dim="time", skipna=True)
-        mean = monthly_mean.sel(month=month_indexer).drop_vars("month", errors="ignore")
-        std = monthly_std.sel(month=month_indexer).drop_vars("month", errors="ignore")
-    elif strategy == "Spatial_climatology_global_variance":
-        monthly_mean = fit.groupby("time.month").mean(dim="time", skipna=True)
-        std = ((fit.groupby("time.month") - monthly_mean).std("time") * weight).sum(dim=spatial, skipna=True) / weight.sum()
-        std = std.drop_vars(["time"], errors="ignore")
-        mean = monthly_mean.sel(month=month_indexer).drop_vars("month", errors="ignore")
-    else:
-        raise ValueError(f"Unknown normalisation strategy {strategy!r}")
-
-    mean = xr.Dataset({v: mean[v] for v in variables})
-    std = xr.Dataset({v: std[v] for v in variables})
+    # Give every month of ds its calendar month's values: (time, latitude, longitude).
+    calendar_month = ds.time.dt.month
+    mean = monthly_mean.sel(month=calendar_month).drop_vars("month")
+    std = monthly_std.sel(month=calendar_month).drop_vars("month")
     return mean, std, mask
 
 
@@ -112,17 +83,8 @@ def _open_time_axis(cfg):
             "temperature (description lacks '273.15'). OHC computed from Kelvin cannot "
             "close against the surface heat flux -- re-extract the dataset."
         )
+    ds = ds.rename({"yt_ocean": "latitude", "xt_ocean": "longitude"})
     return ds.sel(time=months, method="nearest")
-
-
-def _rename_xy(da):
-    rename_map = {k: v for k, v in {"yt_ocean": "latitude", "xt_ocean": "longitude"}.items() if k in da.dims}
-    return da.rename(rename_map)
-
-
-def _broadcast_stat(stat, like):
-    """Broadcast a (possibly scalar or time-less) statistic to like's (time, lat, lon)."""
-    return xr.broadcast(stat, like)[0].transpose("time", "latitude", "longitude")
 
 
 def build_fields(cfg):
@@ -130,15 +92,7 @@ def build_fields(cfg):
     d = cfg.data
     variables = [*d.prognostic, *d.forcing]
     with _open_time_axis(cfg) as ds:
-        mean, std, mask = compute_normalisation(
-            ds,
-            variables,
-            d.normalisation.strategy,
-            d.normalisation.fit_period,
-            d.mask_variable,
-            d.area_variable,
-            d.normalisation.area_weight,
-        )
+        mean, std, mask = compute_normalisation(ds, variables, d.normalisation.fit_period, d.mask_variable)
 
         # A variable missing at ocean cells is silently filled with zero anomaly
         # (z = 0) below: say so. (v1 of the dataset lost tau_x, tau_y and
@@ -146,7 +100,7 @@ def build_fields(cfg):
         # u-to-t regrid; see om2_grid.regrid_u_to_t.)
         ocean = np.asarray(mask.values) == 1
         for v in variables:
-            missing = int((ocean & ~np.isfinite(_rename_xy(ds[v]).isel(time=0).values)).sum())
+            missing = int((ocean & ~np.isfinite(ds[v].isel(time=0).values)).sum())
             if missing:
                 warnings.warn(
                     f"{v} is missing at {missing} of {int(ocean.sum())} ocean cells (first month); "
@@ -154,7 +108,7 @@ def build_fields(cfg):
                 )
 
         def normalised(v):
-            field = _rename_xy(ds[v]).transpose("time", "latitude", "longitude")
+            field = ds[v].transpose("time", "latitude", "longitude")
             z = ((field - mean[v]) / std[v]).fillna(0.0)
             return z.transpose("time", "latitude", "longitude").load()
 
@@ -165,8 +119,8 @@ def build_fields(cfg):
 
         prognostic = stack(d.prognostic, normalised)
         forcing = stack(d.forcing, normalised)
-        like = _rename_xy(ds[d.prognostic[0]]).transpose("time", "latitude", "longitude")
-        stat = lambda s: lambda v: _broadcast_stat(s[v], like).fillna(0.0)
+        like = ds[d.prognostic[0]]
+        stat = lambda s: lambda v: s[v].transpose("time", "latitude", "longitude").fillna(0.0)
         prognostic_mean = stack(d.prognostic, stat(mean))
         prognostic_std = stack(d.prognostic, stat(std))
         forcing_std = stack(d.forcing, stat(std))
@@ -186,7 +140,7 @@ def build_fields(cfg):
         # and the climatological mean of every prognostic variable (e.g. J, kg).
         ocean_area = xr.DataArray(area_np, dims=("latitude", "longitude"))
         def ocean_integral(field):
-            field = _rename_xy(field).transpose("time", "latitude", "longitude").fillna(0.0)
+            field = field.transpose("time", "latitude", "longitude").fillna(0.0)
             return torch.as_tensor((field * ocean_area.values).sum(("latitude", "longitude")).values,
                                    dtype=torch.float64)
         forcing_global = torch.stack([ocean_integral(ds[v]) for v in d.forcing], dim=1)
@@ -279,23 +233,6 @@ def gather_windows(prognostic, forcing, t0, n_prior, n_steps):
     }
 
 
-class InitialMonthDataset(Dataset):
-    """
-    The samples' initial months (time indices), so a batch is just B integers.
-    The windows themselves are cut by gather_windows, on the GPU during
-    training (EmulatorModule keeps the normalised fields there).
-    """
-
-    def __init__(self, initial_indices):
-        self.initial_indices = torch.as_tensor(initial_indices, dtype=torch.long)
-
-    def __len__(self):
-        return len(self.initial_indices)
-
-    def __getitem__(self, i):
-        return self.initial_indices[i]
-
-
 @dataclass
 class ExperimentData:
     """
@@ -383,12 +320,13 @@ def build_data(cfg, rebuild=False, verbose=True):
                          "that end inside it")
     valid_indices = split_indices(month_index, cfg.time.valid, w.n_prior, w.posterior_steps, n_time, "valid")
 
-    # Batches are initial months only; the windows are cut on the GPU (see
+    # A batch is just B initial months (time indices): the DataLoader batches the
+    # tensor of indices directly. The windows are cut on the GPU (see
     # gather_windows), so no worker processes are needed.
     tr = cfg.train
-    train_dl = DataLoader(InitialMonthDataset(train_indices), batch_size=tr.batch_size, shuffle=True,
+    train_dl = DataLoader(torch.as_tensor(train_indices, dtype=torch.long), batch_size=tr.batch_size, shuffle=True,
                           num_workers=tr.num_workers)
-    valid_dl = DataLoader(InitialMonthDataset(valid_indices), batch_size=tr.batch_size, shuffle=False,
+    valid_dl = DataLoader(torch.as_tensor(valid_indices, dtype=torch.long), batch_size=tr.batch_size, shuffle=False,
                           num_workers=tr.num_workers)
     data = ExperimentData(fields, month_index, train_indices, valid_indices, train_dl, valid_dl,
                           w.n_prior, w.posterior_steps)

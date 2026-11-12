@@ -159,24 +159,18 @@ def _load_original_build_normalisation():
     return module.build_normalisation
 
 
-@pytest.mark.parametrize(
-    "strategy",
-    ["Spatial_climatology", "Spatial_climatology_global_variance", "Spatial_in_time", "Global_in_time"],
-)
-def test_normalisation_matches_original(synthetic_file, strategy):
+def test_normalisation_matches_original(synthetic_file):
     build_normalisation = _load_original_build_normalisation()
     variables = [*PROGNOSTIC, *FORCING]  # heat flux at index 1 = the original's land-mask variable
     with pytest.warns(UserWarning):
         mask_old, norm = build_normalisation(
-            str(synthetic_file), strategy, variables,
+            str(synthetic_file), "Spatial_climatology", variables,
             time_window=dict(start="2000-01", end="2005-12", freq="1MS"), train_end="2003-12", mask=True,
         )
     months = pd.date_range("2000-01", "2005-12", freq="MS")
     with xr.open_dataset(synthetic_file) as ds:
-        mean, std, mask = compute_normalisation(
-            ds.sel(time=months, method="nearest"), variables, strategy, ("2000-01", "2003-12"),
-            "total_surface_heat_flx", "area_t",
-        )
+        ds = ds.rename(yt_ocean="latitude", xt_ocean="longitude").sel(time=months, method="nearest")
+        mean, std, mask = compute_normalisation(ds, variables, ("2000-01", "2003-12"), "total_surface_heat_flx")
     np.testing.assert_array_equal(mask.values, mask_old.values)
     for v in variables:
         xr.testing.assert_allclose(mean[v], norm._initialisation["mean"][v])
@@ -192,10 +186,10 @@ def test_windows_match_direct_normalisation(data_and_cfg, synthetic_file):
     months = pd.date_range("2000-01", "2005-12", freq="MS")
     variables = [*PROGNOSTIC, *FORCING]
     with xr.open_dataset(synthetic_file) as raw:
-        ds = raw.sel(time=months, method="nearest")
-        mean, std, _ = compute_normalisation(ds, variables, "Spatial_climatology", ("2000-01", "2003-12"), "total_surface_heat_flx", "area_t")
+        ds = raw.rename(yt_ocean="latitude", xt_ocean="longitude").sel(time=months, method="nearest")
+        mean, std, _ = compute_normalisation(ds, variables, ("2000-01", "2003-12"), "total_surface_heat_flx")
         z = {
-            v: ((ds[v].rename(yt_ocean="latitude", xt_ocean="longitude") - mean[v]) / std[v]).fillna(0.0).values
+            v: ((ds[v] - mean[v]) / std[v]).fillna(0.0).values
             for v in variables
         }
 
@@ -934,7 +928,7 @@ def test_skill_diagnostics_and_spectra(synthetic_file, tmp_path):
 
     # Parseval: PSD integrated over the bands = area-weighted mean zonal variance (zonal mean removed).
     anomaly = skill[f"{name}_truth_anom"].fillna(0.0)
-    k, psd = zonal_spectrum(anomaly)
+    k, psd = zonal_spectrum(anomaly.values, anomaly["latitude"].values)
     half = 0.5 / 8
     band_rows = (anomaly.latitude >= -65) & (anomaly.latitude <= 60)
     a = anomaly.where(band_rows, drop=True)
@@ -1236,7 +1230,7 @@ def test_rmse_by_epoch_draws_baselines():
 
 
 def test_local_mse_is_area_weighted():
-    """Each cell's squared error counts in proportion to its area; without area every ocean cell counts equally."""
+    """Each cell's squared error counts in proportion to its area."""
     from functools import partial
 
     from Emulator import field_loss
@@ -1251,8 +1245,6 @@ def test_local_mse_is_area_weighted():
     expected = (((pred - target) ** 2) * weights).sum() / weights.sum()
     torch.testing.assert_close(loss_fn(pred_t=pred, target_t=target, mask=mask, area=area, rollout_step=0), expected)
 
-    unweighted = (((pred - target) ** 2) * mask).sum() / (mask.sum() * 6)
-    torch.testing.assert_close(loss_fn(pred_t=pred, target_t=target, mask=mask, rollout_step=0), unweighted)
 
 
 def test_field_loss_rejects_unknown_method():
@@ -1260,7 +1252,7 @@ def test_field_loss_rejects_unknown_method():
 
     x = torch.zeros(1, 1, H, W)
     with pytest.raises(ValueError, match="Unknown field_loss method"):
-        field_loss(pred_t=x, target_t=x, mask=torch.ones(H, W), method="mae")
+        field_loss(pred_t=x, target_t=x, mask=torch.ones(H, W), area=torch.ones(H, W), method="mae")
 
 
 # =============================================================================
@@ -1322,13 +1314,13 @@ def test_crps_loss_values():
     target = torch.zeros(2, 1, 2, 2)  # one sample, two members
     spread_members = torch.cat([torch.full((1, 1, 2, 2), 1.0), torch.full((1, 1, 2, 2), 3.0)])
     # mean |x - y| = 2, minus sum |xi - xj| / (2 M (M - 1)) = 4 / 4 = 1
-    torch.testing.assert_close(loss(pred_t=spread_members, target_t=target, mask=mask, n_members=2, rollout_step=0),
+    torch.testing.assert_close(loss(pred_t=spread_members, target_t=target, mask=mask, area=mask, n_members=2, rollout_step=0),
                                torch.tensor(1.0))
     same = torch.full((2, 1, 2, 2), 2.0)  # identical members: CRPS = MAE
-    torch.testing.assert_close(loss(pred_t=same, target_t=target, mask=mask, n_members=2, rollout_step=0),
+    torch.testing.assert_close(loss(pred_t=same, target_t=target, mask=mask, area=mask, n_members=2, rollout_step=0),
                                torch.tensor(2.0))
     with pytest.raises(ValueError, match="n_members"):
-        loss(pred_t=same, target_t=target, mask=mask, n_members=1, rollout_step=0)
+        loss(pred_t=same, target_t=target, mask=mask, area=mask, n_members=1, rollout_step=0)
 
 
 def test_paradigm_config_validation(synthetic_file, tmp_path):
@@ -1436,7 +1428,7 @@ def test_intercomparison_scores_and_figures(data_and_cfg):
 
 def test_interrupted_training_resumes_from_the_last_epoch(synthetic_file, tmp_path):
     """A stage cut short after epoch 0 carries on at epoch 1, keeping the training log and times of both."""
-    from Experiment import last_checkpoint, prepare_resume, read_metrics, training_minutes
+    from Experiment import prepare_resume, read_metrics, training_minutes
 
     run_dir = tmp_path / "run"
     cfg = make_cfg(synthetic_file, tmp_path,
@@ -1445,12 +1437,13 @@ def test_interrupted_training_resumes_from_the_last_epoch(synthetic_file, tmp_pa
     assert prepare_resume(run_dir) is None  # nothing to resume yet
     build_trainer(cfg).fit(build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data),
                            data.train_dl, data.valid_dl)
-    assert last_checkpoint(run_dir) is not None
+    last = run_dir / "checkpoints" / "last.ckpt"
+    assert last.exists()
 
     # The "rest of the run": the same stage, two epochs, resumed in a new process.
     longer = cfg.with_changes(train={"max_epochs": 2})
     checkpoint = prepare_resume(run_dir)
-    assert checkpoint == last_checkpoint(run_dir) and (run_dir / "metrics_part0.csv").exists()
+    assert checkpoint == last and (run_dir / "metrics_part0.csv").exists()
     model = build_model(longer, data)
     trainer = build_trainer(longer)
     trainer.fit(build_module(longer, model, build_losses(longer, data), data), data.train_dl, data.valid_dl,

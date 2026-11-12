@@ -303,47 +303,38 @@ class RolloutSchedule(Callback):
 # Resuming an interrupted stage
 # =============================================================================
 
-def last_checkpoint(run_dir):
-    """
-    The newest last*.ckpt in run_dir/checkpoints, or None. ModelCheckpoint
-    (see build_trainer) overwrites it after every epoch, with the weights,
-    optimizer and learning-rate schedule and the epoch number, so
-    trainer.fit(..., ckpt_path=last_checkpoint(run_dir)) carries on from the
-    last completed epoch (the rollout schedule follows the epoch number).
-    """
-    if run_dir is None:
-        return None
-    candidates = sorted(Path(run_dir, "checkpoints").glob("last*.ckpt"), key=lambda p: p.stat().st_mtime)
-    return candidates[-1] if candidates else None
-
-
 def prepare_resume(run_dir):
     """
-    The checkpoint to resume run_dir's training from (last_checkpoint), or
-    None. When resuming, the existing metrics.csv is renamed to
-    metrics_part<N>.csv first, because the CSV logger replaces metrics.csv
-    when training starts; read_metrics joins the parts.
+    The checkpoint to resume run_dir's training from, or None if there is none
+    yet. ModelCheckpoint (see build_trainer) overwrites checkpoints/last.ckpt
+    after every epoch, with the weights, optimizer, learning-rate schedule and
+    epoch number, so trainer.fit(..., ckpt_path=prepare_resume(run_dir))
+    carries on from the last completed epoch (the rollout schedule follows the
+    epoch number). When resuming, metrics.csv is renamed to metrics_part<N>.csv
+    first, because the CSV logger replaces metrics.csv when training starts;
+    read_metrics joins the parts.
     """
-    checkpoint = last_checkpoint(run_dir)
-    log = Path(run_dir, "metrics.csv") if run_dir is not None else None
-    if checkpoint is not None and log.exists():
-        part = len(list(Path(run_dir).glob("metrics_part*.csv")))
-        log.rename(log.with_name(f"metrics_part{part}.csv"))
+    checkpoint = Path(run_dir, "checkpoints", "last.ckpt")
+    if not checkpoint.exists():
+        return None
+    # A run stopped before its first log write has a checkpoint but no metrics.csv yet.
+    log = Path(run_dir, "metrics.csv")
+    if log.exists():
+        n_parts = len(list(Path(run_dir).glob("metrics_part*.csv")))
+        log.rename(log.with_name(f"metrics_part{n_parts}.csv"))
     return checkpoint
 
 
 def read_metrics(run_dir):
     """
-    The CSV training log of run_dir as one row per epoch: metrics_part*.csv
-    (from earlier, interrupted runs; see prepare_resume) then metrics.csv,
-    keeping the latest value of every column for each epoch.
+    The CSV training log of run_dir as one row per epoch: metrics_part0.csv, metrics_part1.csv, ...
+    (from earlier, interrupted runs; see prepare_resume) then metrics.csv, keeping the latest value of
+    every column for each epoch.
     """
     run_dir = Path(run_dir)
-    parts = sorted(run_dir.glob("metrics_part*.csv"), key=lambda p: int(p.stem[len("metrics_part"):]))
-    files = [*parts, run_dir / "metrics.csv"]
-    frames = [pd.read_csv(f) for f in files if f.exists()]
-    if not frames:
-        raise FileNotFoundError(f"No metrics.csv in {run_dir}")
+    # The parts in number order (as text, part10 would sort before part2), then the current log.
+    parts = sorted(run_dir.glob("metrics_part*.csv"), key=lambda path: int(path.stem[len("metrics_part"):]))
+    frames = [pd.read_csv(path) for path in [*parts, run_dir / "metrics.csv"] if path.exists()]
     return pd.concat(frames, ignore_index=True).groupby("epoch", as_index=False).last()
 
 
@@ -400,8 +391,10 @@ def build_trainer(cfg):
         run_dir.mkdir(parents=True, exist_ok=True)
         cfg.save(run_dir / "config.json")
         logger = CSVLogger(save_dir=str(run_dir), name="", version="")
-        # save_last: checkpoints/last.ckpt is overwritten after every epoch (see last_checkpoint).
-        callbacks.append(ModelCheckpoint(dirpath=run_dir / "checkpoints", monitor="val_loss", save_last=True))
+        # save_last: checkpoints/last.ckpt is overwritten after every epoch (see prepare_resume);
+        # enable_version_counter=False: always that name, never last-v1.ckpt when a run restarts.
+        callbacks.append(ModelCheckpoint(dirpath=run_dir / "checkpoints", monitor="val_loss", save_last=True,
+                                         enable_version_counter=False))
         callbacks.append(EpochTimer(run_dir))
         checkpointing = True
 

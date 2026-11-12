@@ -21,7 +21,7 @@ from Emulator.om2_loss_functions import SPECTRAL_BANDS_PER_DECADE
 
 from .config import rollout_spec
 from .constraints import build_constraint
-from .data import _open_time_axis, _rename_xy
+from .data import _open_time_axis
 from .losses import closure_loss, closure_std_fields
 
 
@@ -98,41 +98,36 @@ def check_known_closure(cfg, data, dataloader=None, max_batches=None, warn_thres
 # =============================================================================
 
 @torch.no_grad()
-def autoregressive_rollout(model, prior, forcing_sequence, mask, target_indices=None, initial_index=None,
-                           constraint=None, members=1):
+def autoregressive_rollout(model, prior, forcing_sequence, mask, target_indices, initial_index, constraint, members=1):
     """
-    Free-running rollout from one initial state, for ``members`` members at
-    once (each a separate sample for a stochastic model; 1 for a deterministic
-    one).
+    Free-running rollout from one initial state, for ``members`` members at once (each a separate
+    sample for a stochastic model; 1 for a deterministic one).
 
-    prior            (n_prior, P, H, W) true initial states, oldest first
-    forcing_sequence (N, C, H, W)       forcing for each predicted month
-    target_indices   (N,)               time index of each predicted month, and
-    initial_index    int                that of the last prior state: needed by
-    constraint                          (e.g. GlobalBudgetConstraint), applied after every step
+    prior            (n_prior, P, H, W) the true initial states, oldest first
+    forcing_sequence (N, C, H, W)       forcing of each predicted month
+    mask             (H, W)             ocean mask
+    target_indices   (N,)               time index of each predicted month
+    initial_index    int                time index of the last prior state
+    constraint       the GlobalBudgetConstraint applied after every step, or None for none
     returns          (members, N, P, H, W) predictions (z-scores), on the CPU
     """
     device = next(model.parameters()).device
     was_training = model.training
     model.eval()
     n_prognostic = prior.shape[1]
-    state = prior.flatten(0, 1)[None].to(device).repeat(members, 1, 1, 1)  # (M, n_prior * P, H, W)
-    mask = mask.to(device)
-    if constraint is not None:
-        if target_indices is None or initial_index is None:
-            raise ValueError("A constraint needs target_indices and initial_index")
-        constraint = constraint.to(device)
-        previous = torch.full((members,), int(initial_index), dtype=torch.long, device=device)
+    # Every member starts from the same true states, stacked as channels: (members, n_prior * P, H, W).
+    state = prior.flatten(0, 1)[None].to(device).repeat(members, 1, 1, 1)
+    previous = torch.full((members,), int(initial_index), device=device)   # time index of the current state
     predictions = []
-    for k in range(forcing_sequence.shape[0]):
+    for k in range(len(forcing_sequence)):
         forcing = forcing_sequence[k : k + 1].to(device).expand(members, -1, -1, -1)
-        pred = model(state, forcing, mask)  # (M, P, H, W)
+        pred = model(state, forcing, mask.to(device))                        # (members, P, H, W)
+        target = torch.full_like(previous, int(target_indices[k]))
         if constraint is not None:
-            target = torch.full_like(previous, int(target_indices[k]))
-            pred = constraint(pred, state[:, -n_prognostic:], previous, target)
-            previous = target
+            pred = constraint.to(device)(pred, state[:, -n_prognostic:], previous, target)
         predictions.append(pred.float().cpu())
-        state = torch.cat([state[:, n_prognostic:], pred.to(state.dtype)], dim=1)
+        state = torch.cat([state[:, n_prognostic:], pred.to(state.dtype)], dim=1)   # drop the oldest month
+        previous = target
     model.train(was_training)
     return torch.stack(predictions, dim=1)
 
@@ -443,19 +438,19 @@ def skill_summary(skill, variables, acc_threshold=0.5):
     return pd.DataFrame(rows).set_index("variable")
 
 
-def zonal_spectrum(anomaly):
+def zonal_spectrum(anomaly, latitude):
     """
-    Time-mean zonal power spectral density of an anomaly (time, latitude,
-    longitude) against physical zonal wavenumber, on the same bands as
-    spectral_loss (Emulator.zonal_wavenumber_bands): returns (k in cycles/km,
-    PSD in units^2 km). PSD is the area-weighted mean zonal variance per unit k,
-    so it reads the same at 1 deg and 1/10 deg. Land is zero anomaly.
+    Time-mean zonal power spectral density of an anomaly (time, latitude, longitude) array, land NaN
+    or 0, against physical zonal wavenumber, on the same bands as the spectral loss
+    (zonal_wavenumber_bands). Returns (k in cycles/km, PSD in units^2 km). PSD is the area-weighted
+    mean zonal variance per unit k, so it reads the same at 1 deg and 1/10 deg.
     """
-    latitude = anomaly["latitude"].values
-    rows, band, power_weight, k = zonal_wavenumber_bands(latitude, anomaly.sizes["longitude"])
-    x = anomaly.fillna(0.0).values[:, rows, :]
+    rows, band, power_weight, k = zonal_wavenumber_bands(latitude, anomaly.shape[-1])
+    x = np.nan_to_num(np.asarray(anomaly, dtype=float))[:, rows, :]
+    # Power of every (row, harmonic), time-mean, without the zonal mean; then summed into the bands.
     power = (np.abs(np.fft.rfft(x, axis=-1)) ** 2).mean(0)[:, 1:] * power_weight
-    energy = np.bincount(band, power.ravel(), minlength=k.size) / np.cos(np.deg2rad(latitude[rows])).sum()
+    energy = np.bincount(band, power.ravel(), minlength=k.size) / np.cos(np.deg2rad(np.asarray(latitude)[rows])).sum()
+    # Energy per band / band width in k = density.
     half = 0.5 / SPECTRAL_BANDS_PER_DECADE
     return k, energy / (k * (10.0**half - 10.0**-half))
 
@@ -518,7 +513,7 @@ def meridional_transports(cfg, data, skill):
     result = {}
     with _open_time_axis(cfg) as ds:
         for budget, closure in budgets.items():
-            flux = _rename_xy(ds[closure.flux_variable]).isel(time=positions)
+            flux = ds[closure.flux_variable].isel(time=positions)
             flux = flux.transpose("time", "latitude", "longitude").assign_coords(
                 time=skill.time.values, latitude=skill.latitude.values, longitude=skill.longitude.values).load()
             out = {}

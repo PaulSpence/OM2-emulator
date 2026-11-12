@@ -25,7 +25,7 @@ def squeeze_field_axes(field):
     return field
 
 
-def field_loss(*, pred_t, target_t, mask, area=None, method="mse", n_members=1, **_):
+def field_loss(*, pred_t, target_t, mask, area, method="mse", n_members=1, **_):
     """
     Ocean-masked, AREA-WEIGHTED mean of a per-cell error for one rollout step,
     in z-score units. ``method`` chooses the per-cell error:
@@ -52,7 +52,7 @@ def field_loss(*, pred_t, target_t, mask, area=None, method="mse", n_members=1, 
     the ACCESS-OM2 1-degree grid cell areas vary 17x (latitudinal refinement
     near the equator, small cells near the poles): an unweighted per-cell mean
     gave the regions poleward of 60 degrees ~27% of the loss for ~10% of the
-    ocean area. Without ``area`` every ocean cell counts equally.
+    ocean area.
 
     Each training setup chooses ``method`` once when it builds its list of
     losses (the loss cell of the UNet notebooks, LOSS_TERMS in
@@ -75,9 +75,7 @@ def field_loss(*, pred_t, target_t, mask, area=None, method="mse", n_members=1, 
         raise ValueError(f"Unknown field_loss method {method!r}: use 'mse' or 'crps'")
 
     # Area-weighted mean over the ocean. Ocean mask (H, W), 1 = ocean, broadcast to error's (B, P, H, W).
-    cell_weight = mask.to(device=error.device, dtype=error.dtype).expand_as(error)
-    if area is not None:
-        cell_weight = cell_weight * area.to(device=error.device, dtype=error.dtype)
+    cell_weight = (mask * area).to(device=error.device, dtype=error.dtype).expand_as(error)
     return (error * cell_weight).sum() / cell_weight.sum().clamp_min(1e-12)
 
 EARTH_RADIUS_KM = 6371.0
@@ -88,15 +86,14 @@ SPECTRUM_LATITUDES = (-65.0, 60.0)
 SPECTRAL_BANDS_PER_DECADE = 8
 
 
-def zonal_wavenumber_bands(latitude, n_lon, latitudes=SPECTRUM_LATITUDES,
-                           bands_per_decade=SPECTRAL_BANDS_PER_DECADE):
+def zonal_wavenumber_bands(latitude, n_lon):
     """
     Sort every (latitude row, zonal harmonic) into bands of PHYSICAL zonal
     wavenumber k (cycles/km), so a band is the same length scale at every
     latitude and at every resolution (1 deg or 1/10 deg).
 
     Returns (rows, band, power_weight, k_band):
-      rows          indices of the latitude rows used (those within ``latitudes``);
+      rows          indices of the latitude rows used (those within SPECTRUM_LATITUDES);
       band          (rows * harmonics,) band number of each (row, harmonic),
                     flattened row by row;
       power_weight  (rows, harmonics): multiplies |rfft|^2 so that it sums to
@@ -106,9 +103,7 @@ def zonal_wavenumber_bands(latitude, n_lon, latitudes=SPECTRUM_LATITUDES,
     latitude = np.asarray(latitude, dtype=float)
 
     # Latitude rows used (north of ~65N the tripole grid's rows are not circles of latitude).
-    rows = np.flatnonzero((latitude >= latitudes[0]) & (latitude <= latitudes[1]))
-    if rows.size == 0:
-        raise ValueError(f"No latitude rows within {latitudes} for the zonal spectrum")
+    rows = np.flatnonzero((latitude >= SPECTRUM_LATITUDES[0]) & (latitude <= SPECTRUM_LATITUDES[1]))
     cos_lat = np.cos(np.deg2rad(latitude[rows]))
 
     # Physical wavenumber of every (row, harmonic). A row is a circle of length 2 pi R cos(lat),
@@ -118,12 +113,12 @@ def zonal_wavenumber_bands(latitude, n_lon, latitudes=SPECTRUM_LATITUDES,
     harmonics = np.fft.rfftfreq(n_lon, d=1.0 / n_lon)[1:]              # (harmonics,)
     k = harmonics[None, :] / row_length_km[:, None]                    # (rows, harmonics)
 
-    # Bands: equal steps in log10(k), bands_per_decade of them per factor of 10, counted from the
-    # smallest k. Then renumber them 0, 1, 2, ..., skipping any band no (row, harmonic) falls in.
+    # Bands: equal steps in log10(k), SPECTRAL_BANDS_PER_DECADE of them per factor of 10, counted from
+    # the smallest k. Then renumber them 0, 1, 2, ..., skipping any band no (row, harmonic) falls in.
     log_k = np.log10(k)
-    band = np.floor((log_k - log_k.min()) * bands_per_decade).astype(int)
+    band = np.floor((log_k - log_k.min()) * SPECTRAL_BANDS_PER_DECADE).astype(int)
     used, band = np.unique(band.ravel(), return_inverse=True)
-    k_band = 10.0 ** (log_k.min() + (used + 0.5) / bands_per_decade)  # band centres
+    k_band = 10.0 ** (log_k.min() + (used + 0.5) / SPECTRAL_BANDS_PER_DECADE)  # band centres
 
     # Parseval: sum_n |rfft_n|^2 / n_lon^2 is the row's variance, once every harmonic below
     # Nyquist is counted twice (rfft returns n but not its mirror image -n, which has the same

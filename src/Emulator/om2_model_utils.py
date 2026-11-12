@@ -14,190 +14,62 @@ import lightning as L
 
 class PartialConv2d(nn.Module):
     """
-    Mask-aware (partial) 2D convolution layer.
+    A convolution that sees only ocean cells: a partial convolution (Liu et al. 2018,
+    "Image Inpainting for Irregular Holes Using Partial Convolutions").
 
-    This layer implements a simplified version of the partial convolution
-    described in:
+    forward(x, mask) -> (out, new_mask)
+        x        : (B, C_in, H, W)
+        mask     : (B, 1, H, W), or (1, 1, H, W) shared by the whole batch; 1 = ocean, 0 = land
+        out      : (B, C_out, H_out, W_out)
+        new_mask : 1 wherever the convolution window held at least one ocean cell
 
-        Liu et al. (2018)
-        "Image Inpainting for Irregular Holes Using Partial Convolutions"
-
-    The key idea is that convolution is performed using only valid pixels
-    defined by a binary mask.
-
-    In this implementation:
-        mask = 1  -> valid pixel (ocean)
-        mask = 0  -> invalid pixel (land)
-
-    The layer performs three operations:
-
-    1. Mask the input
-       x_masked = x * mask
-
-    2. Apply a standard convolution
-       out = Conv2D(x_masked)
-
-    3. Renormalize by the number of valid pixels contributing to each
-       convolution window.
-
-       If N pixels were valid in a KxK window, the output is multiplied by:
-
-            kernel_area / N
-
-       This prevents the convolution amplitude from shrinking near masked
-       regions (coastlines).
-
-    4. Update the mask
-
-       The new mask is defined as:
-
-            new_mask = 1 if any valid pixel existed in the window
-                     = 0 otherwise
-
-       This allows the mask to propagate through the network.
-
-    Parameters
-    ----------
-    in_ch : int
-        Number of input channels.
-
-    out_ch : int
-        Number of output channels.
-
-    kernel_size : int
-        Size of convolution kernel.
-
-    stride : int
-        Convolution stride. When stride > 1 the output spatial dimensions
-        shrink, which allows use in encoder networks.
-
-    padding : int
-        Padding size.
-
-        The data and the mask are padded to follow the ACCESS-OM2 tripolar
-        grid topology:
-          * x (longitude) is padded circularly. With non-periodic padding the
-            seam acts as a coastline neither side can see across; in the
-            autoregressive OHC emulator 98% of the fastest-growing perturbation
-            sat at that seam.
-          * the north edge is the tripole fold: row-top cell i neighbours
-            row-top cell nx - 1 - i, so the ghost rows above the top row are
-            the top rows reversed in x (and in y).
-          * the south edge (Antarctica) is padded with zeros: the zero-padded
-            mask marks those cells as land, so the kernel_area / mask_sum
-            renormalisation treats the edge like a coastline.
-
-    Notes
-    -----
-    * The mask convolution is fixed (all weights = 1) and has no gradients.
-    * The renormalisation depends only on the mask. When every sample shares
-      the land mask, pass it as (1, 1, H, W): the mask convolution then runs
-      once and is broadcast over the batch.
-    * The masking and the renormalisation are folded into one multiplication
-      by a precomputed factor (0 where no valid pixel exists), so each layer
-      keeps one fewer full-size activation for the backward pass.
+    Three steps:
+    1. Pad x and the mask with ``padding`` cells on every side, following the ACCESS-OM2 tripolar grid:
+         * east/west: longitude is periodic, so the columns wrap around. (With non-periodic padding the
+           seam acted as a coastline neither side could see across; in the autoregressive OHC emulator
+           98% of the fastest-growing perturbation sat at that seam.)
+         * north: the tripole fold. Top-row cell i neighbours top-row cell nx - 1 - i, so the ghost rows
+           above the top row are the top rows reversed in x and in y.
+         * south (Antarctica): rows of zeros, marked as land, so the edge acts as a coastline.
+    2. Convolve x * mask, i.e. with land set to 0.
+    3. Multiply by (cells in the window) / (ocean cells in the window), so values next to a coast are
+       not damped by the land around them. 0 where the window holds no ocean cell.
     """
 
     def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1):
         super().__init__()
-
-        # Padding is applied in forward: circular in x (longitude is periodic
-        # on a global grid), the tripole fold at the north edge, zeros at the
-        # south edge. The convolutions do not pad.
         self.padding = padding
-
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, stride=stride)
-
-        # convolution used only to count valid pixels
+        # Counts the ocean cells in every window: all-ones weights, never trained.
         self.mask_conv = nn.Conv2d(1, 1, kernel_size=kernel_size, stride=stride, bias=False)
-
         self.mask_conv.weight.data[:] = 1.0
         self.mask_conv.requires_grad_(False)
-
         self.kernel_area = kernel_size * kernel_size
-        self.eps = 1e-6
 
     def forward(self, x, mask):
-        """
-        PartialConv2d.forward: ONE partial convolution. Runs whenever a
-        PartialConv2d object is called, e.g. self.enc3a(x2, mask2) inside
-        UNet.forward. It calls only PyTorch's nn.Conv2d (self.conv,
-        self.mask_conv), never back into the UNet.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor of shape:
-
-                (batch, channels, height, width)
-
-        mask : torch.Tensor
-            Binary mask tensor:
-
-                (batch, 1, height, width), or (1, 1, height, width) to
-                share one mask across the batch
-
-            1 = valid pixel
-            0 = invalid pixel
-
-        Returns
-        -------
-        out : torch.Tensor
-            Convolution output
-
-                (batch, out_channels, new_height, new_width)
-
-        new_mask : torch.Tensor
-            Updated mask
-
-                (batch, 1, new_height, new_width)
-        """
-
-        # Pad the data and the mask for the ACCESS-OM2 tripolar grid, p ghost cells per side:
         p = self.padding
-        if p:
-            # North edge, the tripole fold: the ghost rows above the top row are the
-            # top p rows, flipped in y (order) and in x (row-top cell i neighbours
-            # row-top cell nx - 1 - i). Rows run south (first) to north (last).
-            x_fold = torch.flip(x[..., -p:, :], dims=(-2, -1))
-            mask_fold = torch.flip(mask[..., -p:, :], dims=(-2, -1))
-            # South edge (Antarctica): p rows of zeros below the bottom row. In the
-            # mask, 0 = land, so the edge counts as a coastline.
-            # Then stack: [zero rows, field, fold rows] along y.
-            x = torch.cat([F.pad(x, (0, 0, p, 0)), x_fold], dim=-2)
-            mask = torch.cat([F.pad(mask, (0, 0, p, 0)), mask_fold], dim=-2)
-            # East/west: longitude is periodic, so wrap p columns around.
-            x = F.pad(x, (p, p, 0, 0), mode="circular")
-            mask = F.pad(mask, (p, p, 0, 0), mode="circular")
+        # 1. Padding. North: the top p rows flipped in y and x (rows run south to north).
+        x_fold = torch.flip(x[..., -p:, :], dims=(-2, -1))
+        mask_fold = torch.flip(mask[..., -p:, :], dims=(-2, -1))
+        # Stack [p zero rows (south), field, fold rows (north)] along y, then wrap p columns around in x.
+        x = F.pad(torch.cat([F.pad(x, (0, 0, p, 0)), x_fold], dim=-2), (p, p, 0, 0), mode="circular")
+        mask = F.pad(torch.cat([F.pad(mask, (0, 0, p, 0)), mask_fold], dim=-2), (p, p, 0, 0), mode="circular")
 
-        # Mask-only quantities. No gradients flow through them: the mask is data and
-        # mask_conv's all-ones weights are frozen, so nothing here is trained.
-        # count valid pixels in each convolution window
-        mask_sum = self.mask_conv(mask)
-        valid = mask_sum > 0
-        # renormalisation factor, 0 where the window has no valid pixel
-        scale = torch.where(valid, self.kernel_area / (mask_sum + self.eps), torch.zeros_like(mask_sum))
-        # updated mask
-        new_mask = valid.to(mask.dtype)
-
-        # mask the input, convolve, renormalise
-        out = self.conv(x * mask) * scale
-
-        return out, new_mask
+        # 2 and 3. Convolve the ocean cells only, and scale up by (cells / ocean cells) in each window.
+        ocean_cells = self.mask_conv(mask)
+        scale = torch.where(ocean_cells > 0, self.kernel_area / (ocean_cells + 1e-6), torch.zeros_like(ocean_cells))
+        new_mask = (ocean_cells > 0).to(mask.dtype)
+        return self.conv(x * mask) * scale, new_mask
 
 def upsample_periodic_x(x, size):
     """
-    Bilinear upsampling (align_corners=False) to ``size`` = (height, width),
-    treating x (longitude, the last dimension) as periodic so the east and west
-    edges interpolate across the seam. Falls back to plain interpolation if the
-    target width is not a whole multiple of the input width.
+    Bilinear upsampling of x (B, C, h, w) to size = (H, W), with longitude (the last dimension)
+    periodic: wrap one column around on each side, interpolate, then cut the extra columns off again,
+    so the east and west edges interpolate across the seam. W must be a whole multiple of w.
     """
-    height, width = size
-    scale = width // x.shape[-1]
-    if scale * x.shape[-1] != width:
-        return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+    scale = size[1] // x.shape[-1]          # e.g. 2: every input column becomes 2 output columns
     x = F.pad(x, (1, 1, 0, 0), mode="circular")
-    x = F.interpolate(x, size=(height, width + 2 * scale), mode="bilinear", align_corners=False)
+    x = F.interpolate(x, size=(size[0], size[1] + 2 * scale), mode="bilinear", align_corners=False)
     return x[..., scale:-scale]
 
 
@@ -345,31 +217,30 @@ class AutoEncoder(nn.Module):
 
 class UNet(nn.Module):
     """
-    Mask-aware U-Net: two stride-2 encoder levels, a bottleneck, and a decoder
-    with skip connections at every resolution.
+    Mask-aware U-Net: two stride-2 encoder levels, a bottleneck, and a decoder with skip connections at
+    every resolution. Every convolution is a PartialConv2d, so land never enters the computation.
 
-    Channel widths scale with the number of input channels, so adding
-    predictors or predicted variables widens the network instead of squeezing
-    them through a fixed bottleneck:
+    forward(x, mask) -> (B, output_channel_count, H, W)
+        x    : (B, input_channel_count, H, W) inputs (prior states, forcing, [noise])
+        mask : (1, 1, H, W) or (B, 1, H, W) ocean mask, 1 = ocean
 
-        level 1 (1/2 resolution)   : width_multiplier * input_channel_count
+    Channel widths scale with the number of inputs, so adding predictors widens the network instead of
+    squeezing them through a fixed bottleneck:
+        level 1 (1/2 resolution)   : width_multiplier * width_channel_count   (32 for 8 inputs and 4)
         level 2 (1/4 resolution)   : 2 x level 1
         bottleneck (1/4 resolution): 4 x level 1
+    width_channel_count defaults to input_channel_count. Setting it lets extra inputs (the noise
+    channels of the CRPS ensemble) leave every layer but the first unchanged, so a trained network's
+    weights still fit. width_multiplier must be >= 2 for the first layer to carry every signed input
+    through its ReLU (each needs a +/- pair of channels).
 
-    width_multiplier must be >= 2 for the first layer to be able to carry every
-    signed input field through its ReLU (each needs a +/- pair of channels).
-
-    The bottleneck (enc3a-c) and the first decoder layer (dec1a-c) are each
-    three 3x3 partial convolutions with a ReLU after each. Together they see a
-    7x7 window (each 3x3 adds one cell on every side: 3 -> 5 -> 7), like the
-    original single 7x7 layers, with 27 instead of 49 weights per channel pair,
-    faster cuDNN kernels on the V100, and two extra non-linearities.
-
-    The output layer works at full resolution on the upsampled decoder
-    features only. Feeding it the raw input as well was tried and removed: in
-    autoregressive use it learned a sharpening stencil that grew grid-scale
-    noise by ~17% per step. A residual wrapper (next = state + output) carries
-    the state's grid-scale content forward unchanged instead.
+    Design notes:
+      * The bottleneck (enc3a-c) and the first decoder layer (dec1a-c) are each three 3x3 convolutions
+        with a ReLU after each: together a 7x7 window (3 -> 5 -> 7), with 27 instead of 49 weights per
+        channel pair and two extra non-linearities.
+      * The output layer sees only the upsampled decoder features, not the raw input: fed the raw input
+        as well, it learned a sharpening stencil that grew grid-scale noise by ~17% per step. The
+        residual wrapper (next = state + output) carries the state's grid-scale content forward instead.
     """
 
     def __init__(self,
@@ -377,16 +248,9 @@ class UNet(nn.Module):
                  output_channel_count=2,
                  width_multiplier=4,
                  width_channel_count=None):
-        # width_channel_count: the input count the widths are scaled from
-        # (default input_channel_count). Extra inputs such as noise channels
-        # then leave every layer but the first unchanged, so a trained
-        # network's weights still fit.
+        super().__init__()
 
-        super(UNet, self).__init__()
-
-        # Channel widths, scaled from the number of input channels.
-        if width_multiplier < 1:
-            raise ValueError(f"width_multiplier must be >= 1, got {width_multiplier}")
+        # Channel widths, scaled from the number of (physical) input channels.
         width1 = int(round(width_multiplier * (width_channel_count or input_channel_count)))  # 1/2 resolution
         width2 = 2 * width1                                                                     # 1/4 resolution
         latent_width = 4 * width1                                                               # bottleneck
@@ -414,18 +278,8 @@ class UNet(nn.Module):
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x, mask):
-        """
-        UNet.forward: the WHOLE network on one batch. Runs whenever a UNet object
-        is called, e.g. self.tendency_network(x, mask) inside ForwardEmulator.forward.
-
-        x    : (B, C_in, H, W) inputs (prior states, forcing, [noise])
-        mask : (B, 1, H, W) or (1, 1, H, W) ocean mask, 1 = ocean
-        returns (B, C_out, H, W): the predicted change in the state.
-
-        Every self.encN / self.decN(...) call below runs PartialConv2d.forward
-        (one partial convolution) with that layer's own weights, and returns
-        (features, mask). Example widths are for 8 inputs and width_multiplier 4.
-        """
+        # The whole network on one batch. Every self.encN / self.decN(...) call runs one PartialConv2d
+        # with that layer's own weights and returns (features, mask). Example widths: 8 inputs, width_multiplier 4.
         # ================================ Encoder ================================
         # PartialConv2d.forward, 4x4 stride 2: full -> 1/2 resolution, C_in -> 32 channels.
         x1, mask1 = self.enc1(x, mask)

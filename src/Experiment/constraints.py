@@ -74,8 +74,6 @@ class GlobalBudgetConstraint(nn.Module):
         return change - flux, (std_target * area).sum(dim=(-2, -1))
 
     def forward(self, pred, previous, previous_index, target_index):
-        previous_index = previous_index.to(pred.device)
-        target_index = target_index.to(pred.device)
         out = pred.clone()
         for budget in self.budgets:
             residual, weight = self.residual(out, previous, previous_index, target_index, budget)

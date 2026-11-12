@@ -212,10 +212,12 @@ def plot_intercomparison_spectra(skills, variables):
         reference = next(iter(skills.values()))
         units = reference[f"{variable}_truth_anom"].attrs.get("units", "")
         for ax, (label, period) in zip(row, periods.items()):
-            k, psd = zonal_spectrum(reference[f"{variable}_truth_anom"].isel(time=period))
+            truth = reference[f"{variable}_truth_anom"].isel(time=period)
+            k, psd = zonal_spectrum(truth.values, truth["latitude"].values)
             ax.loglog(k, psd, label="ACCESS-OM2", **TRUTH_STYLE)
             for name, skill in skills.items():
-                k, psd = zonal_spectrum(skill[f"{variable}_pred_anom"].isel(time=period))
+                pred = skill[f"{variable}_pred_anom"].isel(time=period)
+                k, psd = zonal_spectrum(pred.values, pred["latitude"].values)
                 ax.loglog(k, psd, color=_colour(skills, name), lw=1.6, ls="--", label=name)
             ax.set_title(f"{variable}: {label}", fontsize=10)
             ax.set_xlabel("zonal wavenumber (cycles/km)")

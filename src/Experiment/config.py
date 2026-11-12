@@ -24,12 +24,6 @@ import pandas as pd
 
 # Names accepted by the registries in models.py and losses.py. Kept here so the
 # config can be validated before anything expensive runs.
-KNOWN_NORMALISATION_STRATEGIES = (
-    "Spatial_climatology",
-    "Spatial_climatology_global_variance",
-    "Spatial_in_time",
-    "Global_in_time",
-)
 KNOWN_ARCHITECTURES = ("unet", "samudra")
 # Fitting terms. Every budget in LossConfig.closures adds a "<budget>_closure" term.
 KNOWN_LOSS_TERMS = ("local_mse", "spectral", "crps")
@@ -70,17 +64,11 @@ def _check_range(name, date_range):
 
 @dataclass
 class NormalisationConfig:
-    # How each variable is standardised: z = (x - mean) / std.
-    #   Spatial_climatology                 -- per-grid-cell, per-calendar-month mean and std
-    #   Spatial_climatology_global_variance -- per-cell monthly mean, one area-weighted std
-    #   Spatial_in_time                     -- per-grid-cell mean and std over the fit period
-    #   Global_in_time                      -- one area-weighted mean and std per variable
-    strategy: str = "Spatial_climatology"
+    # Every variable is standardised as z = (x - mean) / std with its monthly
+    # climatology: the mean and std of each grid cell for each calendar month.
     # Months used to fit the statistics (inclusive). Keep this inside the
     # training period so no validation/test information leaks into them.
     fit_period: tuple = ("1970-01", "2004-02")
-    # Area-weight the global statistics (only used by the *global* strategies).
-    area_weight: bool = True
 
 
 @dataclass
@@ -361,11 +349,6 @@ class ExperimentConfig:
         for name in (*d.prognostic, *d.forcing):
             if d.prognostic.count(name) + d.forcing.count(name) > 1:
                 raise ValueError(f"{name!r} is listed more than once")
-        if d.normalisation.strategy not in KNOWN_NORMALISATION_STRATEGIES:
-            raise ValueError(
-                f"Unknown normalisation strategy {d.normalisation.strategy!r}; "
-                f"use one of {KNOWN_NORMALISATION_STRATEGIES}"
-            )
         if d.mask_variable not in (*d.prognostic, *d.forcing):
             raise ValueError(f"mask_variable {d.mask_variable!r} must be a prognostic or forcing variable")
 
@@ -509,7 +492,9 @@ class ExperimentConfig:
         values = {}
         for name, value in raw.items():
             if name == "data":
-                normalisation = {k: tuple(v) if isinstance(v, list) else v for k, v in value["normalisation"].items()}
+                # strategy and area_weight are retired: every saved run used "Spatial_climatology", now the only one.
+                normalisation = {k: tuple(v) if isinstance(v, list) else v for k, v in value["normalisation"].items()
+                                 if k not in ("strategy", "area_weight")}
                 value = DataConfig(**{**value, "normalisation": NormalisationConfig(**normalisation)})
             elif name == "loss":
                 value = LossConfig(**{**value, "closures": {k: ClosureConfig(**c) for k, c in value["closures"].items()}})
