@@ -54,10 +54,10 @@ def field_loss(*, pred_t, target_t, mask, area=None, method="mse", n_members=1, 
     gave the regions poleward of 60 degrees ~27% of the loss for ~10% of the
     ocean area. Without ``area`` every ocean cell counts equally.
 
-    Called with the whole rollout context (``loss(**context)``) and ``method``
-    fixed in advance, e.g. ``partial(field_loss, method="crps")``; context
-    entries it does not use are absorbed by ``**_``. The loss weight is applied
-    by the caller.
+    Each training setup chooses ``method`` once when it builds its list of
+    losses (the loss cell of the UNet notebooks, LOSS_TERMS in
+    src/Experiment/losses.py); rollout-context entries it does not use are
+    absorbed by ``**_``. The loss weight is applied by the caller.
     """
     if method == "mse":
         error = (pred_t - target_t) ** 2                               # (B, P, H, W)
@@ -133,10 +133,11 @@ def zonal_wavenumber_bands(latitude, n_lon, latitudes=SPECTRUM_LATITUDES,
     return rows, band, power_weight, k_band
 
 
-def spectral_loss(weight=1.0, *, latitude):
+def spectral_loss(*, latitude, n_lon):
     """
-    Return a weighted spectral loss: the mean squared difference in log10
-    ENERGY per physical zonal-wavenumber band, per sample and variable.
+    Return the spectral loss for a grid with these row latitudes and n_lon
+    longitudes: the mean squared difference in log10 ENERGY per physical
+    zonal-wavenumber band, per sample and variable.
 
     For every latitude row in SPECTRUM_LATITUDES the ocean-masked field
     (land = 0) is Fourier transformed along longitude, which is periodic. The
@@ -157,52 +158,38 @@ def spectral_loss(weight=1.0, *, latitude):
     across the non-periodic north/south edges.)
 
     ``latitude``: the grid's 1-D nominal latitude (degrees), which sets each
-    row's length and so its physical wavenumbers.
+    row's length and so its physical wavenumbers. ``n_lon``: number of
+    longitudes.
 
-    The spectrum is computed in float32 (half-precision FFTs need power-of-two
-    sizes) under gradient checkpointing, which recomputes it in the backward
-    pass instead of storing the FFTs; the value and gradients are unchanged.
+    The returned loss is called with the whole rollout context
+    (``loss(**context)``); the loss weight is applied by the caller.
     """
-    geometry = {}
+    # The grid's band layout (see zonal_wavenumber_bands), computed once. The tensors are
+    # moved to the field's device at every call: a few hundred kB, negligible next to the network.
+    rows, band, power_weight, k_band = zonal_wavenumber_bands(latitude, n_lon)
+    rows, band = torch.as_tensor(rows), torch.as_tensor(band)
+    power_weight = torch.as_tensor(power_weight, dtype=torch.float32)
 
-    def bands_for(field):
-        key = (field.shape[-1], field.device)
-        if key not in geometry:
-            rows, band, power_weight, k_band = zonal_wavenumber_bands(latitude, field.shape[-1])
-            geometry[key] = (
-                torch.as_tensor(rows, device=field.device),
-                torch.as_tensor(band, device=field.device),
-                torch.as_tensor(power_weight, device=field.device, dtype=torch.float32),
-                k_band.size,
-            )
-        return geometry[key]
-
-    def band_energy(field, valid_mask):
-        rows, band, power_weight, n_bands = bands_for(field)
-        x = (field.float() * valid_mask.float())[..., rows, :]                  # (B, P, R, W)
-        power = torch.fft.rfft(x, dim=-1).abs().square()[..., 1:] * power_weight  # drop the zonal mean
-        energy = power.new_zeros(*power.shape[:-2], n_bands)
-        return energy.index_add(-1, band, power.flatten(-2))               # (B, P, n_bands)
-
-    def log_band_energy_mse(pred_t, target_t, valid_mask):
-        pred_energy = band_energy(pred_t, valid_mask)
-        target_energy = band_energy(target_t, valid_mask)
+    def log_band_energy_mse(pred_t, target_t, mask):
+        device = pred_t.device
+        # Prediction and truth side by side with land set to 0, only the rows used: (2, B, P, rows, n_lon).
+        # In float32: half-precision FFTs need power-of-two sizes.
+        fields = torch.stack([pred_t.float(), target_t.float()]) * mask.to(device, torch.float32)
+        fields = fields[..., rows.to(device), :]
+        # Power of every zonal harmonic except the zonal mean, as its share of the area-weighted variance.
+        power = torch.fft.rfft(fields, dim=-1).abs().square()[..., 1:] * power_weight.to(device)
+        # Energy per wavenumber band: add up the power of every (row, harmonic) in it. (2, B, P, n_bands)
+        energy = power.new_zeros(*power.shape[:-2], k_band.size).index_add(-1, band.to(device), power.flatten(-2))
+        pred_energy, target_energy = energy
         # Floor relative to each sample's total energy, so a band with no ocean
         # (or a zero field) never gives log(0).
         floor = 1.0e-8 * target_energy.sum(-1, keepdim=True) + 1.0e-20
         return (torch.log10(pred_energy + floor) - torch.log10(target_energy + floor)).square().mean()
 
     def loss_fn(*, pred_t, target_t, mask, **_):
-        if weight == 0.0:
-            return pred_t.new_zeros(())
-
-        # Ocean mask (H, W), 1 = ocean, broadcast to pred_t's (B, P, H, W)
-        valid_mask = mask.to(device=pred_t.device, dtype=pred_t.dtype).expand_as(pred_t)
-        if torch.is_grad_enabled() and pred_t.requires_grad:
-            loss = checkpoint(log_band_energy_mse, pred_t, target_t, valid_mask, use_reentrant=False)
-        else:
-            loss = log_band_energy_mse(pred_t, target_t, valid_mask)
-        return weight * loss
+        # Gradient checkpointing: the FFTs are recomputed in the backward pass instead of stored
+        # (same value and gradients, less memory). Without gradients this is a plain call.
+        return checkpoint(log_band_energy_mse, pred_t, target_t, mask, use_reentrant=False)
 
     return loss_fn
 

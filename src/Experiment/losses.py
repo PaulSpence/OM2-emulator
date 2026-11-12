@@ -53,7 +53,7 @@ def closure_std_fields(cfg, data):
 # weight. "<budget>_closure" terms are built by closure_loss.
 LOSS_TERMS = {
     "local_mse": lambda cfg, data: partial(field_loss, method="mse"),
-    "spectral": lambda cfg, data: spectral_loss(weight=1.0, latitude=data.fields["latitude"]),
+    "spectral": lambda cfg, data: spectral_loss(latitude=data.fields["latitude"], n_lon=data.fields["mask"].shape[-1]),
     "crps": lambda cfg, data: partial(field_loss, method="crps"),
 }
 

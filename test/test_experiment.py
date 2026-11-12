@@ -854,7 +854,7 @@ def test_spectral_loss_is_log_band_energy_mse_with_checkpointing():
 
     expected = reference(pred)
     (expected_grad,) = torch.autograd.grad(expected, pred)
-    loss = spectral_loss(weight=1.0, latitude=SPECTRUM_LAT)(pred_t=pred, target_t=target, mask=mask, rollout_step=0)
+    loss = spectral_loss(latitude=SPECTRUM_LAT, n_lon=W)(pred_t=pred, target_t=target, mask=mask, rollout_step=0)
     (grad,) = torch.autograd.grad(loss, pred)
     torch.testing.assert_close(loss, expected)
     torch.testing.assert_close(grad, expected_grad)
@@ -864,7 +864,7 @@ def test_spectral_loss_ignores_phase_and_penalises_lost_energy():
     """Shifting a field in longitude costs nothing; halving its amplitude costs (log10 1/4)^2 in every band."""
     from Emulator import spectral_loss
 
-    loss_fn = spectral_loss(weight=1.0, latitude=SPECTRUM_LAT)
+    loss_fn = spectral_loss(latitude=SPECTRUM_LAT, n_lon=W)
     mask = torch.ones(H, W)
     target = torch.randn(2, 1, H, W, generator=torch.Generator().manual_seed(4))
     shifted = torch.roll(target, shifts=7, dims=-1)  # longitude is periodic
@@ -880,8 +880,8 @@ def test_spectral_loss_runs_in_half_precision_on_any_grid_size():
     from Emulator import spectral_loss
 
     pred = torch.randn(1, 2, H, W).half()
-    loss = spectral_loss(weight=1.0, latitude=SPECTRUM_LAT)(pred_t=pred, target_t=pred.float() * 2, mask=torch.ones(H, W),
-                                                             rollout_step=0)
+    loss = spectral_loss(latitude=SPECTRUM_LAT, n_lon=W)(pred_t=pred, target_t=pred.float() * 2, mask=torch.ones(H, W),
+                                                         rollout_step=0)
     assert loss.dtype == torch.float32 and torch.isfinite(loss)
 
 
