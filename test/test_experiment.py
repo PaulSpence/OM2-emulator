@@ -44,6 +44,7 @@ from Experiment import (  # noqa: E402
     build_trainer,
     check_known_closure,
     compute_normalisation,
+    forcing_scale,
     plot_global_rmse_all_variables,
     plot_rmse_by_epoch,
     plot_skill_evaluation,
@@ -190,9 +191,11 @@ def test_windows_match_direct_normalisation(data_and_cfg, synthetic_file):
     variables = [*PROGNOSTIC, *FORCING]
     with xr.open_dataset(synthetic_file) as raw:
         ds = raw.rename(yt_ocean="latitude", xt_ocean="longitude").sel(time=months, method="nearest")
-        mean, std, _ = compute_normalisation(ds, variables, ("2000-01", "2003-12"), "total_surface_heat_flx")
+        mean, std, mask = compute_normalisation(ds, variables, ("2000-01", "2003-12"), "total_surface_heat_flx")
+        # The forcing is divided by one scale per variable, not each cell's std.
+        scale = forcing_scale(std[FORCING], ds["area_t"].isel(time=0).fillna(0.0) * mask)
         z = {
-            v: ((ds[v] - mean[v]) / std[v]).fillna(0.0).values
+            v: ((ds[v] - mean[v]) / (scale[v] if v in FORCING else std[v])).fillna(0.0).values
             for v in variables
         }
 
@@ -1049,13 +1052,42 @@ def test_partial_conv_respects_the_grid_symmetry(kernel_size, stride, padding):
     torch.testing.assert_close(mask_rolled, torch.roll(new_mask, shift // stride, dims=-1))
 
 
-def test_periodic_upsampling_matches_interpolating_a_tiled_field():
-    from Emulator.om2_model_utils import upsample_periodic_x
+def test_grid_upsampling_matches_interpolating_a_tiled_and_folded_field():
+    """upsample_on_grid sees the same neighbours as the grid: longitude wraps, the top row's north neighbour
+    is the top row reversed in x (the tripole fold)."""
+    from Emulator.om2_model_utils import upsample_on_grid
 
     x = torch.randn(2, 3, 5, 10)
     tiled = torch.cat([x, x, x], dim=-1)  # three copies side by side: the middle one has true neighbours
-    expected = torch.nn.functional.interpolate(tiled, size=(10, 60), mode="bilinear", align_corners=False)[..., 20:40]
-    torch.testing.assert_close(upsample_periodic_x(x, (10, 20)), expected)
+    folded = torch.cat([tiled, torch.flip(tiled[..., -1:, :], dims=(-1,))], dim=-2)  # plus its fold row
+    expected = torch.nn.functional.interpolate(folded, size=(12, 60), mode="bilinear", align_corners=False)
+    torch.testing.assert_close(upsample_on_grid(x, (10, 20)), expected[..., :10, 20:40])
+    # Same size in and out (the bottleneck to the enc2 skip): nothing changes.
+    torch.testing.assert_close(upsample_on_grid(x, (5, 10)), x)
+
+
+def test_unet_sees_its_true_neighbours_across_the_tripole_fold():
+    """
+    Across the fold the grid continues upside down: row h - 1 - k reversed in x. Stack that image on top
+    of the field (a 2h-row grid on which the fold is an ordinary interior seam) and the UNet's output on
+    the top rows must be the same as on the folded h-row grid, at every resolution level. With a 3x3
+    stride-2 layer the 1/4 resolution grid was not symmetric about the fold, so it was not.
+    """
+    from Emulator import UNet
+
+    torch.manual_seed(0)
+    h, w = 64, 32  # far enough from the south edge that the UNet's receptive field does not reach it
+    unet = UNet(input_channel_count=3, output_channel_count=2).eval()
+    x = torch.randn(1, 3, h, w)
+    mask = (torch.rand(1, 1, h, w) > 0.3).float()
+
+    def with_fold_image(t):
+        return torch.cat([t, torch.flip(t, dims=(-2, -1))], dim=-2)
+
+    with torch.no_grad():
+        out = unet(x, mask)
+        out_unfolded = unet(with_fold_image(x), with_fold_image(mask))
+    torch.testing.assert_close(out[..., -4:, :], out_unfolded[..., h - 4:h, :], rtol=1e-4, atol=1e-5)
 
 
 def test_unet_respects_the_grid_symmetry():
@@ -1820,3 +1852,183 @@ def test_seed_spread_and_separation():
     assert crps["difference"] == pytest.approx(-1.0) and crps["seeds"] == 3 and crps["separated"]
     acc = table.loc[("ocean_heat_content_2d", "acc_12mo")]
     assert acc["difference"] == pytest.approx(0.15) and not acc["separated"]
+
+
+# =============================================================================
+# Global flux scale and the physical coupler
+# =============================================================================
+
+def test_forcing_scale_is_the_area_weighted_rms_of_the_cell_std():
+    """One number per flux: sqrt(mean over months of the area-weighted mean of std^2), land ignored."""
+    std_values = np.array([[[1.0, 3.0, np.nan]], [[1.0, 3.0, np.nan]]])   # (time 2, lat 1, lon 3), last cell land
+    std = xr.Dataset({"flux": (("time", "latitude", "longitude"), std_values)})
+    area = xr.DataArray([[1.0, 3.0, 0.0]], dims=("latitude", "longitude"))
+    expected = np.sqrt((1.0 * 1 + 9.0 * 3) / 4)
+    assert forcing_scale(std, area)["flux"] == pytest.approx(expected)
+
+
+def test_fields_use_one_scale_per_forcing(data_and_cfg):
+    data, _ = data_and_cfg
+    ocean = data.fields["mask"] > 0
+    for c in range(len(FORCING)):
+        scale = data.fields["forcing_std"][:, c][:, ocean]
+        assert torch.allclose(scale, scale.flatten()[0].expand_as(scale))
+
+
+def test_constraint_takes_each_samples_own_flux_totals(data_and_cfg):
+    from Experiment import build_constraint
+
+    data, cfg = data_and_cfg
+    constraint = build_constraint(cfg, data)
+    f = data.fields
+    t = data.train_indices[:3]
+    previous = f["prognostic"][t]
+    pred = previous + 0.3 * torch.randn(previous.shape, generator=torch.Generator().manual_seed(0))
+    # The stored ACCESS-OM2 totals passed explicitly: same answer as leaving them out.
+    stored = constraint(pred, previous, t, t + 1)
+    torch.testing.assert_close(constraint(pred, previous, t, t + 1, f["forcing_global"][t], f["forcing_global"][t + 1]), stored)
+    # Other totals: the budget closes against those instead.
+    other_previous, other_target = 2.0 * f["forcing_global"][t], -1.0 * f["forcing_global"][t + 1]
+    out = constraint(pred, previous, t, t + 1, other_previous, other_target)
+    residual, _ = constraint.residual(out, previous, t, t + 1, constraint.budgets[0], other_previous, other_target)
+    before, _ = constraint.residual(pred, previous, t, t + 1, constraint.budgets[0], other_previous, other_target)
+    assert residual.abs().max() < 1e-4 * before.abs().max()
+
+
+def _toy_coupler(T=6, H=5, W=7, seed=0):
+    """A PhysicalCoupler on a small grid: random atmosphere, sea ice, truth and climatology.
+    State variables: 0 = a content, 1 = SST, 2 = u_surf, 3 = v_surf."""
+    from Experiment import PhysicalCoupler
+    from Experiment.coupler import ATMOSPHERE, MAX_RECORDS
+
+    g = torch.Generator().manual_seed(seed)
+    mask = torch.ones(H, W)
+    mask[0, :3] = 0
+    cells = int(mask.sum())
+    months = [1, 2, 3, 4, 5]                                         # forcing months the coupler has inputs for
+    M = len(months)
+    # Plausible 3-hourly weather, stored as read_coupler_inputs does: (x - offset) * factor, half precision.
+    physical = {
+        "tas": 288.0 + 8.0 * torch.randn(M, MAX_RECORDS, cells, generator=g),
+        "huss": 0.008 + 0.002 * torch.rand(M, MAX_RECORDS, cells, generator=g),
+        "uas": 7.0 * torch.randn(M, MAX_RECORDS, cells, generator=g),
+        "vas": 7.0 * torch.randn(M, MAX_RECORDS, cells, generator=g),
+        "psl": 101325.0 + 1000.0 * torch.randn(M, MAX_RECORDS, cells, generator=g),
+    }
+    atmosphere = torch.stack([((physical[name] - offset) * factor) for name, offset, factor in ATMOSPHERE], dim=1).half()
+    n_records = torch.tensor([248, 224, 248, 240, 248])
+    inputs = {"time_index": torch.tensor(months), "atmosphere": atmosphere, "n_records": n_records,
+              "open_water": torch.rand(M, cells, generator=g)}
+    state_mean = torch.zeros(T, 4, H, W)
+    state_mean[:, 1] = 288.15                                         # SST climatology, K (as MOM writes it)
+    state_std = torch.ones(T, 4, H, W)
+    state_std[:, 1] = 2.0
+    state_std[:, 2:] = 0.1                                           # currents, m/s
+    true_state_z = torch.randn(T, 4, H, W, generator=g)
+    true_fluxes = torch.randn(T, 4, H, W, generator=g) * torch.tensor([50.0, 3e-5, 0.1, 0.1])[:, None, None]
+    coupler = PhysicalCoupler(
+        inputs, true_state_z, true_fluxes, surface_channels=[1, 2, 3], state_mean=state_mean, state_std=state_std,
+        forcing_mean=torch.randn(T, 4, H, W, generator=g), forcing_scale=[10.0, 1e-5, 0.1, 0.1],
+        mask=mask, area=torch.rand(H, W, generator=g) + 1.0,
+    )
+    return coupler, mask, true_state_z, true_fluxes
+
+
+def test_open_ocean_fluxes_respond_to_the_surface_as_bulk_formulae_should():
+    from Experiment import open_ocean_fluxes
+
+    def fluxes(sst=293.15, uas=8.0, u_ocean=0.0):
+        t = lambda x: torch.tensor([[float(x)]], dtype=torch.float64)
+        return open_ocean_fluxes(t(290.0), t(0.009), t(uas), t(0.0), t(101325.0), t(sst), t(u_ocean), t(0.0))[0, :, 0, 0]
+
+    base = fluxes()
+    warm = fluxes(sst=295.15)
+    # A warmer sea loses more heat and evaporates more (both fluxes are positive INTO the ocean).
+    assert warm[0] < base[0] < 0 and warm[1] < base[1] < 0
+    # Large-Yeager magnitudes: a 2 K warmer sea loses tens of W/m2 more.
+    assert 10.0 < float(base[0] - warm[0]) < 100.0
+    # The stress pushes the ocean along the wind, and depends on the wind RELATIVE to the current.
+    assert base[2] > 0 and abs(float(base[3])) < 1e-12
+    assert 0 < fluxes(u_ocean=1.0)[2] < base[2]
+    torch.testing.assert_close(fluxes(uas=0.0, u_ocean=0.0)[2], torch.tensor(0.0, dtype=torch.float64))
+
+
+def test_coupler_gives_access_om2_fluxes_on_access_om2_surface():
+    """flux = ACCESS-OM2's - B(ACCESS-OM2's lagged surface) + B(the emulator's): exact when the two agree."""
+    coupler, mask, true_state_z, true_fluxes = _toy_coupler()
+    months = torch.tensor([2, 5])
+    fluxes = coupler.fluxes(true_state_z[months - 1], months)
+    torch.testing.assert_close(fluxes, true_fluxes[months][:, :, mask > 0], rtol=1e-5, atol=1e-9)
+
+
+def test_coupler_ignores_records_past_the_end_of_the_month():
+    coupler, mask, true_state_z, _ = _toy_coupler()
+    months = torch.tensor([2])                                       # 224 records (February)
+    state = true_state_z[months - 1] + 0.5
+    before = coupler.fluxes(state, months)
+    coupler.atmosphere[1, :, 224:] = 7.0
+    torch.testing.assert_close(coupler.fluxes(state, months), before)
+
+
+def test_coupler_shapes_round_trip_and_gradients():
+    coupler, mask, _, _ = _toy_coupler()
+    state = torch.randn(2, 4, *mask.shape, requires_grad=True)
+    months = torch.tensor([1, 4])
+    fluxes = coupler.fluxes(state, months)
+    assert fluxes.shape == (2, 4, int(mask.sum()))
+    forcing, totals = coupler(state, months)
+    assert forcing.shape == (2, 4, *mask.shape) and totals.shape == (2, 4) and totals.dtype == torch.float64
+    assert (forcing[:, :, mask == 0] == 0).all()                       # land is 0
+    # Undo the z-score: flux = climatology + z x scale.
+    back = forcing[:, :, mask > 0] * coupler.forcing_scale[None, :, None] + coupler.forcing_mean[months]
+    torch.testing.assert_close(back, fluxes, rtol=1e-4, atol=1e-6)
+    # Gradients reach the SST and current channels only.
+    forcing.sum().backward()
+    assert state.grad[:, 1:].abs().sum() > 0 and state.grad[:, 0].abs().sum() == 0
+    # A month without inputs is an error, not a silent zero.
+    with pytest.raises(KeyError):
+        coupler.fluxes(state.detach(), torch.tensor([0, 1]))
+    # Samples that share a month (rollout twins, ensemble members) get that month's weather, in any order.
+    shared = coupler.fluxes(state[[1, 0, 1]].detach(), torch.tensor([4, 1, 4]))
+    torch.testing.assert_close(shared[[1, 0]], fluxes.detach())
+    torch.testing.assert_close(shared[2], fluxes[1].detach())
+    # The weather stays where read_coupler_inputs put it (host memory on a 32 GB V100): not a buffer, so moving
+    # the coupler leaves it where it is, and it is never written into checkpoints.
+    assert "atmosphere" not in dict(coupler.named_buffers())
+    assert coupler.to(torch.float64).atmosphere.dtype == torch.float16 and coupler.atmosphere.device.type == "cpu"
+
+
+def test_coupled_rollout_closes_the_budget_with_the_coupled_fluxes():
+    from Experiment import GlobalBudgetConstraint, coupled_rollout
+
+    coupler, mask, _, _ = _toy_coupler()
+    T, H, W = 6, *mask.shape
+    std = torch.rand(T, H, W) + 0.5
+    area = torch.zeros(H * W, dtype=torch.float64)
+    area[coupler.ocean_index] = coupler.cell_area                  # the coupler's cell areas on the grid
+    area = area.view(H, W)
+    constraint = GlobalBudgetConstraint(
+        [("heat", 0, 0, 1.0)], {"heat": std}, mean_global=torch.zeros(T, 4), flux_global=torch.zeros(T, 4),
+        month_seconds=torch.full((T,), 1e6), area=area, mask=mask,
+    )
+
+    class Persist(torch.nn.Module):   # "nothing changes" model, so only the constraint moves the state
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.zeros(()))
+
+        def forward(self, prior, forcing, mask):
+            return prior[:, -4:] + 0 * self.w
+
+    prior = torch.randn(2, 4, H, W)
+    predictions, totals = coupled_rollout(Persist(), coupler, prior, target_indices=[2, 3, 4], initial_index=1,
+                                          constraint=constraint, initial_flux_totals=torch.zeros(4), members=2)
+    assert predictions.shape == (2, 3, 4, H, W) and totals.shape == (2, 3, 4)
+    # Every month the heat content changes by exactly the average of the two months' coupled heat flux.
+    area = constraint.ocean_area
+    content = [(prior[-1, 0].double() * std[1].double() * area).sum()]
+    content += [(predictions[0, k, 0].double() * std[2 + k].double() * area).sum() for k in range(3)]
+    flux = [0.0] + totals[0, :, 0].tolist()
+    for k in range(3):
+        expected = 0.5 * (flux[k] + flux[k + 1]) * 1e6
+        assert float(content[k + 1] - content[k]) == pytest.approx(expected, rel=1e-4, abs=1e-6 * max(abs(expected), 1.0))

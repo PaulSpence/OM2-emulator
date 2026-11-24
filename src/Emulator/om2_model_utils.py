@@ -65,16 +65,25 @@ class PartialConv2d(nn.Module):
         new_mask = (ocean_cells > 0).to(mask.dtype)
         return self.conv(x * mask) * scale, new_mask
 
-def upsample_periodic_x(x, size):
+def upsample_on_grid(x, size):
     """
-    Bilinear upsampling of x (B, C, h, w) to size = (H, W), with longitude (the last dimension)
-    periodic: wrap one column around on each side, interpolate, then cut the extra columns off again,
-    so the east and west edges interpolate across the seam. W must be a whole multiple of w.
+    Bilinear upsampling of x (B, C, h, w) to size = (H, W) on the ACCESS-OM2 tripolar grid, with the
+    same neighbours as PartialConv2d:
+      * longitude (the last dimension) is periodic: one column is wrapped around on each side, so the
+        east and west edges interpolate across the seam. W must be a whole multiple of w.
+      * north: the tripole fold. One ghost row, the top row reversed in x, is added above the top row,
+        so the output rows nearest the fold interpolate towards their fold neighbours instead of
+        copying the top row. (South is left as it was: the edge row is repeated.)
+    The ghost rows and columns are cut off again afterwards. The interpolation is given the true scale
+    factors, so every output cell samples the same input position as plain F.interpolate(x, size).
     """
-    scale = size[1] // x.shape[-1]          # e.g. 2: every input column becomes 2 output columns
-    x = torch.cat([x[..., -1:], x, x[..., :1]], dim=-1)    # wrap one column around on each side
-    x = F.interpolate(x, size=(size[0], size[1] + 2 * scale), mode="bilinear", align_corners=False)
-    return x[..., scale:-scale]
+    h, w = x.shape[-2:]
+    scale_x = size[1] // w                  # e.g. 2: every input column becomes 2 output columns
+    x = torch.cat([x, torch.flip(x[..., -1:, :], dims=(-1,))], dim=-2)   # north ghost row: the fold
+    x = torch.cat([x[..., -1:], x, x[..., :1]], dim=-1)                  # wrap one column each side
+    x = F.interpolate(x, scale_factor=(size[0] / h, scale_x), mode="bilinear", align_corners=False,
+                      recompute_scale_factor=False)
+    return x[..., :size[0], scale_x:scale_x + size[1]]
 
 
 # The below is a Lightning wrapper that is used to train the autoencoder. 
@@ -181,14 +190,14 @@ class AutoEncoder(nn.Module):
     def decode(self, x, mask):
         """Decoder: takes latent representation and reconstructs output"""
         # upsample 1
-        x = upsample_periodic_x(x, (2 * x.shape[-2], 2 * x.shape[-1]))
+        x = upsample_on_grid(x, (2 * x.shape[-2], 2 * x.shape[-1]))
         mask = F.interpolate(mask, scale_factor=2, mode="nearest")
 
         x, mask = self.dec1(x, mask)
         x = self.relu(x)
 
         # upsample 2
-        x = upsample_periodic_x(x, (2 * x.shape[-2], 2 * x.shape[-1]))
+        x = upsample_on_grid(x, (2 * x.shape[-2], 2 * x.shape[-1]))
         mask = F.interpolate(mask, scale_factor=2, mode="nearest")
 
         x, mask = self.dec2(x, mask)
@@ -245,6 +254,12 @@ class UNet(nn.Module):
       * The output layer sees only the upsampled decoder features, not the raw input: fed the raw input
         as well, it learned a sharpening stencil that grew grid-scale noise by ~17% per step. The
         residual wrapper (next = state + output) carries the state's grid-scale content forward instead.
+      * Both stride-2 layers are 4x4 with padding 1, so every coarse cell is centred between two finer
+        cells and each coarse grid is symmetric about the tripole fold: coarse cell j's fold neighbour
+        is cell n - 1 - j, which is what the fold padding assumes. With a 3x3 stride-2 layer the 1/4
+        resolution cells sit on every other 1/2 resolution cell, whose fold neighbours are the cells in
+        between, so all six bottleneck layers saw a neighbour one 1/2 resolution cell away from the true
+        one across the fold (in x and y), and the bilinear upsampling assumed centres half a cell off.
     """
 
     def __init__(self,
@@ -261,7 +276,7 @@ class UNet(nn.Module):
 
         # ---------- Encoder ----------
         self.enc1 = PartialConv2d(input_channel_count, width1, kernel_size=4, stride=2, padding=1)
-        self.enc2 = PartialConv2d(width1, width2, kernel_size=3, stride=2, padding=1)
+        self.enc2 = PartialConv2d(width1, width2, kernel_size=4, stride=2, padding=1)
         # Bottleneck: three 3x3 layers, the receptive field of one 7x7.
         self.enc3a = PartialConv2d(width2, width2, kernel_size=3, stride=1, padding=1)
         self.enc3b = PartialConv2d(width2, width2, kernel_size=3, stride=1, padding=1)
@@ -289,7 +304,7 @@ class UNet(nn.Module):
         x1, mask1 = self.enc1(x, mask)
         x1 = self.relu(x1)
 
-        # PartialConv2d.forward, 3x3 stride 2: 1/2 -> 1/4 resolution, 32 -> 64 channels.
+        # PartialConv2d.forward, 4x4 stride 2: 1/2 -> 1/4 resolution, 32 -> 64 channels.
         x2, mask2 = self.enc2(x1, mask1)
         x2 = self.relu(x2)
 
@@ -305,9 +320,9 @@ class UNet(nn.Module):
         # x1 and x2 (the encoder features at 1/2 and 1/4 resolution) are the skip
         # connections: they are joined back in at their own resolution.
 
-        # The bottleneck is already at x2's 1/4 resolution: upsample_periodic_x
-        # interpolates to x2's grid size, wrapping around in longitude.
-        y = upsample_periodic_x(latent, x2.shape[2:])
+        # The bottleneck is already at x2's 1/4 resolution: upsample_on_grid
+        # interpolates to x2's grid size, wrapping around in longitude and folding at the north edge.
+        y = upsample_on_grid(latent, x2.shape[2:])
         y_mask = F.interpolate(latent_mask, size=mask2.shape[2:], mode="nearest")
         y = torch.cat([y, x2], dim=1)                                # skip from enc2: 128 + 64 = 192 channels
 
@@ -320,7 +335,7 @@ class UNet(nn.Module):
         y = self.relu(y)
 
         # Upsample 1/4 -> 1/2 resolution and join the skip from enc1.
-        y = upsample_periodic_x(y, x1.shape[2:])
+        y = upsample_on_grid(y, x1.shape[2:])
         y_mask = F.interpolate(y_mask, size=mask1.shape[2:], mode="nearest")
         y = torch.cat([y, x1], dim=1)                                # 64 + 32 = 96 channels
 
@@ -329,7 +344,7 @@ class UNet(nn.Module):
         y = self.relu(y)
 
         # Upsample 1/2 -> full resolution (the input's exact size, odd grids included).
-        y = upsample_periodic_x(y, x.shape[2:])
+        y = upsample_on_grid(y, x.shape[2:])
 
         # PartialConv2d.forward, 3x3 at full resolution with the original ocean mask:
         # the output, one channel per predicted variable. No ReLU: the change can be negative.

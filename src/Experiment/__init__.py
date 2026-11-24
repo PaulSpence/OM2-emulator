@@ -34,7 +34,8 @@ from .config import (
     WindowConfig,
 )
 from .constraints import GlobalBudgetConstraint, build_constraint
-from .data import ExperimentData, build_data, compute_normalisation, gather_windows
+from .coupler import PhysicalCoupler, coupled_rollout, monthly_open_ocean_fluxes, open_ocean_fluxes, read_coupler_inputs
+from .data import ExperimentData, build_data, compute_normalisation, forcing_scale, gather_windows
 from .evaluation import (
     check_known_closure,
     climatology_rmse,
@@ -101,6 +102,12 @@ __all__ = [
     "DiffusionConfig",
     "EnsembleConfig",
     "GlobalBudgetConstraint",
+    "PhysicalCoupler",
+    "coupled_rollout",
+    "monthly_open_ocean_fluxes",
+    "open_ocean_fluxes",
+    "read_coupler_inputs",
+    "forcing_scale",
     "build_constraint",
     "default_members",
     "ResidualDiffusion",

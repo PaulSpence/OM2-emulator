@@ -28,7 +28,7 @@
 #PBS -l mem=97280M
 #PBS -l jobfs=100GB
 #PBS -l walltime=24:00:00
-#PBS -l storage=gdata/cj50+gdata/e14+gdata/v46+gdata/p73+gdata/v45+gdata/x77+gdata/fs38+gdata/ik11+gdata/oi10+gdata/xp65+gdata/g40+gdata/ol01+gdata/nm47+gdata/dk92+gdata/rv74+gdata/rq0
+#PBS -l storage=gdata/cj50+gdata/e14+gdata/v46+gdata/p73+gdata/v45+gdata/x77+gdata/fs38+gdata/ik11+gdata/oi10+gdata/xp65+gdata/g40+gdata/ol01+gdata/nm47+gdata/dk92+gdata/rv74+gdata/rq0+gdata/qv56
 #PBS -l wd
 #PBS -j oe
 #PBS -o /home/156/txs156/uom/OM2-emulator/runs/

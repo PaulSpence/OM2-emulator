@@ -27,7 +27,8 @@ from torch.utils.data import DataLoader
 
 from Emulator import grid_row_length_km
 
-CACHE_FORMAT_VERSION = 4  # 3: month_seconds and global integrals for the budget constraint; 4: row_length_km
+CACHE_FORMAT_VERSION = 5  # 3: month_seconds and global integrals for the budget constraint; 4: row_length_km;
+                          # 5: forcing z-scores use one scale per variable (forcing_scale)
 
 
 # =============================================================================
@@ -60,6 +61,30 @@ def compute_normalisation(ds, variables, fit_period, mask_variable):
     mean = monthly_mean.sel(month=calendar_month).drop_vars("month")
     std = monthly_std.sel(month=calendar_month).drop_vars("month")
     return mean, std, mask
+
+
+def forcing_scale(std, ocean_area):
+    """
+    ONE number per forcing variable, to divide its anomaly by instead of each cell's own std.
+
+    It is the typical size of that cell-and-month std over the ocean: the root of its mean square,
+    weighted by cell area, over all ocean cells and all months.
+
+    Why not each cell's own std, as for the state variables? Some cells have a flux that barely varies
+    (e.g. the heat flux under permanent sea ice). Their std is tiny, so any small error in a flux
+    computed by the coupler becomes an enormous z-score there (up to z ~ 170 for heat),
+    far outside anything the network saw in training. With one scale per flux, the same error is
+    small everywhere.
+
+    std        : Dataset of (time, latitude, longitude) per-cell std, from compute_normalisation
+    ocean_area : (latitude, longitude) DataArray, cell area on ocean and 0 on land
+    returns    : {variable: float}
+    """
+    weight = ocean_area / ocean_area.sum()
+    return {
+        v: float(np.sqrt(((std[v].fillna(0.0) ** 2) * weight).sum(("latitude", "longitude")).mean("time")))
+        for v in std.data_vars
+    }
 
 
 # =============================================================================
@@ -108,6 +133,15 @@ def build_fields(cfg):
                     f"{v} is missing at {missing} of {int(ocean.sum())} ocean cells (first month); "
                     "those cells get zero anomaly. Regenerate the dataset if this is not intended."
                 )
+
+        # The forcing (surface fluxes) is divided by one scale per variable, not each cell's std:
+        # see forcing_scale. Its mean is still each cell's monthly climatology.
+        cell_area = ds[d.area_variable]
+        if "time" in cell_area.dims:
+            cell_area = cell_area.isel(time=0)
+        scale = forcing_scale(std[list(d.forcing)], cell_area.fillna(0.0) * mask)
+        for v in d.forcing:
+            std[v] = xr.full_like(std[v], scale[v])
 
         def normalised(v):
             field = ds[v].transpose("time", "latitude", "longitude")
@@ -166,7 +200,7 @@ def build_fields(cfg):
         "forcing": forcing,                  # (T, C, H, W) z-scores
         "prognostic_mean": prognostic_mean,  # (T, P, H, W) physical units
         "prognostic_std": prognostic_std,    # (T, P, H, W) physical units
-        "forcing_std": forcing_std,          # (T, C, H, W) physical units (closure fluxes)
+        "forcing_std": forcing_std,          # (T, C, H, W) physical units: each forcing's one scale (forcing_scale), everywhere
         "forcing_global": forcing_global,    # (T, C) float64 ocean integral of each forcing, physical units x m^2
         "prognostic_mean_global": mean_global,  # (T, P) float64 ocean integral of the climatological mean
         "month_seconds": torch.as_tensor(month_seconds, dtype=torch.float64),  # (T,) length of each month

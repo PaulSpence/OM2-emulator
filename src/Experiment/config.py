@@ -114,8 +114,10 @@ class TimeConfig:
     test: tuple = ("2005-02", "2018-11")
     # Control run: the forcing of these months (inclusive) repeated
     # control_repeats times, seeded from the truth at control[0]. Isolates
-    # drift under (near-)constant forcing. None disables it.
-    control: tuple | None = ("2003-01", "2003-12")
+    # drift under (near-)constant forcing. None disables it. Default: May 1990 -
+    # April 1991, the repeat year of ACCESS-OM2's RYF runs, whose net surface
+    # heat flux is ~-0.03 W/m2 (2003: -0.5 W/m2, a forced drift in the control).
+    control: tuple | None = ("1990-05", "1991-04")
     control_repeats: int = 10
 
 

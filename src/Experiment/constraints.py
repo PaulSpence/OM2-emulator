@@ -20,13 +20,18 @@ import torch.nn as nn
 
 class GlobalBudgetConstraint(nn.Module):
     """
-    forward(pred, previous, previous_index, target_index) -> pred, with every
-    enforced budget closed exactly.
+    forward(pred, previous, previous_index, target_index, flux_previous=None, flux_target=None)
+        -> pred, with every enforced budget closed exactly.
 
     pred, previous   : (B, P, H, W) z-scores: the predicted next state and the
                        state it was predicted from
     previous_index,
     target_index     : (B,) time indices of those two states (their months)
+    flux_previous,
+    flux_target      : (B, C) ocean-integrated surface fluxes of those two months, one row per
+                       sample, when the fluxes come from the coupler (each sample has
+                       its own, computed from its own surface). Leave out to use ACCESS-OM2's
+                       fluxes stored at construction (flux_global).
 
     For each budget, with content C = z * std + mean (physical, per cell):
 
@@ -60,23 +65,26 @@ class GlobalBudgetConstraint(nn.Module):
         for name, *_ in self.budgets:
             self.register_buffer(f"{name}_std", content_std[name].float(), persistent=False)
 
-    def residual(self, pred, previous, previous_index, target_index, budget):
+    def residual(self, pred, previous, previous_index, target_index, budget, flux_previous=None, flux_target=None):
         """(B,) budget residual R (content units x m^2) of one budget, and sum(area * std_target)."""
         name, c, f, sign = budget
+        if flux_previous is None:   # ACCESS-OM2's fluxes of those months
+            flux_previous = self.flux_global[previous_index]
+            flux_target = self.flux_global[target_index]
         std = getattr(self, f"{name}_std")
         std_previous = std[previous_index].double()
         std_target = std[target_index].double()
         area = self.ocean_area
         change = ((pred[:, c].double() * std_target - previous[:, c].double() * std_previous) * area).sum(dim=(-2, -1))
         change = change + self.mean_global[target_index, c] - self.mean_global[previous_index, c]
-        flux = sign * 0.5 * (self.flux_global[previous_index, f] * self.month_seconds[previous_index]
-                             + self.flux_global[target_index, f] * self.month_seconds[target_index])
+        flux = sign * 0.5 * (flux_previous[:, f].double() * self.month_seconds[previous_index]
+                             + flux_target[:, f].double() * self.month_seconds[target_index])
         return change - flux, (std_target * area).sum(dim=(-2, -1))
 
-    def forward(self, pred, previous, previous_index, target_index):
+    def forward(self, pred, previous, previous_index, target_index, flux_previous=None, flux_target=None):
         out = pred.clone()
         for budget in self.budgets:
-            residual, weight = self.residual(out, previous, previous_index, target_index, budget)
+            residual, weight = self.residual(out, previous, previous_index, target_index, budget, flux_previous, flux_target)
             k = (residual / weight.clamp_min(1e-30)).to(pred.dtype)
             out[:, budget[1]] = out[:, budget[1]] - k[:, None, None] * self.ocean
         return out
