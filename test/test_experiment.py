@@ -1953,6 +1953,20 @@ def test_open_ocean_fluxes_respond_to_the_surface_as_bulk_formulae_should():
     torch.testing.assert_close(fluxes(uas=0.0, u_ocean=0.0)[2], torch.tensor(0.0, dtype=torch.float64))
 
 
+def test_open_ocean_fluxes_gradient_is_finite_where_the_stability_parameter_hits_one_sixteenth():
+    from Experiment import open_ocean_fluxes
+
+    # A real JRA55-do record (1970) and an emulator surface for which 1 - 16 zeta rounds to 0: with the max taken
+    # after the square root, sqrt's infinite gradient at 0 times the max's 0 gave NaN, and one such cell among
+    # millions made every weight's gradient NaN (training froze in stage 1 once rollouts went through the coupler).
+    t = lambda x: torch.tensor([[x]], dtype=torch.float32)
+    atmosphere = [t(x) for x in (274.0601501464844, 0.003898437600582838, -6.48828125, -1.548828125, 96718.75)]
+    surface = [t(x).requires_grad_() for x in (272.958740234375, 0.08064328879117966, 0.05757435783743858)]
+    fluxes = open_ocean_fluxes(*atmosphere, *surface)
+    gradients = torch.autograd.grad(fluxes.sum(), surface)
+    assert torch.isfinite(fluxes).all() and all(torch.isfinite(g).all() for g in gradients)
+
+
 def test_coupler_gives_access_om2_fluxes_on_access_om2_surface():
     """flux = ACCESS-OM2's - B(ACCESS-OM2's lagged surface) + B(the emulator's): exact when the two agree."""
     coupler, mask, true_state_z, true_fluxes = _toy_coupler()

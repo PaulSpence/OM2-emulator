@@ -254,7 +254,10 @@ def open_ocean_fluxes(tas, huss, uas, vas, psl, sst, u_ocean, v_ocean):
         bstar = GRAV * (tstar / tv + qstar / (q + 1 / 0.608))
         zeta = VONKAR * bstar * Z_REF / (ustar * ustar)
         zeta = torch.copysign(torch.clamp(zeta.abs(), max=10.0), zeta)
-        x2 = torch.clamp(torch.sqrt((1 - 16 * zeta).abs()), min=1.0)
+        # CICE: x2 = max(sqrt(abs(1 - 16 zeta)), 1). The same, with the max taken before the square root: at
+        # zeta = 1/16 the square root's gradient is infinite, and 0 (from the max) x inf = NaN would poison
+        # every weight's gradient.
+        x2 = torch.sqrt(torch.clamp((1 - 16 * zeta).abs(), min=1.0))
         x = torch.sqrt(x2)
         is_stable = zeta > 0
         psi_m = torch.where(is_stable, -5 * zeta,
