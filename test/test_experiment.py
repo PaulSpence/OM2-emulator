@@ -1064,6 +1064,9 @@ def test_grid_upsampling_matches_interpolating_a_tiled_and_folded_field():
     torch.testing.assert_close(upsample_on_grid(x, (10, 20)), expected[..., :10, 20:40])
     # Same size in and out (the bottleneck to the enc2 skip): nothing changes.
     torch.testing.assert_close(upsample_on_grid(x, (5, 10)), x)
+    # Under autocast it keeps the input's 16-bit precision (autocast alone would make it 32-bit).
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        assert upsample_on_grid(x.bfloat16(), (10, 20)).dtype == torch.bfloat16
 
 
 def test_unet_sees_its_true_neighbours_across_the_tripole_fold():

@@ -81,8 +81,12 @@ def upsample_on_grid(x, size):
     scale_x = size[1] // w                  # e.g. 2: every input column becomes 2 output columns
     x = torch.cat([x, torch.flip(x[..., -1:, :], dims=(-1,))], dim=-2)   # north ghost row: the fold
     x = torch.cat([x[..., -1:], x, x[..., :1]], dim=-1)                  # wrap one column each side
-    x = F.interpolate(x, scale_factor=(size[0] / h, scale_x), mode="bilinear", align_corners=False,
-                      recompute_scale_factor=False)
+    # Under autocast PyTorch runs every interpolation in 32-bit (bicubic needs it, pytorch #121324), converting
+    # the 16-bit activations up and back down. Bilinear is fine in 16-bit, so autocast is off here and the
+    # interpolation keeps the input's precision.
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        x = F.interpolate(x, scale_factor=(size[0] / h, scale_x), mode="bilinear", align_corners=False,
+                          recompute_scale_factor=False)
     return x[..., :size[0], scale_x:scale_x + size[1]]
 
 

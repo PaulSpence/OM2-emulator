@@ -419,14 +419,16 @@ class PhysicalCoupler(nn.Module):
         slots = self.slot[months]
         if (slots < 0).any():
             raise KeyError(f"the coupler has no inputs for time indices {months[slots < 0].tolist()}")
-        z_surface = latest_state[:, self.surface_channels].flatten(2)[:, :, self.ocean_index].float()
+        # index_select, not [..., self.ocean_index]: the backward of plain indexing sorts the indices on the GPU
+        # every step (slow); index_select's backward adds straight into place.
+        z_surface = latest_state[:, self.surface_channels].flatten(2).index_select(-1, self.ocean_index).float()
         return self.rest[slots] + self._open_ocean(z_surface, months, slots)
 
     def forcing_z(self, fluxes, months):
         """(B, 4, H, W) the emulator's forcing input: (flux - climatology) / scale, 0 on land."""
         z = (fluxes - self.forcing_mean[months]) / self.forcing_scale[None, :, None]
         full = z.new_zeros(z.shape[0], z.shape[1], self.grid_shape[0] * self.grid_shape[1])
-        full[:, :, self.ocean_index] = z
+        full = full.index_copy(-1, self.ocean_index, z)        # (as above: no index sort)
         return full.view(z.shape[0], z.shape[1], *self.grid_shape)
 
     def ocean_totals(self, fluxes):
