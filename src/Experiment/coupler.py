@@ -16,20 +16,25 @@ What ACCESS-OM2 does (1deg_jra55_iaf_omip2_cycle6; cice5 9864af2, libaccessom2 4
     surface current (+ 1 m/s gust), tas and huss used as 10 m values, and the sea-level pressure. Winds are
     used as given (east/north), not rotated onto the grid. These enter the ocean weighted by the open-water
     fraction 1 - aice.
+  - MOM restores the sea-surface salinity towards a monthly WOA13 climatology (ocean_sbc_nml): a salt flux
+    rho_dzt(top) (S_target - SSS) / (1000 x 21.28 days), everywhere (under the ice too), minus its global mean.
   - Everything else the ocean receives does not depend on the ocean surface: downward shortwave (fixed
     albedo) and longwave, rain, snow, runoff, the sea-ice terms (melt water, salt, heat, shortwave through
     the ice, ice-ocean stress), frazil.
 
 How the emulator's coupler does the same, per month:
     flux = ACCESS-OM2's flux of the month  -  B(ACCESS-OM2's surface)  +  B(the emulator's surface)
-where B is the open-ocean part above (the only part that depends on the ocean), computed exactly as CICE
-does from every 3-hourly JRA55-do record of the month and averaged. So the coupler gives ACCESS-OM2's own
+where B is the part above that depends on the ocean surface: the open-ocean fluxes, computed exactly as CICE
+does from every 3-hourly JRA55-do record of the month and averaged, and the salinity restoring (as the
+freshwater flux it equals; the data's freshwater flux leaves it out, so ACCESS-OM2's flux has none to remove
+and the restoring enters as R(the emulator's SSS) - R(ACCESS-OM2's SSS), in which the target cancels). So the coupler gives ACCESS-OM2's own
 fluxes when the emulator's surface equals ACCESS-OM2's, and responds to any difference exactly as ACCESS-OM2's
 bulk formulae do. Offline check (2010, MOM's daily SST and currents): this port reproduces MOM's recorded
 open-ocean sensible, latent, longwave and evaporation fluxes with R^2 = 1.0000.
 
-The surface B sees: SST and the surface currents u_surf, v_surf (all three predicted by the emulator), and the
-month's sea-ice concentration (prescribed: CICE monthly aice_m of the same run).
+The surface B sees: SST, the surface currents u_surf, v_surf and SSS (all four predicted by the emulator), the
+month's sea-ice concentration (prescribed: CICE monthly aice_m of the same run) and the mass of MOM's top cell
+(monthly rho_dzt of the same run).
 
 Lagged surface: to predict month t+1 the emulator needs the fluxes of month t+1, which depend on the surface of
 month t+1, which it has not predicted yet. So B uses the surface ANOMALY (z-score) of month t laid on the
@@ -37,7 +42,7 @@ climatology of month t+1, for the emulator and for ACCESS-OM2 alike: the two lag
 right, and the flux responds to the emulator's error the same way either way.
 
 Inputs are read straight from where they live (nothing is copied): JRA55-do from /g/data/qv56, the remapping
-weights and the CICE output from /g/data/ik11. They are read once, for the months a run needs, and kept on the
+weights and the CICE and MOM output from /g/data/ik11. They are read once, for the months a run needs, and kept on the
 GPU if they fit, otherwise in host memory (half precision, stored relative to an offset; ~170 MB per month).
 
     inputs  = read_coupler_inputs(months_YYYY_MM, time_indices, mask, device, weather_device)
@@ -85,6 +90,8 @@ D608 = D378 / D622
 KAPPA = RDGAS / CP_AIR
 GUST = 1.0                      # m/s, added to the relative wind speed
 Z_REF = 10.0                    # m, height of the atmospheric values
+SALT_RESTORE_TSCALE = 21.28 * 86400.0   # s, MOM's salt_restore_tscale in ACCESS-OM2 (days)
+S_REF = 35.0                    # psu, the data's reference salinity: freshwater flux = -1000 x salt flux / S_REF
 
 
 # =========================================================================================================
@@ -160,6 +167,7 @@ def read_coupler_inputs(months, time_indices, mask, device, weather_device, proc
                       (x - offset) * factor (see ATMOSPHERE); records past the end of a month are 0
         "n_records" : (M,) long on `device`, 3-hourly records in each month
         "open_water": (M, cells) float32 on `device`, 1 - CICE's monthly-mean sea-ice concentration
+        "top_cell_mass": (M, cells) float32 on `device`, MOM's monthly-mean rho_dzt of the top cell (kg/m2)
     }
     """
     import xarray as xr
@@ -188,11 +196,24 @@ def read_coupler_inputs(months, time_indices, mask, device, weather_device, proc
             aice = np.nan_to_num(ice["aice_m"].values[0]).ravel()[ocean_cells]
         open_water[slot[m]] = 1.0 - np.clip(aice, 0.0, 1.0)
 
+    # The mass of MOM's top cell (kg/m2, rho_dzt at the surface, monthly mean): the salinity restoring's flux is
+    # proportional to it. From the run's ocean_month.nc, one file per year next to the ice files (records Jan..Dec).
+    top_cell_mass = np.zeros_like(open_water)
+    by_file = {}
+    for m in months:
+        by_file.setdefault(Path(ice_files[m]).parents[2] / "ocean" / "ocean_month.nc", []).append(m)
+    for path, file_months in by_file.items():
+        with xr.open_dataset(path, decode_times=False) as ocean:
+            top = ocean["rho_dzt"].isel(st_ocean=0)
+            for m in file_months:
+                top_cell_mass[slot[m]] = np.nan_to_num(top.isel(time=int(m[5:7]) - 1).values).ravel()[ocean_cells]
+
     return {
         "time_index": torch.as_tensor(time_indices, dtype=torch.long),
         "atmosphere": atmosphere,
         "n_records": n_records.to(device),
         "open_water": torch.from_numpy(open_water).to(device),
+        "top_cell_mass": torch.from_numpy(top_cell_mass).to(device),
     }
 
 
@@ -212,6 +233,24 @@ def saturation_vapour_pressure(t):
     es_ice, es_water = 10.0 ** log_ice, 10.0 ** log_water
     blend = 0.05 * ((t_ice - t) * es_ice + (t - t_ice + 20.0) * es_water)
     return torch.where(t <= t_ice - 20.0, es_ice, torch.where(t >= t_ice, es_water, blend))
+
+
+def salinity_restoring(sss, top_cell_mass, cell_area):
+    """
+    MOM5's sea-surface salinity restoring as ACCESS-OM2 runs it (ocean_sbc_nml: salt_restore_as_salt_flux,
+    salt_restore_tscale = 21.28 days, zero_net_salt_restore, salt_restore_under_ice, no cap on the difference),
+    as the freshwater flux it equals (kg/m2/s, into the ocean: -1000 x salt flux / S_REF, the data's convention),
+    leaving out the terms without SSS (the target's), which cancel in the coupler's R(emulator) - R(ACCESS-OM2):
+        MOM's salt flux = rho_dzt(top) (S_target - SSS) / (1000 tau), minus its ocean (area-weighted) mean
+        R(SSS)          = rho_dzt(top) (SSS - S_REF) / (tau S_REF),     minus its ocean mean
+    Offline check (1958, ACCESS-OM2's monthly sfc_salt_flux_restore against rho_dzt (S_target - sss)): R^2 = 0.999,
+    tau = 21.1-21.4 days.
+
+    sss (B, cells) psu; top_cell_mass (B, cells) kg/m2; cell_area (cells,) m2. Returns (B, cells).
+    """
+    restoring = top_cell_mass * (sss - S_REF) / (SALT_RESTORE_TSCALE * S_REF)   # S_REF: only to keep the numbers small
+    weight = (cell_area / cell_area.sum()).to(restoring.dtype)
+    return restoring - (restoring * weight).sum(dim=-1, keepdim=True)
 
 
 def open_ocean_fluxes(tas, huss, uas, vas, psl, sst, u_ocean, v_ocean):
@@ -364,7 +403,7 @@ class PhysicalCoupler(nn.Module):
         true_state_z     : (T, P, H, W) ACCESS-OM2's states (z-scores), the whole time axis
         true_fluxes      : (T, 4, H, W) ACCESS-OM2's fluxes in physical units, in the emulator's forcing order:
                            heat (W/m2), freshwater (kg/m2/s), tau_x, tau_y (N/m2)
-        surface_channels : positions of sst, u_surf, v_surf among the state variables
+        surface_channels : positions of sst, u_surf, v_surf, sss among the state variables
         state_mean,
         state_std        : (T, P, H, W) climatological mean and std of the state (to undo the z-scores)
         forcing_mean     : (T, 4, H, W) climatological mean of the fluxes, physical units
@@ -385,7 +424,8 @@ class PhysicalCoupler(nn.Module):
             "slot": slot,                                                  # time index -> position in the inputs
             "n_records": inputs["n_records"],                              # (M,)
             "open_water": inputs["open_water"],                            # (M, cells)
-            "surface_mean": at_ocean(state_mean[:, self.surface_channels]),   # (T, 3, cells)
+            "top_cell_mass": inputs["top_cell_mass"],                      # (M, cells)
+            "surface_mean": at_ocean(state_mean[:, self.surface_channels]),   # (T, 4, cells)
             "surface_std": at_ocean(state_std[:, self.surface_channels]),
             "forcing_mean": at_ocean(forcing_mean),                        # (T, 4, cells)
             "forcing_scale": torch.as_tensor(forcing_scale, dtype=torch.float32),
@@ -404,15 +444,19 @@ class PhysicalCoupler(nn.Module):
         with torch.no_grad():
             for k, t in enumerate(inputs["time_index"].tolist()):
                 z_true = at_ocean(true_state_z[t - 1, self.surface_channels])[None].to(device)
-                b_true = self._open_ocean(z_true, torch.tensor([t], device=device), torch.tensor([k], device=device))
+                b_true = self._surface_fluxes(z_true, torch.tensor([t], device=device), torch.tensor([k], device=device))
                 rest.append(at_ocean(true_fluxes[t])[None].to(device) - b_true)
         self.register_buffer("rest", torch.cat(rest), persistent=False)    # (M, 4, cells)
 
-    def _open_ocean(self, z_surface, months, slots):
-        """B: the open-ocean fluxes (B, 4, cells) of `months` from the surface z-scores (B, 3, cells) of the month
-        before, laid on the climatology of `months`."""
-        surface = z_surface * self.surface_std[months] + self.surface_mean[months]
-        return monthly_open_ocean_fluxes(self.atmosphere, slots, self.n_records[slots], self.open_water[slots], surface)
+    def _surface_fluxes(self, z_surface, months, slots):
+        """B: the fluxes (B, 4, cells) of `months` that depend on the surface, from the surface z-scores (B, 4, cells)
+        of the month before, laid on the climatology of `months`: the open-ocean fluxes (SST, currents) and, in the
+        freshwater flux, the salinity restoring (SSS)."""
+        surface = z_surface * self.surface_std[months] + self.surface_mean[months]     # K, m/s, m/s, psu
+        open_ocean = monthly_open_ocean_fluxes(self.atmosphere, slots, self.n_records[slots], self.open_water[slots],
+                                               surface[:, :3])
+        restoring = salinity_restoring(surface[:, 3], self.top_cell_mass[slots], self.cell_area)
+        return torch.cat([open_ocean[:, :1], open_ocean[:, 1:2] + restoring[:, None], open_ocean[:, 2:]], dim=1)
 
     def fluxes(self, latest_state, months):
         """(B, 4, cells) physical fluxes of `months` from the emulator's latest state (the month before)."""
@@ -422,7 +466,7 @@ class PhysicalCoupler(nn.Module):
         # index_select, not [..., self.ocean_index]: the backward of plain indexing sorts the indices on the GPU
         # every step (slow); index_select's backward adds straight into place.
         z_surface = latest_state[:, self.surface_channels].flatten(2).index_select(-1, self.ocean_index).float()
-        return self.rest[slots] + self._open_ocean(z_surface, months, slots)
+        return self.rest[slots] + self._surface_fluxes(z_surface, months, slots)
 
     def forcing_z(self, fluxes, months):
         """(B, 4, H, W) the emulator's forcing input: (flux - climatology) / scale, 0 on land."""

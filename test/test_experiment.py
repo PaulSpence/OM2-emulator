@@ -1900,7 +1900,7 @@ def test_constraint_takes_each_samples_own_flux_totals(data_and_cfg):
 
 def _toy_coupler(T=6, H=5, W=7, seed=0):
     """A PhysicalCoupler on a small grid: random atmosphere, sea ice, truth and climatology.
-    State variables: 0 = a content, 1 = SST, 2 = u_surf, 3 = v_surf."""
+    State variables: 0 = SSS, 1 = SST, 2 = u_surf, 3 = v_surf."""
     from Experiment import PhysicalCoupler
     from Experiment.coupler import ATMOSPHERE, MAX_RECORDS
 
@@ -1921,16 +1921,18 @@ def _toy_coupler(T=6, H=5, W=7, seed=0):
     atmosphere = torch.stack([((physical[name] - offset) * factor) for name, offset, factor in ATMOSPHERE], dim=1).half()
     n_records = torch.tensor([248, 224, 248, 240, 248])
     inputs = {"time_index": torch.tensor(months), "atmosphere": atmosphere, "n_records": n_records,
-              "open_water": torch.rand(M, cells, generator=g)}
+              "open_water": torch.rand(M, cells, generator=g), "top_cell_mass": torch.full((M, cells), 2382.0)}
     state_mean = torch.zeros(T, 4, H, W)
+    state_mean[:, 0] = 35.0                                           # SSS climatology, psu
     state_mean[:, 1] = 288.15                                         # SST climatology, K (as MOM writes it)
     state_std = torch.ones(T, 4, H, W)
+    state_std[:, 0] = 0.3
     state_std[:, 1] = 2.0
     state_std[:, 2:] = 0.1                                           # currents, m/s
     true_state_z = torch.randn(T, 4, H, W, generator=g)
     true_fluxes = torch.randn(T, 4, H, W, generator=g) * torch.tensor([50.0, 3e-5, 0.1, 0.1])[:, None, None]
     coupler = PhysicalCoupler(
-        inputs, true_state_z, true_fluxes, surface_channels=[1, 2, 3], state_mean=state_mean, state_std=state_std,
+        inputs, true_state_z, true_fluxes, surface_channels=[1, 2, 3, 0], state_mean=state_mean, state_std=state_std,
         forcing_mean=torch.randn(T, 4, H, W, generator=g), forcing_scale=[10.0, 1e-5, 0.1, 0.1],
         mask=mask, area=torch.rand(H, W, generator=g) + 1.0,
     )
@@ -1970,6 +1972,34 @@ def test_open_ocean_fluxes_gradient_is_finite_where_the_stability_parameter_hits
     assert torch.isfinite(fluxes).all() and all(torch.isfinite(g).all() for g in gradients)
 
 
+def test_salinity_restoring_is_moms_zero_net_restoring_as_a_freshwater_flux():
+    from Experiment import salinity_restoring
+
+    area = torch.tensor([1.0, 2.0, 1.0], dtype=torch.float64)
+    mass = torch.full((1, 3), 2382.0)
+    sss = torch.tensor([[35.0, 35.0, 35.0]])
+    torch.testing.assert_close(salinity_restoring(sss, mass, area), torch.zeros(1, 3))   # uniform SSS: zero net, so 0
+    saltier = salinity_restoring(sss + torch.tensor([[1.0, 0.0, 0.0]]), mass, area)
+    # 1 psu saltier than the rest: fresh water in, at MOM's rate rho_dzt / (21.28 days x 35 psu) per psu, the rest
+    # of the ocean pays for it (zero net over the area).
+    rate = 2382.0 / (21.28 * 86400.0 * 35.0)
+    torch.testing.assert_close(saltier[0, 0], torch.tensor(rate * 0.75))                  # 1 - area share (1/4)
+    torch.testing.assert_close((saltier.double() * area).sum(), torch.tensor(0.0, dtype=torch.float64), atol=1e-12, rtol=0)
+
+
+def test_coupler_freshens_where_the_emulator_is_saltier_than_access_om2():
+    coupler, mask, true_state_z, true_fluxes = _toy_coupler()
+    months = torch.tensor([3])
+    state = true_state_z[months - 1].clone()
+    state[0, 0, 2, 4] += 1.0                                         # one cell's SSS 1 std (0.3 psu) saltier
+    change = coupler.fluxes(state, months) - coupler.fluxes(true_state_z[months - 1], months)
+    cell = int((coupler.ocean_index == 2 * mask.shape[1] + 4).nonzero())
+    assert change[0, 1, cell] > 0                                    # more fresh water into that cell
+    assert (change[0, [0, 2, 3]] == 0).all()                         # heat and stress do not depend on SSS
+    total = (change[0, 1].double() * coupler.cell_area).sum()
+    assert abs(float(total)) < 1e-5 * float((change[0, 1].abs().double() * coupler.cell_area).sum())   # zero net
+
+
 def test_coupler_gives_access_om2_fluxes_on_access_om2_surface():
     """flux = ACCESS-OM2's - B(ACCESS-OM2's lagged surface) + B(the emulator's): exact when the two agree."""
     coupler, mask, true_state_z, true_fluxes = _toy_coupler()
@@ -1999,9 +2029,10 @@ def test_coupler_shapes_round_trip_and_gradients():
     # Undo the z-score: flux = climatology + z x scale.
     back = forcing[:, :, mask > 0] * coupler.forcing_scale[None, :, None] + coupler.forcing_mean[months]
     torch.testing.assert_close(back, fluxes, rtol=1e-4, atol=1e-6)
-    # Gradients reach the SST and current channels only.
+    # Gradients reach all four surface channels (SST and currents through the bulk formulae, SSS through the
+    # salinity restoring).
     forcing.sum().backward()
-    assert state.grad[:, 1:].abs().sum() > 0 and state.grad[:, 0].abs().sum() == 0
+    assert (state.grad.abs().sum(dim=(0, 2, 3)) > 0).all()
     # A month without inputs is an error, not a silent zero.
     with pytest.raises(KeyError):
         coupler.fluxes(state.detach(), torch.tensor([0, 1]))
