@@ -2036,7 +2036,7 @@ def test_coupler_shapes_round_trip_and_gradients():
     # A month without inputs is an error, not a silent zero.
     with pytest.raises(KeyError):
         coupler.fluxes(state.detach(), torch.tensor([0, 1]))
-    # Samples that share a month (rollout twins, ensemble members) get that month's weather, in any order.
+    # Samples that share a month (ensemble members) get that month's weather, in any order.
     shared = coupler.fluxes(state[[1, 0, 1]].detach(), torch.tensor([4, 1, 4]))
     torch.testing.assert_close(shared[[1, 0]], fluxes.detach())
     torch.testing.assert_close(shared[2], fluxes[1].detach())
@@ -2046,8 +2046,44 @@ def test_coupler_shapes_round_trip_and_gradients():
     assert coupler.to(torch.float64).atmosphere.dtype == torch.float16 and coupler.atmosphere.device.type == "cpu"
 
 
+def test_column_budget_puts_the_flux_anomaly_straight_into_each_column():
+    from Experiment import ColumnBudget
+
+    T, B, H, W = 5, 3, 4, 6
+    std = torch.rand(T, H, W) + 0.5
+    std[:, 0, 0] = 0.0                                           # one land cell
+    lengths = torch.tensor([2.6e6, 2.4e6, 2.7e6, 2.6e6, 2.7e6])
+    scale = torch.tensor([20.0, 3e-5])
+    budget = ColumnBudget([("heat", 0, 0, 1.0), ("freshwater", 1, 1, 1.0)], {"heat": std, "freshwater": 2 * std},
+                          forcing_scale=scale, month_seconds=lengths)
+    previous = torch.randn(B, 3, H, W)
+    forcing_previous, forcing_target = torch.randn(B, 2, H, W), torch.randn(B, 2, H, W)
+    a, b = torch.tensor([0, 1, 3]), torch.tensor([1, 2, 4])
+    # A network that predicts no change: each content anomaly changes by exactly its integrated flux anomaly.
+    out = budget(previous.clone(), previous, a, b, forcing_previous, forcing_target)
+    for c, s in ((0, std), (1, 2 * std)):
+        flux = 0.5 * scale[c] * (forcing_previous[:, c] * lengths[a, None, None] + forcing_target[:, c] * lengths[b, None, None])
+        change = out[:, c] * s[b] - previous[:, c] * s[a]
+        torch.testing.assert_close(change[:, 1:, 1:], flux[:, 1:, 1:], rtol=1e-5, atol=1e-5 * float(flux.abs().max()))
+    torch.testing.assert_close(out[:, :, 0, 0], previous[:, :, 0, 0])            # land: the network's value
+    torch.testing.assert_close(out[:, 2], previous[:, 2])                        # other channels: untouched
+    # The network's own change rides on top, as the transport (in std units of the target month), and
+    # gradients reach it.
+    tendency = torch.randn(B, 3, H, W, requires_grad=True)
+    nudged = budget(previous + tendency, previous, a, b, forcing_previous, forcing_target)
+    torch.testing.assert_close(nudged - out, tendency.detach(), rtol=1e-5, atol=1e-5)
+    nudged.sum().backward()
+    assert torch.isfinite(tendency.grad).all() and (tendency.grad == 1).all()
+    # The content answers a flux exactly as the budget says: dF x half the target month's length, per cell.
+    more = forcing_target.clone()
+    more[:, 0] += 1.0
+    again = budget(previous.clone(), previous, a, b, forcing_previous, more)
+    expected = 0.5 * scale[0] * lengths[b, None, None] / std[b]
+    torch.testing.assert_close((again - out)[:, 0, 1:, 1:], expected[:, 1:, 1:], rtol=1e-5, atol=1e-6)
+
+
 def test_coupled_rollout_closes_the_budget_with_the_coupled_fluxes():
-    from Experiment import GlobalBudgetConstraint, coupled_rollout
+    from Experiment import ColumnBudget, GlobalBudgetConstraint, coupled_rollout
 
     coupler, mask, _, _ = _toy_coupler()
     T, H, W = 6, *mask.shape
@@ -2055,6 +2091,8 @@ def test_coupled_rollout_closes_the_budget_with_the_coupled_fluxes():
     area = torch.zeros(H * W, dtype=torch.float64)
     area[coupler.ocean_index] = coupler.cell_area                  # the coupler's cell areas on the grid
     area = area.view(H, W)
+    column_budget = ColumnBudget([("heat", 0, 0, 1.0)], {"heat": std}, forcing_scale=coupler.forcing_scale,
+                                 month_seconds=torch.full((T,), 1e6))
     constraint = GlobalBudgetConstraint(
         [("heat", 0, 0, 1.0)], {"heat": std}, mean_global=torch.zeros(T, 4), flux_global=torch.zeros(T, 4),
         month_seconds=torch.full((T,), 1e6), area=area, mask=mask,
@@ -2070,7 +2108,9 @@ def test_coupled_rollout_closes_the_budget_with_the_coupled_fluxes():
 
     prior = torch.randn(2, 4, H, W)
     predictions, totals = coupled_rollout(Persist(), coupler, prior, target_indices=[2, 3, 4], initial_index=1,
-                                          constraint=constraint, initial_flux_totals=torch.zeros(4), members=2)
+                                          column_budget=column_budget, constraint=constraint,
+                                          initial_forcing=torch.zeros(4, H, W), initial_flux_totals=torch.zeros(4),
+                                          members=2)
     assert predictions.shape == (2, 3, 4, H, W) and totals.shape == (2, 3, 4)
     # Every month the heat content changes by exactly the average of the two months' coupled heat flux.
     area = constraint.ocean_area

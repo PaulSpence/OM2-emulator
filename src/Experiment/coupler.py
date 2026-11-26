@@ -357,7 +357,7 @@ def monthly_open_ocean_fluxes(atmosphere, slots, n_records, open_water, surface,
     """
     sst, u_ocean, v_ocean = (surface[:, k, None] for k in range(3))     # each (B, 1, cells)
     records_sum = _records_sum_compiled if surface.is_cuda else _records_sum
-    # Each distinct month is fetched once (rollout twins and ensemble members share their month), then handed to
+    # Each distinct month is fetched once (ensemble members share their month), then handed to
     # every sample in it.
     distinct, sample_month = slots.unique(return_inverse=True)
     distinct = distinct.to(atmosphere.device)
@@ -485,7 +485,8 @@ class PhysicalCoupler(nn.Module):
 
 
 @torch.no_grad()
-def coupled_rollout(model, coupler, prior, target_indices, initial_index, constraint, initial_flux_totals, members=1):
+def coupled_rollout(model, coupler, prior, target_indices, initial_index, column_budget, constraint, initial_forcing,
+                    initial_flux_totals, members=1):
     """
     Free-running rollout like autoregressive_rollout, but every month's forcing comes from the coupler,
     computed from the emulator's own previous month.
@@ -493,19 +494,22 @@ def coupled_rollout(model, coupler, prior, target_indices, initial_index, constr
     prior               (n_prior, P, H, W) the true initial states, oldest first
     target_indices      (N,)  time index of each predicted month (sets the atmosphere and sea ice used)
     initial_index       int   time index of the last prior state
+    column_budget       the ColumnBudget: every column's content takes in the coupled flux
     constraint          the GlobalBudgetConstraint, closed with the coupled fluxes
-    initial_flux_totals (C,)  ACCESS-OM2's ocean-total fluxes of the starting month (the budget of the
-                              first step averages them with the first coupled month's)
+    initial_forcing     (C, H, W) ACCESS-OM2's forcing input (z-scores) of the starting month, and
+    initial_flux_totals (C,)  its ocean-total fluxes (the budgets of the first step average them with the
+                              first coupled month's)
     returns  predictions (members, N, P, H, W) z-scores, and the ocean-total coupled fluxes
              (members, N, C) float64, both on the CPU
     """
     device = next(model.parameters()).device
     was_training = model.training
     model.eval()
-    coupler, constraint = coupler.to(device), constraint.to(device)
+    coupler, column_budget, constraint = coupler.to(device), column_budget.to(device), constraint.to(device)
     n_prognostic = prior.shape[1]
     state = prior.flatten(0, 1)[None].to(device).repeat(members, 1, 1, 1)
     previous = torch.full((members,), int(initial_index), device=device)
+    forcing_previous = torch.as_tensor(initial_forcing, device=device).float()[None].repeat(members, 1, 1, 1)
     totals_previous = torch.as_tensor(initial_flux_totals, device=device).double()[None].repeat(members, 1)
     predictions, totals = [], []
     for target in target_indices:
@@ -513,10 +517,11 @@ def coupled_rollout(model, coupler, prior, target_indices, initial_index, constr
         latest = state[:, -n_prognostic:]
         forcing, totals_target = coupler(latest, target)                     # fluxes from the emulator's own surface
         pred = model(state, forcing, coupler.mask)
+        pred = column_budget(pred, latest, previous, target, forcing_previous, forcing)
         pred = constraint(pred, latest, previous, target, totals_previous, totals_target)
         predictions.append(pred.float().cpu())
         totals.append(totals_target.cpu())
         state = torch.cat([state[:, n_prognostic:], pred.to(state.dtype)], dim=1)
-        previous, totals_previous = target, totals_target
+        previous, forcing_previous, totals_previous = target, forcing, totals_target
     model.train(was_training)
     return torch.stack(predictions, dim=1), torch.stack(totals, dim=1)
