@@ -321,7 +321,10 @@ def prepare_resume(run_dir):
     log = Path(run_dir, "metrics.csv")
     if log.exists():
         n_parts = len(list(Path(run_dir).glob("metrics_part*.csv")))
-        log.rename(log.with_name(f"metrics_part{n_parts}.csv"))
+        try:
+            log.rename(log.with_name(f"metrics_part{n_parts}.csv"))
+        except FileNotFoundError:   # another process of the same multi-GPU run renamed it first
+            pass
     return checkpoint
 
 
