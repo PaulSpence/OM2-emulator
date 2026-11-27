@@ -12,14 +12,6 @@ The time step is the true month length. Between the centres of months a and b
 the flux integral is F_a L_a / 2 + F_b L_b / 2 (L = month length): with a fixed
 30-day month the 1970-2018 ACCESS-OM2 heat budget mis-closed by about half of
 the OHC change, against about 5% with true month lengths.
-
-ColumnBudget builds the same budget into every column, before the global
-constraint: a column's content changes by its surface flux plus the convergence
-of the ocean's lateral transport. The flux part is computed, and the network
-only predicts the transport, which the 2-D content cannot show. Without it the
-coupled emulator learned to answer a flux with 2.5 times the freshwater-content
-change ACCESS-OM2 shows (and ~10 times the heat-content change), the more so the
-longer its training rollouts.
 """
 
 import torch
@@ -95,64 +87,6 @@ class GlobalBudgetConstraint(nn.Module):
             residual, weight = self.residual(out, previous, previous_index, target_index, budget, flux_previous, flux_target)
             k = (residual / weight.clamp_min(1e-30)).to(pred.dtype)
             out[:, budget[1]] = out[:, budget[1]] - k[:, None, None] * self.ocean
-        return out
-
-
-class ColumnBudget(nn.Module):
-    """
-    forward(pred, previous, previous_index, target_index, forcing_previous, forcing_target)
-        -> pred, with every budget's surface flux built into its content column by column.
-
-    pred, previous    : (B, P, H, W) z-scores: the network's next state and the state it was predicted from
-    previous_index,
-    target_index      : (B,) time indices of those two states (their months)
-    forcing_previous,
-    forcing_target    : (B, C, H, W) the forcing inputs (z-scores: flux anomaly / scale) of those two months
-
-    Every column's content C changes by its surface flux and by the convergence of the ocean's lateral
-    transport D:
-
-        C_b - C_a = sign * (F_a L_a + F_b L_b) / 2 + D
-
-    The climatological fluxes and transport are in the climatology (C = mean + a), so in anomalies
-    (a = z * std, F' = F - its climatology):
-
-        a_b = a_a + sign * (F'_a L_a + F'_b L_b) / 2 + std_b * (pred - previous)
-
-    The flux term is computed here; the network's change in z of the content channel is taken as the
-    transport anomaly D / std_b. With no network change the anomaly persists and the flux anomaly goes
-    straight into the column. Land (std 0) keeps the network's value. Run GlobalBudgetConstraint after it:
-    D must not change the ocean total.
-    """
-
-    def __init__(self, budgets, content_std, forcing_scale, month_seconds):
-        """
-        budgets      : [(name, content_channel, flux_channel, flux_sign)], as GlobalBudgetConstraint
-        content_std  : {name: (T, H, W) std of the content, physical units}
-        forcing_scale: (C,) the one scale of each forcing: forcing z = (flux - climatology) / scale
-        month_seconds: (T,) month lengths in seconds
-        """
-        super().__init__()
-        self.budgets = [(name, int(c), int(f), float(sign)) for name, c, f, sign in budgets]
-        # Non-persistent: rebuilt from the data, so they stay out of checkpoints.
-        self.register_buffer("forcing_scale", torch.as_tensor(forcing_scale).float(), persistent=False)
-        self.register_buffer("month_seconds", torch.as_tensor(month_seconds).float(), persistent=False)
-        for name, *_ in self.budgets:
-            self.register_buffer(f"{name}_std", content_std[name].float(), persistent=False)
-
-    def forward(self, pred, previous, previous_index, target_index, forcing_previous, forcing_target):
-        out = pred.clone()
-        length_previous = self.month_seconds[previous_index][:, None, None]   # (B, 1, 1)
-        length_target = self.month_seconds[target_index][:, None, None]
-        for name, c, f, sign in self.budgets:
-            std = getattr(self, f"{name}_std")
-            std_previous, std_target = std[previous_index], std[target_index]   # (B, H, W)
-            # The flux anomaly integrated between the two month centres, content units (e.g. J/m2).
-            flux = sign * 0.5 * self.forcing_scale[f] * (forcing_previous[:, f].float() * length_previous
-                                                         + forcing_target[:, f].float() * length_target)
-            # What the column holds with no transport anomaly, as a z-score of the target month.
-            column = (previous[:, c].float() * std_previous + flux) / std_target.clamp_min(1e-30)
-            out[:, c] = pred[:, c] - previous[:, c] + torch.where(std_target > 0, column, previous[:, c].float())
         return out
 
 

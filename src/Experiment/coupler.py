@@ -27,9 +27,8 @@ How the emulator's coupler does the same, per month:
 where B is the part above that depends on the ocean surface: the open-ocean fluxes, computed exactly as CICE
 does from every 3-hourly JRA55-do record of the month and averaged, and the salinity restoring (as the
 freshwater flux it equals; the data's freshwater flux leaves it out, so ACCESS-OM2's flux has none to remove
-and the restoring enters as R(the emulator's SSS) - R(ACCESS-OM2's SSS), in which the target cancels). So the coupler gives ACCESS-OM2's own
-fluxes when the emulator's surface equals ACCESS-OM2's, and responds to any difference exactly as ACCESS-OM2's
-bulk formulae do. Offline check (2010, MOM's daily SST and currents): this port reproduces MOM's recorded
+and the restoring enters as R(the emulator's SSS) - R(ACCESS-OM2's SSS), in which the target cancels). The surface-dependent part
+responds to the emulator's surface exactly as ACCESS-OM2's bulk formulae do. Offline check (2010, MOM's daily SST and currents): this port reproduces MOM's recorded
 open-ocean sensible, latent, longwave and evaporation fluxes with R^2 = 1.0000.
 
 The surface B sees: SST, the surface currents u_surf, v_surf and SSS (all four predicted by the emulator), the
@@ -37,9 +36,16 @@ month's sea-ice concentration (prescribed: CICE monthly aice_m of the same run) 
 (monthly rho_dzt of the same run).
 
 Lagged surface: to predict month t+1 the emulator needs the fluxes of month t+1, which depend on the surface of
-month t+1, which it has not predicted yet. So B uses the surface ANOMALY (z-score) of month t laid on the
-climatology of month t+1, for the emulator and for ACCESS-OM2 alike: the two lags cancel when the emulator is
-right, and the flux responds to the emulator's error the same way either way.
+month t+1, which it has not predicted yet. So B(the emulator's surface) uses its surface ANOMALY (z-score) of
+month t laid on the climatology of month t+1 (an explicit step for the air-sea feedback).
+
+No truth in the flux: B(ACCESS-OM2's surface) is taken at ACCESS-OM2's surface of month t+1 itself, not lagged.
+The rest, ACCESS-OM2's flux minus it, is then what does not depend on the ocean surface (radiation, rain,
+runoff, the sea-ice terms). Lagged, the rest also held B(ACCESS-OM2's surface of t+1) - B(of t), i.e.
+ACCESS-OM2's own SST and SSS change over the month being predicted, which the emulator could read off its
+forcing: it learned to over-weight the flux (~2.5 times ACCESS-OM2's freshwater-content response, ~10 times the
+heat-content response), the more so the longer its training rollouts. The price: on ACCESS-OM2's own previous
+surface the coupler gives ACCESS-OM2's flux minus that month's B change, not ACCESS-OM2's flux exactly.
 
 Inputs are read straight from where they live (nothing is copied): JRA55-do from /g/data/qv56, the remapping
 weights and the CICE and MOM output from /g/data/ik11. They are read once, for the months a run needs, and kept on the
@@ -439,11 +445,12 @@ class PhysicalCoupler(nn.Module):
         # read_coupler_inputs put it when the coupler is moved, and is never written into checkpoints.
         self.atmosphere = inputs["atmosphere"]
 
-        # The rest of every month's flux: ACCESS-OM2's flux minus B on ACCESS-OM2's own (lagged) surface.
+        # The rest of every month's flux: ACCESS-OM2's flux minus B on ACCESS-OM2's own surface of that same month
+        # (not lagged: see "No truth in the flux" above).
         rest = []
         with torch.no_grad():
             for k, t in enumerate(inputs["time_index"].tolist()):
-                z_true = at_ocean(true_state_z[t - 1, self.surface_channels])[None].to(device)
+                z_true = at_ocean(true_state_z[t, self.surface_channels])[None].to(device)
                 b_true = self._surface_fluxes(z_true, torch.tensor([t], device=device), torch.tensor([k], device=device))
                 rest.append(at_ocean(true_fluxes[t])[None].to(device) - b_true)
         self.register_buffer("rest", torch.cat(rest), persistent=False)    # (M, 4, cells)
@@ -485,8 +492,7 @@ class PhysicalCoupler(nn.Module):
 
 
 @torch.no_grad()
-def coupled_rollout(model, coupler, prior, target_indices, initial_index, column_budget, constraint, initial_forcing,
-                    initial_flux_totals, members=1):
+def coupled_rollout(model, coupler, prior, target_indices, initial_index, constraint, initial_flux_totals, members=1):
     """
     Free-running rollout like autoregressive_rollout, but every month's forcing comes from the coupler,
     computed from the emulator's own previous month.
@@ -494,22 +500,19 @@ def coupled_rollout(model, coupler, prior, target_indices, initial_index, column
     prior               (n_prior, P, H, W) the true initial states, oldest first
     target_indices      (N,)  time index of each predicted month (sets the atmosphere and sea ice used)
     initial_index       int   time index of the last prior state
-    column_budget       the ColumnBudget: every column's content takes in the coupled flux
     constraint          the GlobalBudgetConstraint, closed with the coupled fluxes
-    initial_forcing     (C, H, W) ACCESS-OM2's forcing input (z-scores) of the starting month, and
-    initial_flux_totals (C,)  its ocean-total fluxes (the budgets of the first step average them with the
-                              first coupled month's)
+    initial_flux_totals (C,)  ACCESS-OM2's ocean-total fluxes of the starting month (the budget of the
+                              first step averages them with the first coupled month's)
     returns  predictions (members, N, P, H, W) z-scores, and the ocean-total coupled fluxes
              (members, N, C) float64, both on the CPU
     """
     device = next(model.parameters()).device
     was_training = model.training
     model.eval()
-    coupler, column_budget, constraint = coupler.to(device), column_budget.to(device), constraint.to(device)
+    coupler, constraint = coupler.to(device), constraint.to(device)
     n_prognostic = prior.shape[1]
     state = prior.flatten(0, 1)[None].to(device).repeat(members, 1, 1, 1)
     previous = torch.full((members,), int(initial_index), device=device)
-    forcing_previous = torch.as_tensor(initial_forcing, device=device).float()[None].repeat(members, 1, 1, 1)
     totals_previous = torch.as_tensor(initial_flux_totals, device=device).double()[None].repeat(members, 1)
     predictions, totals = [], []
     for target in target_indices:
@@ -517,11 +520,10 @@ def coupled_rollout(model, coupler, prior, target_indices, initial_index, column
         latest = state[:, -n_prognostic:]
         forcing, totals_target = coupler(latest, target)                     # fluxes from the emulator's own surface
         pred = model(state, forcing, coupler.mask)
-        pred = column_budget(pred, latest, previous, target, forcing_previous, forcing)
         pred = constraint(pred, latest, previous, target, totals_previous, totals_target)
         predictions.append(pred.float().cpu())
         totals.append(totals_target.cpu())
         state = torch.cat([state[:, n_prognostic:], pred.to(state.dtype)], dim=1)
-        previous, forcing_previous, totals_previous = target, forcing, totals_target
+        previous, totals_previous = target, totals_target
     model.train(was_training)
     return torch.stack(predictions, dim=1), torch.stack(totals, dim=1)
